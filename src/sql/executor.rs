@@ -485,11 +485,13 @@ pub fn execute_on(
     }
 
     if statement.is_read_only() || *in_txn {
-        return run_with_engine(engine, statement, params);
+        // 其它会话持有写事务时，本会话的只读语句只能看已提交数据
+        let committed_only = !*in_txn && engine.store.in_txn();
+        return run_with_engine(engine, statement, params, committed_only);
     }
 
     // 单语句隐式事务
-    let outcome = engine.write(|inner| run_with_engine(inner, statement, params));
+    let outcome = engine.write(|inner| run_with_engine(inner, statement, params, false));
     if outcome.is_err() {
         *in_txn = false;
     }
@@ -500,9 +502,10 @@ fn run_with_engine(
     engine: &mut Engine,
     statement: &Statement,
     params: &[Value],
+    committed_only: bool,
 ) -> Result<QueryResult> {
     match statement {
-        Statement::Select(select) => exec_select(engine, select, params),
+        Statement::Select(select) => exec_select(engine, select, params, committed_only),
         Statement::Insert(insert) => exec_insert(engine, insert, params),
         Statement::Update(update) => exec_update(engine, update, params),
         Statement::Delete(delete) => exec_delete(engine, delete, params),
@@ -604,7 +607,12 @@ fn run_with_engine(
 
 // ------------------------------------------------------------------ SELECT
 
-fn exec_select(engine: &mut Engine, stmt: &SelectStmt, params: &[Value]) -> Result<QueryResult> {
+fn exec_select(
+    engine: &mut Engine,
+    stmt: &SelectStmt,
+    params: &[Value],
+    committed_only: bool,
+) -> Result<QueryResult> {
     let mut table_columns: Vec<Column> = Vec::new();
     let mut rows: Vec<RowContext> = Vec::new();
 
@@ -614,18 +622,25 @@ fn exec_select(engine: &mut Engine, stmt: &SelectStmt, params: &[Value]) -> Resu
             table_columns = table.columns.clone();
         }
 
-        let candidates = index_candidates(&*engine, &from.table, stmt.where_clause.as_ref(), params)?;
-        match candidates {
-            Some(ids) => {
-                for id in ids {
-                    if let Some(values) = engine.get(&from.table, id)? {
-                        rows.push(RowContext::new(&table_columns, values));
+        if committed_only {
+            for (_, values) in engine.scan_committed(&from.table)? {
+                rows.push(RowContext::new(&table_columns, values));
+            }
+        } else {
+            let candidates =
+                index_candidates(&*engine, &from.table, stmt.where_clause.as_ref(), params)?;
+            match candidates {
+                Some(ids) => {
+                    for id in ids {
+                        if let Some(values) = engine.get(&from.table, id)? {
+                            rows.push(RowContext::new(&table_columns, values));
+                        }
                     }
                 }
-            }
-            None => {
-                for (_, values) in engine.scan(&from.table)? {
-                    rows.push(RowContext::new(&table_columns, values));
+                None => {
+                    for (_, values) in engine.scan(&from.table)? {
+                        rows.push(RowContext::new(&table_columns, values));
+                    }
                 }
             }
         }

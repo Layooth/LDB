@@ -45,6 +45,19 @@ fn print_help() {
 }
 
 fn main() {
+    // SQL/JSON 解析和表达式求值都是递归的：给主逻辑一条 8MB 栈的线程，
+    // 避免极端输入在默认 1MB 的主线程栈上直接爆栈
+    let worker = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("无法创建主线程");
+    if worker.join().is_err() {
+        eprintln!("错误: 发生内部崩溃");
+        std::process::exit(1);
+    }
+}
+
+fn real_main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
@@ -218,6 +231,13 @@ fn detect_data_dir() -> String {
 
 fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
     let mut options = ServerOptions::default();
+    // 与 launcher 约定：设置 LDB_NO_OPEN=1 时不自动打开浏览器
+    if std::env::var("LDB_NO_OPEN")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        options.open_browser = false;
+    }
     let mut i = 0;
     while i < extra.len() {
         match extra[i].as_str() {

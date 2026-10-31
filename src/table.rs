@@ -14,6 +14,10 @@ use crate::store::Store;
 /// 页内剩余空间低于此值时不再作为插入候选（避免碎片化）
 const FREE_PAGE_MIN: i32 = 128;
 
+/// row_id = (page_no << 16) | slot，page_no 只有 16 位可用，
+/// 超过上限后 row_id 会与前面的页冲突（静默数据损坏），必须显式拒绝。
+pub const MAX_PAGES_PER_TABLE: u32 = 65535;
+
 pub struct Index {
     pub name: String,
     pub columns: Vec<usize>,
@@ -165,6 +169,24 @@ pub fn scan(store: &mut Store, table: &Table) -> Result<Vec<(u32, Vec<Value>)>> 
     let mut rows = Vec::new();
     for page_no in 0..pages {
         let page = store.read_page(table.id, page_no)?;
+        let count = pg::slot_count(&page);
+        for slot in 0..count {
+            if let Some(record) = pg::read_record(&page, slot) {
+                let values = codec::decode_row(&table.columns, &record)?;
+                rows.push((make_row_id(page_no, slot), values));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// 只读已提交数据的全表扫描：其它会话查询时避免脏读。
+/// 内存索引在事务里会混入未提交的键，所以这条路径也不能走索引。
+pub fn scan_committed(store: &mut Store, table: &Table) -> Result<Vec<(u32, Vec<Value>)>> {
+    let pages = store.page_count(table.id);
+    let mut rows = Vec::new();
+    for page_no in 0..pages {
+        let page = store.read_page_committed(table.id, page_no)?;
         let count = pg::slot_count(&page);
         for slot in 0..count {
             if let Some(record) = pg::read_record(&page, slot) {
@@ -366,6 +388,18 @@ fn insert_physical(store: &mut Store, table: &mut Table, record: &[u8]) -> Resul
         table.free_pages.insert(page_no);
     }
 
+    let count = store.page_count(table.id);
+    if count >= MAX_PAGES_PER_TABLE {
+        return Err(DbError::new(
+            error::LIMIT,
+            format!(
+                "表 \"{}\" 已达单表页数上限（{} 页 ≈ {} MB），无法再分配新页",
+                table.name,
+                MAX_PAGES_PER_TABLE,
+                MAX_PAGES_PER_TABLE * pg::PAGE_SIZE as u32 / 1024 / 1024
+            ),
+        ));
+    }
     let page_no = store.alloc_page(table.id)?;
     let mut page = store.read_page(table.id, page_no)?;
     let slot = pg::insert_record(&mut page, record).ok_or_else(|| {

@@ -6,19 +6,39 @@ use crate::error::{DbError, Result};
 use super::ast::*;
 use super::lexer::{tokenize, Token, TokenKind};
 
+/// 表达式嵌套深度上限。递归下降解析每层约 9 个栈帧，默认线程栈 2MB 下
+/// 200 层就会爆栈（实测），而真实 SQL 几乎不会超过 20 层——64 足够宽裕。
+pub const MAX_EXPR_DEPTH: usize = 64;
+
+/// 单条语句的记号数上限。`1+1+1+...` 这类链式表达式是迭代构建的，
+/// 深度闸门拦不住，但求值和 AST 析构仍是递归——
+/// 2 万记号最坏产生约 1 万层 AST，配合 8MB 线程栈是安全的。
+pub const MAX_TOKENS: usize = 20_000;
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     param_index: usize,
+    expr_depth: usize,
+    explain_depth: usize,
 }
 
 impl Parser {
     pub fn new(sql: &str) -> Result<Parser> {
         let tokens = tokenize(sql)?;
+        if tokens.len() > MAX_TOKENS {
+            return Err(DbError::syntax(format!(
+                "语句过长：{} 个记号，超过 {} 上限",
+                tokens.len(),
+                MAX_TOKENS
+            )));
+        }
         Ok(Parser {
             tokens,
             pos: 0,
             param_index: 0,
+            expr_depth: 0,
+            explain_depth: 0,
         })
     }
 
@@ -173,7 +193,13 @@ impl Parser {
         }
         if self.at_keyword("EXPLAIN") {
             self.advance();
-            let inner = self.parse_statement()?;
+            self.explain_depth += 1;
+            if self.explain_depth > 10 {
+                return Err(DbError::syntax("EXPLAIN 嵌套层数过多"));
+            }
+            let inner = self.parse_statement();
+            self.explain_depth -= 1;
+            let inner = inner?;
             if !matches!(
                 inner,
                 Statement::Select(_)
@@ -581,8 +607,23 @@ impl Parser {
 
     // ------------------------------------------------------------ 表达式
 
+    /// 递归下降的深度闸门：括号、NOT、一元 +/- 都会叠加嵌套层级
+    fn enter_expr(&mut self) -> Result<()> {
+        self.expr_depth += 1;
+        if self.expr_depth > MAX_EXPR_DEPTH {
+            return Err(DbError::syntax(format!(
+                "表达式嵌套超过 {} 层上限",
+                MAX_EXPR_DEPTH
+            )));
+        }
+        Ok(())
+    }
+
     pub fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_or()
+        self.enter_expr()?;
+        let outcome = self.parse_or();
+        self.expr_depth -= 1;
+        outcome
     }
 
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>> {
@@ -621,10 +662,12 @@ impl Parser {
 
     fn parse_not(&mut self) -> Result<Expr> {
         if self.eat_keyword("NOT") {
-            let operand = self.parse_not()?;
+            self.enter_expr()?;
+            let operand = self.parse_not();
+            self.expr_depth -= 1;
             return Ok(Expr::Unary {
                 op: UnOp::Not,
-                operand: Box::new(operand),
+                operand: Box::new(operand?),
             });
         }
         self.parse_comparison()
@@ -784,18 +827,22 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
-        if self.eat_punct("-") {
-            let operand = self.parse_unary()?;
+        let op = if self.at_punct("-") {
+            self.advance();
+            Some(UnOp::Neg)
+        } else if self.at_punct("+") {
+            self.advance();
+            Some(UnOp::Plus)
+        } else {
+            None
+        };
+        if let Some(op) = op {
+            self.enter_expr()?;
+            let operand = self.parse_unary();
+            self.expr_depth -= 1;
             return Ok(Expr::Unary {
-                op: UnOp::Neg,
-                operand: Box::new(operand),
-            });
-        }
-        if self.eat_punct("+") {
-            let operand = self.parse_unary()?;
-            return Ok(Expr::Unary {
-                op: UnOp::Plus,
-                operand: Box::new(operand),
+                op,
+                operand: Box::new(operand?),
             });
         }
         self.parse_primary()
@@ -1080,5 +1127,31 @@ mod tests {
     #[test]
     fn trailing_content_is_error() {
         assert!(Parser::parse("SELECT * FROM t extra stuff").is_err());
+    }
+
+    #[test]
+    fn deep_expression_nesting_is_rejected_not_crash() {
+        // 曾经：1000 层嵌套括号让递归解析爆栈、整个进程 abort
+        let too_deep = format!("SELECT {}1{}", "(".repeat(MAX_EXPR_DEPTH + 1), ")".repeat(MAX_EXPR_DEPTH + 1));
+        assert!(Parser::parse(&too_deep).is_err());
+
+        let ok = format!("SELECT {}1{}", "(".repeat(50), ")".repeat(50));
+        assert!(Parser::parse(&ok).is_ok());
+
+        // 一元符号和 NOT 的自递归路径同样受限
+        let unary_chain = format!("SELECT {}1", "-".repeat(MAX_EXPR_DEPTH + 1));
+        assert!(Parser::parse(&unary_chain).is_err());
+        let not_chain = format!("SELECT {} 1", "NOT ".repeat(MAX_EXPR_DEPTH + 1));
+        assert!(Parser::parse(&not_chain).is_err());
+    }
+
+    #[test]
+    fn explain_nesting_is_bounded() {
+        // 双层 EXPLAIN 本来就被「EXPLAIN 只支持 SELECT/INSERT/UPDATE/DELETE」拒绝；
+        // explain_depth 守卫是纵深防御，防止该白名单将来放宽后递归失控
+        assert!(Parser::parse("EXPLAIN SELECT 1").is_ok());
+        assert!(Parser::parse("EXPLAIN EXPLAIN SELECT 1").is_err());
+        let chain = "EXPLAIN ".repeat(50) + "SELECT 1";
+        assert!(Parser::parse(&chain).is_err());
     }
 }

@@ -232,7 +232,11 @@ pub fn apply_unary(op: UnOp, value: &Value) -> Result<Value> {
     match op {
         UnOp::Neg => match value {
             Value::Null => Ok(Value::Null),
-            Value::Int(n) => Ok(Value::Int(-n)),
+            // i64::MIN 取负会溢出，升级为 REAL 而不是静默回绕
+            Value::Int(n) => match n.checked_neg() {
+                Some(v) => Ok(Value::Int(v)),
+                None => Ok(Value::Real(-(*n as f64))),
+            },
             Value::Real(n) => Ok(Value::Real(-n)),
             other => Err(DbError::type_error(format!(
                 "无法对 \"{}\" 取负",
@@ -288,6 +292,31 @@ fn arith(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
     }
+
+    // INT × INT 的加减乘走 i64 精确运算，避免 2^53 以上静默丢精度；
+    // 溢出时按 SQLite 语义升级为 REAL。除/取模保持 f64 语义（除 0 报错）。
+    if let (Value::Int(x), Value::Int(y)) = (left, right) {
+        let exact = match op {
+            BinOp::Add => x.checked_add(*y),
+            BinOp::Sub => x.checked_sub(*y),
+            BinOp::Mul => x.checked_mul(*y),
+            _ => None,
+        };
+        if let Some(v) = exact {
+            return Ok(Value::Int(v));
+        }
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+            let (fx, fy) = (*x as f64, *y as f64);
+            let result = match op {
+                BinOp::Add => fx + fy,
+                BinOp::Sub => fx - fy,
+                BinOp::Mul => fx * fy,
+                _ => unreachable!(),
+            };
+            return Ok(Value::Real(result));
+        }
+    }
+
     let x = left
         .as_f64()
         .ok_or_else(|| DbError::type_error(format!("无法把 \"{}\" 用于算术运算", left.as_text())))?;
@@ -321,30 +350,38 @@ fn arith(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
     }
 }
 
-/// `%` 匹配任意长度，`_` 匹配单个字符
+/// `%` 匹配任意长度，`_` 匹配单个字符。
+///
+/// 贪心双指针回溯匹配：时间 O(n+m)、内存 O(1)。
+/// 之前的 O(n·m) DP 表在「长文本 × 长模式」下会分配巨量内存
+/// （2MB 请求即可要求约 1TB），必须避免。
 pub fn like_match(text: &str, pattern: &str) -> bool {
     let text: Vec<char> = text.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
-    let n = text.len();
-    let m = pattern.len();
+    let (mut i, mut j) = (0usize, 0usize);
+    // 最近一个 '%' 及其当前尝试匹配到的 text 位置，失配时从它回溯
+    let mut star: Option<(usize, usize)> = None;
 
-    let mut dp = vec![vec![false; m + 1]; n + 1];
-    dp[0][0] = true;
-    for j in 1..=m {
-        if pattern[j - 1] == '%' {
-            dp[0][j] = dp[0][j - 1];
+    while i < text.len() {
+        if j < pattern.len() && (pattern[j] == '_' || pattern[j] == text[i]) {
+            i += 1;
+            j += 1;
+        } else if j < pattern.len() && pattern[j] == '%' {
+            star = Some((j, i));
+            j += 1;
+        } else if let Some((star_j, star_i)) = star {
+            // 让最近的 '%' 多吞一个字符，从它的下一位置重新匹配
+            j = star_j + 1;
+            i = star_i + 1;
+            star = Some((star_j, star_i + 1));
+        } else {
+            return false;
         }
     }
-    for i in 1..=n {
-        for j in 1..=m {
-            dp[i][j] = match pattern[j - 1] {
-                '%' => dp[i][j - 1] || dp[i - 1][j],
-                '_' => dp[i - 1][j - 1],
-                ch => dp[i - 1][j - 1] && text[i - 1] == ch,
-            };
-        }
+    while j < pattern.len() && pattern[j] == '%' {
+        j += 1;
     }
-    dp[n][m]
+    j == pattern.len()
 }
 
 fn eval_scalar(
@@ -725,5 +762,78 @@ mod tests {
             }
             other => panic!("期望 SELECT，得到 {:?}", other),
         }
+    }
+
+    #[test]
+    fn like_semantics_match_sql() {
+        // 与原 DP 实现语义对齐的基本用例
+        let cases = [
+            ("abc", "abc", true),
+            ("abc", "a%", true),
+            ("abc", "%c", true),
+            ("abc", "%", true),
+            ("abc", "a_c", true),
+            ("abc", "b%", false),
+            ("abc", "abcd", false),
+            ("", "", true),
+            ("", "%", true),
+            ("", "_", false),
+            ("abXbXc", "%X%", true),
+            ("aXbXc", "a%b%c", true),
+            ("aXbXd", "a%b%c", false),
+            ("aaa", "%a%a%a%", true),
+            ("abab", "%ab%ab%", true),
+            ("中文abc", "中文%", true),
+            ("中文abc", "%_c", true),
+        ];
+        for (text, pattern, expected) in cases {
+            assert_eq!(
+                like_match(text, pattern),
+                expected,
+                "'{}' LIKE '{}'",
+                text,
+                pattern
+            );
+        }
+        // 多个 % 交叉回溯的对抗样例
+        assert!(like_match("aaab", "a%a%a%b"));
+        assert!(!like_match("aaab", "a%a%a%c"));
+    }
+
+    #[test]
+    fn like_is_linear_not_quadratic() {
+        // 曾经：O(n·m) DP 表，n=m=30k 就要分配 ~900MB；
+        // 现在是 O(n+m)，大输入应当瞬时完成
+        let text = "a".repeat(200_000);
+        let pattern = "%".to_string() + &"a".repeat(199_999);
+        let start = std::time::Instant::now();
+        assert!(like_match(&text, &pattern));
+        assert!(start.elapsed().as_millis() < 1000, "应远快于 1 秒");
+    }
+
+    #[test]
+    fn int_arithmetic_is_exact() {
+        let eval_int = |sql: &str| -> Value {
+            let stmt = Parser::parse(sql).unwrap();
+            match stmt {
+                crate::sql::Statement::Select(select) => {
+                    eval(&select.items[0].expr, &RowContext::new(&[], Vec::new()), &[]).unwrap()
+                }
+                other => panic!("期望 SELECT，得到 {:?}", other),
+            }
+        };
+
+        // 2^53+1 曾经在 f64 里丢 1：返回 9007199254740992
+        assert_eq!(
+            eval_int("SELECT 9007199254740993 + 0"),
+            Value::Int(9007199254740993)
+        );
+        // i64 溢出按 SQLite 语义升级为 REAL
+        match eval_int("SELECT 9223372036854775807 + 1") {
+            Value::Real(n) => assert!((n - 9.223372036854776e18).abs() < 1e10),
+            other => panic!("溢出应升级为 REAL，实际 {:?}", other),
+        }
+        assert_eq!(eval_int("SELECT -9223372036854775807 - 1"), Value::Int(i64::MIN));
+        assert_eq!(eval_int("SELECT 3 * 4"), Value::Int(12));
     }
 }

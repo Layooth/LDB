@@ -245,6 +245,75 @@ fn wal_recovery_after_crash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 其它会话不能看到未提交事务的行（曾经是脏读：READ UNCOMMITTED）
+#[test]
+fn cross_session_reads_see_only_committed() {
+    use littledb::sql::executor::ConnSession;
+    use littledb::sql::QueryResult;
+    use std::sync::{Arc, Mutex};
+
+    let dir = temp_dir("isolation");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        setup(&mut engine).unwrap();
+        engine
+            .write(|e| -> Result<()> {
+                e.insert(
+                    "players",
+                    vec![Value::Int(1), Value::Text("committed".to_string()), Value::Int(0)],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Arc::new(Mutex::new(Engine::open(&dir).unwrap()));
+    let mut writer = littledb::sql::executor::ConnSession::new(Arc::clone(&engine));
+    let mut reader = littledb::sql::executor::ConnSession::new(Arc::clone(&engine));
+
+    writer.execute("BEGIN", &[]).unwrap();
+    writer
+        .execute("INSERT INTO players VALUES (2, 'uncommitted', 0)", &[])
+        .unwrap();
+
+    // 未提交的行必须不可见
+    let seen = reader.execute("SELECT COUNT(*) FROM players", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // 未提交期间，其它会话的写会被正确拒绝（全局单写锁语义保持不变）
+    assert!(reader.execute("INSERT INTO players VALUES (3, 'blocked', 0)", &[]).is_err());
+
+    writer.execute("COMMIT", &[]).unwrap();
+    // 提交之后立即可见
+    let seen = reader.execute("SELECT COUNT(*) FROM players", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(2)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // 回滚路径：未提交的行消失，且不会残留在索引/缓存里
+    writer.execute("BEGIN", &[]).unwrap();
+    writer
+        .execute("INSERT INTO players VALUES (4, 'rolled-back', 0)", &[])
+        .unwrap();
+    writer.execute("ROLLBACK", &[]).unwrap();
+    let seen = reader.execute("SELECT COUNT(*) FROM players", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(2)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    drop(writer);
+    drop(reader);
+    let engine = Arc::into_inner(engine).unwrap();
+    let mut engine = Mutex::into_inner(engine).unwrap();
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn many_rows_cross_pages() {
     let dir = temp_dir("pages");

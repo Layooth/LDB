@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::codec::Value;
 use crate::engine::Engine;
@@ -30,7 +30,14 @@ use crate::sql::executor::ConnSession;
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const MAX_HEADER: usize = 64 * 1024;
+/// 单次 socket 读的超时：客户端必须在这个时间内继续发送数据。
+/// 防止声明了 Content-Length 却不发送的连接永久占住线程（slowloris）。
+const READ_TIMEOUT_SECS: u64 = 30;
 const SESSION_TTL_SECS: u64 = 30 * 60;
+/// 事务中的会话空闲多久后自动回滚。
+/// 被抛弃的 BEGIN 会一直握着全局写锁（其它会话全部 DATABASE_LOCKED），
+/// 等 30 分钟才释放是不可接受的，所以这里用短得多的超时。
+const TXN_SESSION_TTL_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -41,6 +48,7 @@ pub struct HttpState {
     pub token: Option<String>,
     pub web_dir: PathBuf,
     pub connections: Arc<AtomicUsize>,
+    pub max_connections: usize,
     pub queries: Arc<AtomicUsize>,
     pub slow_queries: Arc<AtomicUsize>,
     pub rejected: Arc<AtomicUsize>,
@@ -53,6 +61,7 @@ impl HttpState {
         token: Option<String>,
         web_dir: PathBuf,
         connections: Arc<AtomicUsize>,
+        max_connections: usize,
         queries: Arc<AtomicUsize>,
         slow_queries: Arc<AtomicUsize>,
         rejected: Arc<AtomicUsize>,
@@ -65,6 +74,7 @@ impl HttpState {
             token,
             web_dir,
             connections,
+            max_connections,
             queries,
             slow_queries,
             rejected,
@@ -94,13 +104,28 @@ pub fn serve(state: HttpState, host: &str, port: u16) -> Result<()> {
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
+                // 与 LDBP 端共用 max_connections，防止线程被无限连接耗尽
+                if state.connections.load(Ordering::SeqCst) >= state.max_connections {
+                    state.rejected.fetch_add(1, Ordering::SeqCst);
+                    let mut stream = stream;
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
                 let state = state.clone();
                 let connections = Arc::clone(&state.connections);
-                thread::spawn(move || {
-                    connections.fetch_add(1, Ordering::SeqCst);
-                    handle(state, stream);
-                    connections.fetch_sub(1, Ordering::SeqCst);
-                });
+                let rejected = Arc::clone(&state.rejected);
+                let spawn = thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        connections.fetch_add(1, Ordering::SeqCst);
+                        handle(state, stream);
+                        connections.fetch_sub(1, Ordering::SeqCst);
+                    });
+                if spawn.is_err() {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
             }
             Err(_) => continue,
         }
@@ -136,6 +161,11 @@ impl Request {
 }
 
 fn handle(state: HttpState, mut stream: TcpStream) {
+    // 读/写超时：连接建立后客户端必须在时限内继续发数据，
+    // 否则线程不会永远等下去（防 slowloris；正常请求毫秒级完成）
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+
     let request = match read_request(&mut stream) {
         Ok(Some(r)) => r,
         _ => return,
@@ -369,13 +399,12 @@ fn fail(status: u16, code: &str, message: &str) -> (u16, Json, Vec<(String, Stri
 
 fn route(state: &HttpState, request: &Request) -> (u16, Json, Vec<(String, String)>) {
     if let Some(expected) = &state.token {
+        // 只认 Authorization 头：query 里的 token 会进访问日志和浏览器历史
         let provided = request
             .header("authorization")
             .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|s| s.to_string())
-            .or_else(|| request.param("token").map(|s| s.to_string()))
-            .unwrap_or_default();
-        if provided != *expected {
+            .unwrap_or("");
+        if provided != expected.as_str() {
             return fail(401, error::AUTH, "认证失败：缺少或错误的 access token");
         }
     }
@@ -461,11 +490,18 @@ fn with_session<T>(
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    // 顺手清理过期会话
+    // 顺手清理过期会话；事务中的会话用短超时，尽快交还全局写锁
     let now = Instant::now();
     let expired: Vec<String> = guard
         .iter()
-        .filter(|(_, (_, last))| now.duration_since(*last).as_secs() > SESSION_TTL_SECS)
+        .filter(|(_, (session, last))| {
+            let ttl = if session.in_transaction() {
+                TXN_SESSION_TTL_SECS
+            } else {
+                SESSION_TTL_SECS
+            };
+            now.duration_since(*last).as_secs() > ttl
+        })
         .map(|(id, _)| id.clone())
         .collect();
     for id in expired {
@@ -853,9 +889,18 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request) {
         rel = "/index.html".to_string();
     }
 
-    // 防止路径穿越
+    // 防止路径穿越与绝对路径逃逸：
+    // Path::join 遇到 "C:/..." 或 "//server/share" 这类绝对路径会整体替换基准目录，
+    // 所以除 ".." 之外，还必须拒绝带 Windows 盘符 / UNC 前缀的路径，
+    // 并在拼接后校验最终路径仍然位于 web_dir 之内。
     let cleaned = rel.replace('\\', "/");
-    if cleaned.contains("..") {
+    let has_drive_prefix = {
+        let bytes = cleaned.as_bytes();
+        // "C:/" 或 "C:\\"（cleaned 已把 '\' 换成 '/'，这里只看 "x:/"）
+        (bytes.len() >= 2 && bytes[1] == b':')
+            || cleaned.starts_with("//")
+    };
+    if cleaned.contains("..") || has_drive_prefix {
         send_response(
             stream,
             403,
@@ -869,6 +914,23 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request) {
 
     let web_dir = &state.web_dir;
     let mut file_path = web_dir.join(cleaned.trim_start_matches('/'));
+    let canonical_base = fs::canonicalize(web_dir).unwrap_or_else(|_| web_dir.clone());
+    // 文件不存在时 canonicalize 会失败，交给后面的 index.html 兜底处理；
+    // 这里只拦截「解析成功但落在 web_dir 之外」的路径。
+    let escapes_base = fs::canonicalize(&file_path)
+        .map(|resolved| !resolved.starts_with(&canonical_base))
+        .unwrap_or(false);
+    if escapes_base {
+        send_response(
+            stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"403 Forbidden",
+            &[],
+        );
+        return;
+    }
 
     if !file_path.is_file() {
         file_path = web_dir.join("index.html");

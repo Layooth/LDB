@@ -8,7 +8,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::codec::Value;
 use crate::engine::Engine;
@@ -79,6 +79,7 @@ impl Server {
                 self.options.token.clone(),
                 self.options.web_dir.clone(),
                 Arc::clone(&self.connections),
+                self.options.max_connections,
                 Arc::clone(&self.queries),
                 Arc::clone(&self.slow_queries),
                 Arc::clone(&self.rejected),
@@ -133,11 +134,19 @@ impl Server {
                     let rejected = Arc::clone(&self.rejected);
                     let connections = Arc::clone(&self.connections);
 
-                    thread::spawn(move || {
-                        handle_connection(
-                            stream, engine, options, active, queries, slow, rejected, connections,
-                        );
-                    });
+                    // 大栈：SQL 解析/JSON 解析的递归即使有深度上限，
+                    // 也按"最坏情况"给足余量，避免栈溢出直接 abort 进程
+                    let spawn = thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            handle_connection(
+                                stream, engine, options, active, queries, slow, rejected,
+                                connections,
+                            );
+                        });
+                    if spawn.is_err() {
+                        eprintln!("[LittleDB] 接受连接失败：线程创建失败");
+                    }
                 }
                 Err(err) => {
                     eprintln!("[LittleDB] 接受连接失败：{}", err);
@@ -175,6 +184,9 @@ fn handle_connection(
 
     connections.fetch_add(1, Ordering::SeqCst);
     let _ = stream.set_nodelay(true);
+    // 协议连接的读超时：客户端 5 分钟没有任何字节就断开。
+    // LDBP 允许长连接，但完全不限时的 idle 连接会占死 max_connections 名额。
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
 
     let mut session = ConnSession::new(engine);
     let mut authed = options.token.is_none();

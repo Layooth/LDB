@@ -216,6 +216,10 @@ impl Store {
         Ok(buf)
     }
 
+    /// 把 catalog 里没登记的表文件改名隔离（.orphan 后缀），而不是直接删除。
+    ///
+    /// 直接删除在「catalog 回退到旧版本」的掉电场景下等于丢整张表；
+    /// 改名后数据还在磁盘上，可以人工找回。
     fn cleanup_orphans(&mut self) -> usize {
         let known: HashSet<u32> = self.catalog.tables.iter().map(|t| t.id).collect();
         let entries = match fs::read_dir(&self.data_dir) {
@@ -233,7 +237,9 @@ impl Store {
                 continue;
             }
             self.files.remove(&id);
-            if fs::remove_file(entry.path()).is_ok() {
+            let mut orphan = entry.file_name();
+            orphan.push(".orphan");
+            if fs::rename(entry.path(), self.data_dir.join(orphan)).is_ok() {
                 removed += 1;
             }
         }
@@ -412,6 +418,31 @@ impl Store {
             txn.pages.insert(key, page.clone());
         }
         Ok(page)
+    }
+
+    /// 已提交视图的页读取：跳过活动事务的页缓存。
+    ///
+    /// 引擎是全局单写锁 + 单一 `store.txn`，其它会话的只读查询不能看到
+    /// 未提交事务的脏页（脏读），也不能把自己的读缓存写进别人的事务。
+    pub fn read_page_committed(&mut self, table_id: u32, page_no: u32) -> Result<Vec<u8>> {
+        self.assert_usable()?;
+        if let Some(page) = self.pending.get(&(table_id, page_no)) {
+            return Ok(page.clone());
+        }
+        let f = self.table_file(table_id)?;
+        if page_no >= f.pages {
+            return Ok(init_page(page_no));
+        }
+        let mut buf = vec![0u8; PAGE_SIZE];
+        f.file
+            .seek(SeekFrom::Start(page_no as u64 * PAGE_SIZE as u64))?;
+        match f.file.read_exact(&mut buf) {
+            Ok(()) => Ok(buf),
+            // 页号在内存页数内但磁盘上还没有：那是活动事务刚分配的页，
+            // 对已提交视图来说就是空页
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(init_page(page_no)),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// 把修改后的页写回事务缓存并标记为脏页

@@ -309,6 +309,13 @@ impl Engine {
         table::scan(&mut self.store, table)
     }
 
+    /// 只读已提交数据：其它会话有未提交事务时，SELECT 用这条路径避免脏读
+    pub fn scan_committed(&mut self, table_name: &str) -> Result<Vec<(u32, Vec<Value>)>> {
+        let position = self.table_index(table_name)?;
+        let table = &self.tables[position];
+        table::scan_committed(&mut self.store, table)
+    }
+
     pub fn find_by_equality(
         &self,
         table_name: &str,

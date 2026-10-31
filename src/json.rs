@@ -158,9 +158,14 @@ fn write_value(out: &mut String, value: &Json) {
     }
 }
 
+/// JSON 嵌套深度上限。真实数据远用不到这么深；
+/// 没有限制时深嵌套报文会让递归解析（以及 Json 树的递归 Drop）栈溢出。
+pub const MAX_JSON_DEPTH: usize = 200;
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -168,6 +173,7 @@ impl<'a> Parser<'a> {
         Parser {
             bytes: text.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -195,6 +201,17 @@ impl<'a> Parser<'a> {
                 ch as char, self.pos
             )))
         }
+    }
+
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_JSON_DEPTH {
+            return Err(DbError::internal(format!(
+                "JSON 嵌套超过 {} 层上限",
+                MAX_JSON_DEPTH
+            )));
+        }
+        Ok(())
     }
 
     fn parse_value(&mut self) -> Result<Json> {
@@ -234,6 +251,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_array(&mut self) -> Result<Json> {
+        self.enter()?;
+        let outcome = self.parse_array_inner();
+        self.depth -= 1;
+        outcome
+    }
+
+    fn parse_array_inner(&mut self) -> Result<Json> {
         self.expect(b'[')?;
         let mut items = Vec::new();
         self.skip_ws();
@@ -258,6 +282,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_object(&mut self) -> Result<Json> {
+        self.enter()?;
+        let outcome = self.parse_object_inner();
+        self.depth -= 1;
+        outcome
+    }
+
+    fn parse_object_inner(&mut self) -> Result<Json> {
         self.expect(b'{')?;
         let mut items = Vec::new();
         self.skip_ws();
@@ -523,5 +554,17 @@ mod tests {
         assert_eq!(b64_encode(b"abc"), "YWJj");
         assert_eq!(b64_encode(b"abcd"), "YWJjZA==");
         assert_eq!(b64_decode("YWJj").unwrap(), b"abc".to_vec());
+    }
+
+    #[test]
+    fn deep_nesting_is_rejected_not_crash() {
+        // 曾经：深嵌套会让递归解析爆栈、整个进程 abort
+        for depth in [MAX_JSON_DEPTH + 1, 100_000] {
+            let text = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            assert!(parse(&text).is_err(), "深度 {} 应被拒绝", depth);
+        }
+        // 上限内的正常嵌套不受影响
+        let ok = format!("{}{}", "[".repeat(MAX_JSON_DEPTH), "]".repeat(MAX_JSON_DEPTH));
+        assert!(parse(&ok).is_ok());
     }
 }

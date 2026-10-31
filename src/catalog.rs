@@ -19,6 +19,7 @@
 //! ```
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use crate::codec::{format_datetime_from_millis, Column, ColumnType, Value};
@@ -138,11 +139,17 @@ impl Catalog {
         })
     }
 
-    /// 原子写：先写临时文件再 rename，避免半截 catalog
+    /// 原子写：先写临时文件再 rename，避免半截 catalog。
+    /// tmp 必须先 fsync：WAL 截断后 catalog 是唯一凭证，
+    /// 掉电时 rename 到位的文件不能是空/半截内容。
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = self.to_json().to_string();
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, text.as_bytes())?;
+        {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
         fs::rename(&tmp, path)?;
         Ok(())
     }

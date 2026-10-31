@@ -541,10 +541,53 @@ impl Parser {
             }
         }
 
+        // `ON CONFLICT [(列...)] DO NOTHING | DO UPDATE SET 列 = 表达式, ...
+        let on_conflict = if self.at_keyword("ON") {
+            self.advance();
+            self.expect_keyword("CONFLICT")?;
+            let mut target = Vec::new();
+            if self.at_punct("(") {
+                self.advance();
+                loop {
+                    target.push(self.expect_ident()?);
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+                self.expect_punct(")")?;
+            }
+            self.expect_keyword("DO")?;
+            if self.eat_keyword("NOTHING") {
+                Some(OnConflict {
+                    target,
+                    action: ConflictAction::Nothing,
+                })
+            } else {
+                self.expect_keyword("UPDATE")?;
+                self.expect_keyword("SET")?;
+                let mut assignments = Vec::new();
+                loop {
+                    let name = self.expect_ident()?;
+                    self.expect_punct("=")?;
+                    assignments.push((name, self.parse_expr()?));
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+                Some(OnConflict {
+                    target,
+                    action: ConflictAction::Update(assignments),
+                })
+            }
+        } else {
+            None
+        };
+
         Ok(Statement::Insert(InsertStmt {
             table,
             columns,
             values,
+            on_conflict,
         }))
     }
 
@@ -1123,6 +1166,19 @@ impl Parser {
                 "NULL" => {
                     self.advance();
                     Ok(Expr::Literal(Literal::Null))
+                }
+                // UPSERT 的 `EXCLUDED.列`：引用「本次想插入的那一行」
+                "EXCLUDED" => {
+                    self.advance();
+                    if !self.at_punct(".") {
+                        return Err(DbError::syntax("EXCLUDED 后面必须跟 .列名"));
+                    }
+                    self.advance();
+                    let column = self.expect_ident()?;
+                    Ok(Expr::Column {
+                        table: Some("excluded".to_string()),
+                        name: column,
+                    })
                 }
                 _ => Err(DbError::syntax(format!(
                     "表达式中不能使用关键字 {}",

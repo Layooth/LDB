@@ -87,6 +87,10 @@ pub enum QueryResult {
     },
     Insert {
         inserted: usize,
+        /// UPSERT 命中的更新行数
+        updated: usize,
+        /// `ON CONFLICT DO NOTHING` 跳过的行数
+        skipped: usize,
         /// 自增列分配出的值（表里没有自增列时为空）
         ids: Vec<i64>,
     },
@@ -177,7 +181,18 @@ impl QueryResult {
         match self {
             QueryResult::Select { rows, .. } => format!("{} 行", rows.len()),
             QueryResult::Explain { rows, .. } => format!("{} 步", rows.len()),
-            QueryResult::Insert { inserted, .. } => format!("插入 {} 行", inserted),
+            QueryResult::Insert {
+                inserted,
+                updated,
+                skipped,
+                ..
+            } => {
+                if *updated == 0 && *skipped == 0 {
+                    format!("插入 {} 行", inserted)
+                } else {
+                    format!("插入 {} 行，更新 {} 行，跳过 {} 行", inserted, updated, skipped)
+                }
+            }
             QueryResult::Update { updated } => format!("更新 {} 行", updated),
             QueryResult::Delete { deleted } => format!("删除 {} 行", deleted),
             QueryResult::Ddl { message } => message.clone(),
@@ -213,9 +228,16 @@ impl QueryResult {
                 ("rows".to_string(), rows_to_json(rows)),
                 ("rowCount".to_string(), Json::Num(rows.len() as f64)),
             ]),
-            QueryResult::Insert { inserted, ids } => Json::Obj(vec![
+            QueryResult::Insert {
+                inserted,
+                updated,
+                skipped,
+                ids,
+            } => Json::Obj(vec![
                 ("type".to_string(), Json::str("insert")),
                 ("inserted".to_string(), Json::Num(*inserted as f64)),
+                ("updated".to_string(), Json::Num(*updated as f64)),
+                ("skipped".to_string(), Json::Num(*skipped as f64)),
                 // 自增列分配出的值；没有自增列时是空数组、lastId 为 null
                 (
                     "ids".to_string(),
@@ -655,7 +677,7 @@ fn run_with_engine(
         Statement::Select(select) => {
             exec_select(engine, select, params, committed_only, Some(owner))
         }
-        Statement::Insert(insert) => exec_insert(engine, insert, params),
+        Statement::Insert(insert) => exec_insert(engine, insert, params, owner),
         Statement::Update(update) => exec_update(engine, update, params, owner),
         Statement::Delete(delete) => exec_delete(engine, delete, params, owner),
         Statement::CreateTable(create) => {
@@ -1958,7 +1980,12 @@ fn index_candidates(
 
 // ------------------------------------------------------------------ 写语句
 
-fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Result<QueryResult> {
+fn exec_insert(
+    engine: &mut Engine,
+    stmt: &InsertStmt,
+    params: &[Value],
+    owner: u64,
+) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
     // 表级写锁：同表 DML 串行（页内容冲突要求）。
     // 注意调用方已持引擎全局写锁，跨表并行当前并不成立（见 ConnSession 的说明）
@@ -1988,8 +2015,50 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
         None => (0..columns.len()).collect(),
     };
 
+    // 冲突判定列（UPSERT）：显式 target，未写则用主键。
+    // 必须有可用的索引，否则每行都全表扫描，代价离谱。
+    let conflict_slots: Option<(Vec<usize>, Option<&Vec<(String, Expr)>>)> = match &stmt.on_conflict {
+        None => None,
+        Some(conflict) => {
+            let names: Vec<String> = if conflict.target.is_empty() {
+                columns
+                    .iter()
+                    .filter(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .collect()
+            } else {
+                conflict.target.clone()
+            };
+            if names.is_empty() {
+                return Err(DbError::syntax(
+                    "ON CONFLICT 需要指定冲突列，或表上要有主键",
+                ));
+            }
+            let mut slots = Vec::with_capacity(names.len());
+            for name in &names {
+                match position.get(&name.to_lowercase()) {
+                    Some(slot) => slots.push(*slot),
+                    None => {
+                        return Err(DbError::not_found(format!(
+                            "冲突列 \"{}\" 不存在于表 \"{}\"",
+                            name, stmt.table
+                        )))
+                    }
+                }
+            }
+            let assigns = match &conflict.action {
+                // Some(_) = DO UPDATE SET ...；None = DO NOTHING
+                ConflictAction::Update(assigns) => Some(assigns),
+                ConflictAction::Nothing => None,
+            };
+            Some((slots, assigns))
+        }
+    };
+
     let empty = RowContext::new(&[], Vec::new());
     let mut inserted = 0usize;
+    let mut updated = 0usize;
+    let mut skipped = 0usize;
     // 自增列分配出来的值（没有自增列时为空）
     let mut ids: Vec<i64> = Vec::new();
 
@@ -2015,6 +2084,71 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
             values[*slot] = codec::coerce(columns[*slot].ty, columns[*slot].scale, &raw)?;
         }
 
+        // ---------------------------------------------------------- UPSERT
+        // 冲突判定走索引（主键 / 唯一索引 / 前导列索引）：命中则更新或跳过。
+        // 我们的唯一约束是**提交期**才检查的，所以这里必须显式查一次索引，
+        // 否则同一事务里连续两条 UPSERT 会各自插一行、提交时才报冲突。
+        if let Some((slots, assignments)) = &conflict_slots {
+            let mut key: Vec<(String, Value)> = Vec::with_capacity(slots.len());
+            let mut usable = true;
+            for slot in slots {
+                if values[*slot].is_null() {
+                    // 冲突列含 NULL：唯一索引不索引 NULL，按「不冲突」处理
+                    usable = false;
+                    break;
+                }
+                key.push((columns[*slot].name.clone(), values[*slot].clone()));
+            }
+            let hit = if usable {
+                match engine.find_by_index(&stmt.table, &key, Some(owner))? {
+                    Some(lookup) => lookup.ids.first().copied(),
+                    // 冲突列上没有索引 → 没法判定冲突，直接报错而不是逐行全表扫
+                    None => {
+                        let names: Vec<String> =
+                            slots.iter().map(|s| columns[*s].name.clone()).collect();
+                        return Err(DbError::syntax(format!(
+                            "ON CONFLICT 的列（{}）上没有可用索引：需要主键或唯一索引",
+                            names.join(", ")
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(row_id) = hit {
+                match assignments {
+                    None => {
+                        skipped += 1;
+                        continue;
+                    }
+                    Some(assignments) => {
+                        let current = engine
+                            .get(&stmt.table, row_id)?
+                            .ok_or_else(|| DbError::internal("冲突行在更新时消失"))?;
+                        // 现有行用裸列名，新行以 EXCLUDED.列 暴露：
+                        // 这样 `SET name = EXCLUDED.name` 与 `SET n = n + 1` 都能写
+                        let mut combined = current.clone();
+                        combined.extend(values.iter().cloned());
+                        let ctx = RowContext::with_qualified_alias(&columns, combined, "excluded");
+                        let mut next = current;
+                        for (name, expr) in assignments.iter() {
+                            let slot = *position.get(&name.to_lowercase()).ok_or_else(|| {
+                                DbError::not_found(format!(
+                                    "列 \"{}\" 不存在于表 \"{}\"",
+                                    name, stmt.table
+                                ))
+                            })?;
+                            let raw = eval(expr, &ctx, params)?;
+                            next[slot] = codec::coerce(columns[slot].ty, columns[slot].scale, &raw)?;
+                        }
+                        engine.update(&stmt.table, row_id, next)?;
+                        updated += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         let (_, auto_value) = engine.insert_returning(&stmt.table, values)?;
         if let Some(id) = auto_value {
             ids.push(id);
@@ -2022,7 +2156,12 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
         inserted += 1;
     }
 
-    Ok(QueryResult::Insert { inserted, ids })
+    Ok(QueryResult::Insert {
+        inserted,
+        updated,
+        skipped,
+        ids,
+    })
 }
 
 /// UPDATE / DELETE 的行来源：能用索引就只取候选行，否则退回全表扫描。

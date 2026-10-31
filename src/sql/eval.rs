@@ -69,6 +69,24 @@ impl RowContext {
         }
     }
 
+    /// 构造「现有行 + 一个只能用限定名访问的来源」上下文。
+    ///
+    /// UPSERT 用：`values` = 现有行 ++ 待插入行，`alias`（excluded）只写入
+    /// 限定名映射，不参与裸列名与歧义判定——否则 `SET hits = hits + 1`
+    /// 会因为两段都有 `hits` 被判成「歧义」。
+    pub fn with_qualified_alias(columns: &[Column], values: Vec<Value>, alias: &str) -> RowContext {
+        let width = columns.len();
+        let alias_lc = alias.to_lowercase();
+        let mut ctx = RowContext::new(columns, values);
+        for (i, column) in columns.iter().enumerate() {
+            let value = ctx.values.get(width + i).cloned().unwrap_or(Value::Null);
+            ctx.qualified
+                .insert(format!("{}.{}", alias_lc, column.name.to_lowercase()), value);
+        }
+        ctx.aliases.push(alias_lc);
+        ctx
+    }
+
     /// qualifier：`u.name` 里的 `u`；单表行传 None
     pub fn field(&self, qualifier: Option<&str>, name: &str) -> Result<&Value> {
         let name_lc = name.to_lowercase();

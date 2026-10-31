@@ -172,6 +172,24 @@ pub struct InsertStmt {
     pub table: String,
     pub columns: Option<Vec<String>>,
     pub values: Vec<Vec<Expr>>,
+    /// `ON CONFLICT ...`（UPSERT）；None = 普通插入
+    pub on_conflict: Option<OnConflict>,
+}
+
+/// `ON CONFLICT` 的动作
+#[derive(Debug, Clone)]
+pub enum ConflictAction {
+    /// `DO NOTHING`：冲突时跳过该行
+    Nothing,
+    /// `DO UPDATE SET ...`：冲突时更新已有行（可用 `EXCLUDED.列` 引用新行）
+    Update(Vec<(String, Expr)>),
+}
+
+#[derive(Debug, Clone)]
+pub struct OnConflict {
+    /// 冲突判定列；空表示用主键
+    pub target: Vec<String>,
+    pub action: ConflictAction,
 }
 
 #[derive(Debug, Clone)]

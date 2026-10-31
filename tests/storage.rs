@@ -1296,7 +1296,9 @@ fn auto_increment_assigns_and_reports_ids() {
         .execute("INSERT INTO t (name) VALUES ('a'),('b')", &[])
         .unwrap();
     match &result {
-        QueryResult::Insert { inserted, ids } => {
+        QueryResult::Insert {
+            inserted, ids, ..
+        } => {
             assert_eq!(*inserted, 2);
             assert_eq!(ids, &vec![1, 2], "应回报分配到的 id");
         }
@@ -1348,6 +1350,121 @@ fn auto_increment_assigns_and_reports_ids() {
     assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
 
     reopened.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// UPSERT：主键/唯一索引冲突更新、DO NOTHING、EXCLUDED 引用、无索引报错
+#[test]
+fn upsert_on_conflict() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("upsert");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute(
+            "CREATE TABLE s (\n\
+               id INT PRIMARY KEY AUTO_INCREMENT,\n\
+               name TEXT,\n\
+               hits INT DEFAULT 0,\n\
+               email TEXT UNIQUE\n\
+             )",
+            &[],
+        )
+        .unwrap();
+
+    let counts = |session: &mut Session, sql: &str| -> (usize, usize, usize, Vec<i64>) {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Insert {
+                inserted,
+                updated,
+                skipped,
+                ids,
+            } => (inserted, updated, skipped, ids),
+            other => panic!("期望 INSERT，得到 {:?}", other),
+        }
+    };
+
+    // 先插一行（id 自动 = 1）
+    assert_eq!(
+        counts(&mut session, "INSERT INTO s (name, email) VALUES ('a','a@x')"),
+        (1, 0, 0, vec![1])
+    );
+
+    // 主键冲突 → 更新；EXCLUDED 取新行的值，hits 累加在旧值上
+    assert_eq!(
+        counts(
+            &mut session,
+            "INSERT INTO s (id, name, hits) VALUES (1,'b',5)\n\
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, hits = hits + 1"
+        ),
+        (0, 1, 0, vec![])
+    );
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+    assert_eq!(
+        rows(&mut session, "SELECT id, name, hits, email FROM s WHERE id = 1"),
+        vec![vec![
+            Value::Int(1),
+            Value::Text("b".into()),
+            // 旧值 0 + 1（EXCLUDED.hits 是 5，但这里没引用它）
+            Value::Int(1),
+            Value::Text("a@x".into()), // 没被赋值，保持原值
+        ]]
+    );
+
+    // DO NOTHING（冲突列省略 → 用主键）
+    assert_eq!(
+        counts(
+            &mut session,
+            "INSERT INTO s (id, name) VALUES (1,'zzz') ON CONFLICT DO NOTHING"
+        ),
+        (0, 0, 1, vec![])
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT name FROM s WHERE id = 1"),
+        vec![vec![Value::Text("b".into())]],
+        "DO NOTHING 不能改数据"
+    );
+
+    // 唯一索引冲突（email 有 uq_ 隐式索引）
+    assert_eq!(
+        counts(
+            &mut session,
+            "INSERT INTO s (name, email) VALUES ('c','a@x')\n\
+             ON CONFLICT (email) DO UPDATE SET hits = hits + 10"
+        ),
+        (0, 1, 0, vec![])
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT hits FROM s WHERE id = 1"),
+        vec![vec![Value::Int(11)]]
+    );
+    assert_eq!(rows(&mut session, "SELECT COUNT(*) FROM s"), vec![vec![Value::Int(1)]]);
+
+    // 不冲突 → 正常插入，自增继续往下走
+    assert_eq!(
+        counts(
+            &mut session,
+            "INSERT INTO s (name, email) VALUES ('d','d@x') ON CONFLICT (id) DO UPDATE SET hits = 1"
+        ),
+        (1, 0, 0, vec![2])
+    );
+
+    // 冲突列没有索引 → 明确报错，而不是逐行全表扫
+    let err = session
+        .execute(
+            "INSERT INTO s (name, email) VALUES ('e','e@x') ON CONFLICT (name) DO NOTHING",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    assert!(err.message.contains("索引"), "{}", err.message);
+
+    session.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

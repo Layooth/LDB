@@ -141,7 +141,7 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | 类别 | 支持 |
 |---|---|
 | DDL | `CREATE TABLE`（列级 PK/NOT NULL/UNIQUE/DEFAULT/**AUTO_INCREMENT**、表级 PK、IF NOT EXISTS）、`DROP TABLE`、`CREATE/DROP [UNIQUE] INDEX`、`ALTER TABLE`（`ADD [COLUMN]` / `DROP [COLUMN]` / `RENAME COLUMN a TO b` / `RENAME TO c`） |
-| DML | `INSERT INTO t [(列)] VALUES (...),(...)`、`UPDATE ... SET ... [WHERE]`、`DELETE FROM ... [WHERE]` |
+| DML | `INSERT INTO t [(列)] VALUES (...),(...)`、`INSERT ... ON CONFLICT [(列)] DO UPDATE SET ... / DO NOTHING`（UPSERT，可用 `EXCLUDED.列` 引用待插入行）、`UPDATE ... SET ... [WHERE]`、`DELETE FROM ... [WHERE]` |
 | 查询 | `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`/`UNION [ALL]`、`INNER/LEFT/CROSS JOIN`（左深树，嵌套循环）、`IN (SELECT ...)`（非关联单列） |
 | 事务 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` |
 | 元命令 | `SHOW TABLES`、`DESCRIBE t`、`EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` |
@@ -179,10 +179,11 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 `insert` 结果会回报自增列分配出的值，省掉再查一次：
 
 ```json
-{ "type": "insert", "inserted": 2, "ids": [1, 2], "lastId": 2 }
+{ "type": "insert", "inserted": 2, "updated": 0, "skipped": 0, "ids": [1, 2], "lastId": 2 }
 ```
 
-没有 `AUTO_INCREMENT` 列时 `ids` 为空数组、`lastId` 为 `null`。
+没有 `AUTO_INCREMENT` 列时 `ids` 为空数组、`lastId` 为 `null`；`updated`/`skipped`
+是 UPSERT 命中的更新/跳过行数（普通 INSERT 恒为 0）。
 自增列语义：插入时该列为 `NULL`（或列在 `INSERT` 列表里被省略）就分配下一个值；
 显式写入更大的值会把游标顶到 `值+1`，所以手工指定 id、`dump`/`load` 都不会撞车。
 游标（`nextAutoId`）随 catalog 持久化，重启不丢。

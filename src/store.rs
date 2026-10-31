@@ -6,7 +6,7 @@
 //!   3. WAL 超过阈值自动 checkpoint
 //! 崩溃后只重放带 commit 标记的事务。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,9 @@ use crate::page::{init_page, PAGE_SIZE};
 use crate::wal::{Wal, WalRecord};
 
 pub type PageKey = (u32, u32);
+
+/// 单次增量 checkpoint 最多落盘的页数（约 4MB），限制单次停顿时长
+const CHECKPOINT_PAGE_CAP: usize = 1024;
 
 /// 提交持久化屏障：写路径只负责把 WAL 字节落进 OS 缓存并发布序号，
 /// fsync 由后台线程批量完成；full 模式下调用方在【释放引擎写锁之后】
@@ -200,8 +203,8 @@ pub struct Store {
     txn_owner: Option<u64>,
     /// 每会话一个开放事务（P1 阶段由单写者门禁保证同时最多一个）
     txns: HashMap<u64, Txn>,
-    /// 已提交未落盘的页集合，按 seq 升序
-    committed: Vec<CommittedPages>,
+    /// 已提交未落盘的页集合，按 seq 升序（checkpoint 从队头增量落盘）
+    committed: VecDeque<CommittedPages>,
     pub catalog: Catalog,
     committed_catalog: Catalog,
     wal: Wal,
@@ -245,7 +248,7 @@ impl Store {
             committed_catalog: Catalog::empty(),
             wal: Wal::open(&wal_path)?,
             txns: HashMap::new(),
-            committed: Vec::new(),
+            committed: VecDeque::new(),
             pending_drops: Vec::new(),
             catalog_pending: false,
             wal_limit: 8 * 1024 * 1024,
@@ -630,7 +633,7 @@ impl Store {
 
         // 提交页集合挂入有序列表；seq 在下方递增后回填
         let entry_seq = self.commit_seq + 1;
-        self.committed.push(CommittedPages {
+        self.committed.push_back(CommittedPages {
             seq: entry_seq,
             pages: txn
                 .dirty
@@ -647,6 +650,8 @@ impl Store {
         }
 
         if self.wal.bytes >= self.wal_limit {
+            // 增量 checkpoint：有开放事务也能安全推进（只落盘水位线内的条目）。
+            // 只有真实 I/O 错误才会标记 needs_recovery。
             if let Err(err) = self.checkpoint() {
                 self.needs_recovery = true;
                 return Err(DbError::internal(format!(
@@ -658,7 +663,7 @@ impl Store {
 
         // 发布提交序号；full 模式由调用方在【释放引擎写锁之后】等待 fsync 确认
         self.commit_seq += 1;
-        debug_assert_eq!(self.committed.last().unwrap().seq, self.commit_seq);
+        debug_assert_eq!(self.committed.back().unwrap().seq, self.commit_seq);
         self.commit_barrier.publish(self.commit_seq);
         Ok(())
     }
@@ -697,32 +702,57 @@ impl Store {
         }
     }
 
+    /// 增量 checkpoint：
+    /// - 只落盘 `seq <= 最老活跃快照` 的提交条目（开放事务的读视图不受影响）
+    /// - 每次最多落盘 CHECKPOINT_PAGE_CAP 页，单次停顿有界；没落完下次继续
+    /// - WAL 只在全部条目落盘后才截断（否则崩溃恢复会丢失未落盘的已提交数据）
+    /// 因此有开放事务时也能安全推进，不再拒绝执行。
     pub fn checkpoint(&mut self) -> Result<()> {
-        if !self.txns.is_empty() {
-            return Err(DbError::internal("不能在事务进行中执行 checkpoint"));
+        self.checkpoint_inner(CHECKPOINT_PAGE_CAP)
+    }
+
+    /// 全量 checkpoint：循环增量落盘直到清空（close 前使用）
+    pub fn checkpoint_full(&mut self) -> Result<()> {
+        while !self.committed.is_empty() {
+            self.checkpoint_inner(CHECKPOINT_PAGE_CAP)?;
         }
-        // WAL 截断前必须确认所有已写入的提交都已 fsync
+        Ok(())
+    }
+
+    fn checkpoint_inner(&mut self, page_cap: usize) -> Result<()> {
+        // WAL 截断（如果发生）前必须确认所有已写入的提交都已 fsync
         self.commit_barrier.wait_all()?;
-        // 水位线：只落盘 seq <= 最老活跃快照 的提交页，
-        // 更新的条目留给开放事务的快照读
         let watermark = self.snapshot_watermark();
-        let mut pending: HashMap<PageKey, Vec<u8>> = HashMap::new();
-        self.committed.retain(|entry| {
-            if entry.seq <= watermark {
-                // 升序合并：同一页以更高的 seq 为准
-                for (key, page) in &entry.pages {
-                    pending.insert(*key, page.clone());
-                }
-                false
-            } else {
-                true
-            }
-        });
+
+        // 从最旧的条目开始落盘，直到水位线或页数上限
         let mut touched: HashSet<u32> = HashSet::new();
-        for ((table_id, page_no), page) in pending.iter() {
-            self.write_page_raw(*table_id, *page_no, page)?;
-            touched.insert(*table_id);
+        let mut flushed_pages = 0usize;
+        let mut drained = true;
+        loop {
+            let entry_pages = match self.committed.front() {
+                Some(entry) if entry.seq <= watermark => entry.pages.clone(),
+                Some(_) => {
+                    drained = false;
+                    break;
+                }
+                None => break,
+            };
+            for (key, page) in &entry_pages {
+                self.write_page_raw(key.0, key.1, page)?;
+                touched.insert(key.0);
+                flushed_pages += 1;
+            }
+            self.committed.pop_front();
+            if flushed_pages >= page_cap {
+                drained = false;
+                break;
+            }
         }
+
+        if touched.is_empty() && drained && !self.catalog_pending {
+            return Ok(()); // 无事可做
+        }
+
         for table_id in &touched {
             if let Some(f) = self.files.get(table_id) {
                 f.file.sync_all()?;
@@ -737,7 +767,12 @@ impl Store {
             self.read_handles.remove(&table_id);
             let _ = fs::remove_file(self.table_file_path(table_id));
         }
-        self.wal.truncate(false)?;
+        // 只有全部条目都已落盘才允许截断 WAL；
+        // 还有残留（水位线被开放事务压住/达到页数上限）时保留完整 WAL，
+        // 崩溃恢复靠它重放未落盘的已提交事务。
+        if drained {
+            self.wal.truncate(false)?;
+        }
         self.checkpoints += 1;
         Ok(())
     }
@@ -919,9 +954,9 @@ impl Store {
             self.txns.clear();
             self.txn_owner = None;
         }
-        // 先确认全部提交落盘，再 checkpoint（会截断 WAL）
+        // 先确认全部提交落盘，再全量 checkpoint（会截断 WAL）
         let _ = self.commit_barrier.wait_all();
-        let _ = self.checkpoint();
+        let _ = self.checkpoint_full();
         self.shutdown_sync_thread();
         for (_, f) in self.files.iter() {
             let _ = f.file.sync_all();

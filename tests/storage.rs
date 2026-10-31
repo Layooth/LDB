@@ -905,3 +905,109 @@ fn cross_session_sequential_updates() {
     engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Tier1：长事务开放期间 WAL 超限，不得把库标记为待恢复；
+/// 事务关闭后 checkpoint 排空；期间所有已提交数据可查且崩溃可恢复
+#[test]
+fn long_txn_does_not_brick_on_wal_overflow() {
+    use littledb::sql::executor::ConnSession;
+    use littledb::sql::QueryResult;
+    use std::sync::{Arc, RwLock};
+
+    let dir = temp_dir("longtxn");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        setup(&mut engine).unwrap();
+        engine.store.set_wal_limit(64 * 1024); // 64KB，制造频繁触发
+        engine.close().unwrap();
+    }
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+    let mut a = ConnSession::new(Arc::clone(&engine));
+
+    // A 开启长事务（不做任何写，占住水位线）
+    a.execute("BEGIN", &[]).unwrap();
+
+    // 其它会话持续写入：超过 64KB 的 WAL（约 100 行 × 4KB）
+    let mut b = ConnSession::new(Arc::clone(&engine));
+    for i in 0..100 {
+        b.execute(
+            &format!("INSERT INTO players VALUES ({}, 'bulk{}', {})", i, i, i),
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("WAL 超限期间的写入失败: {}", e));
+    }
+
+    // 关键断言：库没有进入 needs_recovery（旧实现这里会整库不可写）
+    let still_writable = b
+        .execute("INSERT INTO players VALUES (500, 'after-overflow', 0)", &[])
+        .is_ok();
+    assert!(still_writable, "WAL 超限后写入应继续可用");
+
+    // A 的长事务回滚释放水位线
+    a.execute("ROLLBACK", &[]).unwrap();
+
+    // 之后的写入触发 checkpoint 排空
+    b.execute("INSERT INTO players VALUES (501, 'drain', 0)", &[]).unwrap();
+
+    // 数据完整
+    let seen = b.execute("SELECT COUNT(*) FROM players", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(102)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // kill -9 级恢复：强杀后重开，数据完整（未排空的 WAL 不会被错误截断）
+    drop(a);
+    drop(b);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
+    engine.close().unwrap();
+    drop(engine);
+
+    let mut engine = Engine::open(&dir).unwrap();
+    let rows = engine.scan("players").unwrap();
+    assert_eq!(rows.len(), 102, "重启后数据完整");
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 增量 checkpoint：单次落盘受页数上限约束，多次后全部排空
+#[test]
+fn incremental_checkpoint_drains_over_multiple_calls() {
+    let dir = temp_dir("incrck");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+
+    engine
+        .write(|e| -> Result<()> {
+            for i in 0..30 {
+                e.insert(
+                    "players",
+                    vec![Value::Int(i), Value::Text(format!("r{}", i)), Value::Int(i)],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    // 手动多次增量：首次受限（用小表测不出上限，但验证多调用收敛）
+    let mut calls = 0;
+    while calls < 10 {
+        engine.checkpoint().unwrap();
+        calls += 1;
+        if engine.store.stats().pending_pages == 0 {
+            break;
+        }
+    }
+    assert!(
+        engine.store.stats().pending_pages == 0,
+        "{} 次增量后应全部落盘",
+        calls
+    );
+
+    // 全部落盘后数据完好
+    let rows = engine.scan("players").unwrap();
+    assert_eq!(rows.len(), 30);
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -44,6 +44,8 @@ const TXN_SESSION_TTL_SECS: u64 = 120;
 const MAX_SESSIONS: usize = 512;
 /// 认证失败限速的默认阈值（与 ServerOptions 的默认值保持一致）
 const DEFAULT_AUTH_FAIL_LIMIT: u32 = 5;
+/// 同一会话的并发请求最多等待多久（超过返回 503 SESSION_BUSY）
+const DEFAULT_SESSION_WAIT_SECS: u64 = 30;
 
 /// 一个 HTTP 会话。
 ///
@@ -107,6 +109,8 @@ pub struct HttpState {
     cors_origin: Option<String>,
     /// 认证失败限速（与 LDBP 端口共用同一份计数）
     auth: Arc<AuthLimiter>,
+    /// 同一会话被占用时，等待多久算超时
+    session_wait: Duration,
 }
 
 impl HttpState {
@@ -134,7 +138,14 @@ impl HttpState {
             rejected,
             cors_origin: None,
             auth: Arc::new(AuthLimiter::new(DEFAULT_AUTH_FAIL_LIMIT)),
+            session_wait: Duration::from_secs(DEFAULT_SESSION_WAIT_SECS),
         }
+    }
+
+    /// 调整「同会话并发等待」的超时（测试用；生产默认 30 秒）
+    pub fn with_session_wait(mut self, wait: Duration) -> HttpState {
+        self.session_wait = wait;
+        self
     }
 
     /// 配置允许的跨源来源（逗号分隔，`*` 表示不限制）
@@ -732,17 +743,24 @@ fn to_error(err: DbError) -> (u16, Json, Vec<(String, String)>) {
         409
     } else if err.code == error::RATE_LIMITED {
         429
+    } else if err.code == error::SESSION_BUSY {
+        503
     } else {
         400
     };
-    fail(status, err.code, &err.message)
+    let (status, payload, mut extra) = fail(status, err.code, &err.message);
+    // 这两类错误都是「等一会儿再来」，带 Retry-After 让客户端知道别立刻重试
+    if err.code == error::SESSION_BUSY || err.code == error::RATE_LIMITED {
+        extra.push(("Retry-After".to_string(), "1".to_string()));
+    }
+    (status, payload, extra)
 }
 
 fn with_session<T>(
     state: &HttpState,
     sid: Option<&str>,
     action: impl FnOnce(&mut ConnSession) -> T,
-) -> (String, T) {
+) -> Result<(String, T)> {
     let (id, entry) = {
         let mut guard = lock_sessions(state);
         reap_sessions(&mut guard);
@@ -769,15 +787,33 @@ fn with_session<T>(
 
     // 只锁「本会话」：同一 sid 的并发请求在此串行（一个会话就是一条连接），
     // 不同会话完全并行，长查询不会阻塞别的请求的会话解析。
-    let outcome = {
-        let mut session = match entry.session.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        action(&mut session)
+    //
+    // 但不能无限等：一个卡死的查询会让同会话的后续请求一直占着线程。
+    // 用 try_lock 轮询实现超时（std 的 Mutex 没有 lock_timeout）。
+    let deadline = Instant::now() + state.session_wait;
+    let mut session = loop {
+        match entry.session.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(DbError::new(
+                        error::SESSION_BUSY,
+                        format!(
+                            "同一会话（{}）还有请求在执行，已等待 {} 秒；请稍后重试或换一个 X-Session-Id",
+                            id,
+                            state.session_wait.as_secs()
+                        ),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
     };
+    let outcome = action(&mut session);
+    drop(session);
     entry.touch();
-    (id, outcome)
+    Ok((id, outcome))
 }
 
 fn lock_sessions(
@@ -1032,7 +1068,8 @@ fn run_sql(
         .or_else(|| payload.get("session").and_then(|v| v.as_str()).map(|s| s.to_string()));
 
     let started = Instant::now();
-    let (id, outcome) = with_session(state, sid.as_deref(), |session| session.execute(&sql, &params));
+    let (id, outcome) =
+        with_session(state, sid.as_deref(), |session| session.execute(&sql, &params))?;
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
 
     state.queries.fetch_add(1, Ordering::SeqCst);
@@ -1069,7 +1106,7 @@ fn table_rows(
     let sql = format!("SELECT * FROM {} LIMIT {} OFFSET {}", quoted, limit, offset);
     let sid = request.header("x-session-id").map(|s| s.to_string());
 
-    let (id, outcome) = with_session(state, sid.as_deref(), |session| session.execute(&sql, &[]));
+    let (id, outcome) = with_session(state, sid.as_deref(), |session| session.execute(&sql, &[]))?;
     let result = outcome?;
 
     let mut fields = match result.to_wire_json() {
@@ -1102,7 +1139,7 @@ fn drop_table(
     let sql = format!("DROP TABLE {}", quoted);
     let sid = request.header("x-session-id").map(|s| s.to_string());
 
-    let (_, outcome) = with_session(state, sid.as_deref(), |session| session.execute(&sql, &[]));
+    let (_, outcome) = with_session(state, sid.as_deref(), |session| session.execute(&sql, &[]))?;
     Ok(outcome?.to_wire_json())
 }
 
@@ -1318,4 +1355,79 @@ pub fn find_web_dir() -> PathBuf {
         }
     }
     PathBuf::from("web")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn temp_state(name: &str, wait: Duration) -> (PathBuf, HttpState) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("littledb-http-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let engine = Engine::open(&dir).unwrap();
+        let counter = || Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = HttpState::new(
+            Arc::new(RwLock::new(engine)),
+            Some("t".to_string()),
+            PathBuf::from("web"),
+            counter(),
+            4,
+            counter(),
+            counter(),
+            counter(),
+        )
+        .with_session_wait(wait);
+        (dir, state)
+    }
+
+    /// 同一会话被占用时，第二个请求必须超时报错，而不是无限阻塞
+    #[test]
+    fn same_session_wait_times_out() {
+        let (dir, state) = temp_state("busy", Duration::from_millis(150));
+        let (sid, _) = with_session(&state, None, |_| ()).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let holder_state = state.clone();
+        let holder_sid = sid.clone();
+        let holder = thread::spawn(move || {
+            with_session(&holder_state, Some(&holder_sid), |_| {
+                let _ = tx.send(());
+                thread::sleep(Duration::from_millis(600));
+            })
+            .unwrap();
+        });
+        // 等持有者真正拿到会话锁（而不是靠 sleep 猜）
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("持有者未能取得会话锁");
+
+        let started = Instant::now();
+        let err = with_session(&state, Some(&sid), |_| ()).unwrap_err();
+        assert_eq!(err.code, error::SESSION_BUSY, "{}", err.message);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "应在超时后立即返回，实际 {:?}",
+            started.elapsed()
+        );
+
+        holder.join().unwrap();
+        // 持有者释放后，同一会话立刻恢复可用
+        assert!(with_session(&state, Some(&sid), |_| ()).is_ok());
+        drop(state);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 会话忙 / 认证退避都要映射成「等会儿再来」的状态码 + Retry-After
+    #[test]
+    fn busy_and_rate_limited_map_to_retryable_status() {
+        let (status, payload, extra) = to_error(DbError::new(error::SESSION_BUSY, "busy"));
+        assert_eq!(status, 503);
+        assert!(extra.iter().any(|(k, _)| k == "Retry-After"));
+        assert!(payload.to_string().contains("SESSION_BUSY"));
+
+        let (status, _, extra) = to_error(DbError::new(error::RATE_LIMITED, "slow down"));
+        assert_eq!(status, 429);
+        assert!(extra.iter().any(|(k, _)| k == "Retry-After"));
+    }
 }

@@ -26,6 +26,8 @@ pub const PROTOCOL: &str = "PROTOCOL_ERROR";
 pub const LENGTH_REQUIRED: &str = "LENGTH_REQUIRED";
 /// 认证失败次数过多，正在退避（HTTP 429）
 pub const RATE_LIMITED: &str = "RATE_LIMITED";
+/// 同一会话还有请求在执行，等待超时（HTTP 503）
+pub const SESSION_BUSY: &str = "SESSION_BUSY";
 
 impl DbError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {

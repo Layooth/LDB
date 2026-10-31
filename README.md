@@ -160,7 +160,8 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | `POST /api/tables/:name/alter` | 结构化改表（重建） |
 
 会话：响应头 `X-Session-Id` 会话 id，后续请求带上它即可让 `BEGIN` 的事务跨请求延续。
-同一 id 的并发请求在服务端串行；不同会话互不阻塞。空闲 30 分钟（事务中 120 秒）回收。
+同一 id 的并发请求在服务端串行，**等待上限 30 秒**（超时回 503 `SESSION_BUSY` + `Retry-After`）；
+不同会话互不阻塞。空闲 30 分钟（事务中 120 秒）回收，最多同时保留 512 个会话。
 
 **错误码**（响应体 `{"ok":false,"error":{"code":"..","message":".."}}`）：
 
@@ -179,6 +180,7 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | `PROTOCOL_ERROR` | 400 | 报文非法（含重复的关键头部、非法 Content-Length） |
 | `LENGTH_REQUIRED` | 411 | 客户端用了 `Transfer-Encoding: chunked`，请改用 `Content-Length` |
 | `RATE_LIMITED` | 429 | 认证失败次数过多，正在退避（响应带 `Retry-After`） |
+| `SESSION_BUSY` | 503 | 同一 `X-Session-Id` 还有请求在执行，等待超时（带 `Retry-After`） |
 | `INTERNAL_ERROR` | 400 | 内部错误（含待恢复状态） |
 
 ## 限制一览

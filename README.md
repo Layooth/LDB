@@ -41,6 +41,16 @@ build.cmd build --release # 发布构建
 `build.cmd` 只是个包装：本机（Windows Server 2016 + VS2026）的 `link.exe` 缺系统 API，
 直接链接会返回 `0xc0000139`，脚本改用 Rust 自带的 `rust-lld`。链接器正常时直接用 cargo 即可。
 
+### 一键门禁与专项脚本
+
+```powershell
+pwsh -File tools\verify.ps1              # 测试 → 发布构建 → 部署 → 冒烟（10 项 HTTP/会话/并发/畸形请求）
+pwsh -File tools\verify.ps1 -SmokeOnly   # 只跑冒烟（用现有 littledb.exe）
+pwsh -File tools\crash-test.ps1 -Rounds 3   # 写入过程中强杀进程，重启后校验「已 ACK 的提交不丢」
+build.cmd test --release -- --ignored row_cap
+                                         # 50 万行上限的边界用例（慢，默认忽略）
+```
+
 ## 磁盘格式
 
 | 文件 | 内容 |

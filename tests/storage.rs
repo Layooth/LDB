@@ -1331,6 +1331,75 @@ fn lock_poisoning_does_not_brick_service() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 单语句 50 万行上限的**边界**验证（很慢，默认跳过）。
+///
+/// 跑法：`build.cmd test --release -- --ignored row_cap`
+#[test]
+#[ignore = "需要插入 50 万行，手动用 --release --ignored 跑"]
+fn row_cap_rejects_full_scan_but_allows_limit() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("rowcap");
+    const ROWS: i64 = 500_050; // 略超 MAX_SCAN_ROWS(500_000)
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        engine
+            .write(|e| -> Result<()> {
+                // id 做主键：这样「索引查找不受上限影响」也有得测
+                let mut id = Column::new("id", ColumnType::Int);
+                id.primary_key = true;
+                id.not_null = true;
+                e.create_table(
+                    "big",
+                    vec![id, Column::new("v", ColumnType::Int)],
+                    false,
+                )
+            })
+            .unwrap();
+        // 分批提交，避免单个事务撑爆
+        let mut inserted = 0i64;
+        while inserted < ROWS {
+            let start = inserted;
+            let end = (start + 50_000).min(ROWS);
+            engine
+                .write(|e| -> Result<()> {
+                    for i in start..end {
+                        e.insert("big", vec![Value::Int(i), Value::Int(0)])?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            inserted = end;
+        }
+        engine.close().unwrap();
+    }
+
+    let mut session = Session::open(&dir).unwrap();
+
+    // 全表物化（聚合无法下推）→ 超上限报错
+    let err = session.execute("SELECT COUNT(*) FROM big", &[]).unwrap_err();
+    assert_eq!(err.code, "LIMIT_EXCEEDED", "{}", err.message);
+
+    // DML 同样受保护
+    let err = session.execute("UPDATE big SET v = 1", &[]).unwrap_err();
+    assert_eq!(err.code, "LIMIT_EXCEEDED", "{}", err.message);
+    let err = session.execute("DELETE FROM big", &[]).unwrap_err();
+    assert_eq!(err.code, "LIMIT_EXCEEDED", "{}", err.message);
+
+    // LIMIT 下推 / 索引查找都不受影响
+    match session.execute("SELECT id FROM big LIMIT 5", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows.len(), 5),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    match session.execute("SELECT v FROM big WHERE id = 499999", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(0)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 删除只打标记、不改 freeOffset：不整理页内死空间的话，
 /// 反复「插入-删除」会让表文件一路涨（旧实现里 compact_page 是死代码）
 #[test]

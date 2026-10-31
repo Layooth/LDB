@@ -84,6 +84,9 @@ pub enum QueryResult {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
     },
+    Batch {
+        results: Vec<QueryResult>,
+    },
 }
 
 impl QueryResult {
@@ -91,6 +94,7 @@ impl QueryResult {
     pub fn to_grid(&self) -> Option<(Vec<String>, Vec<Vec<Value>>)> {
         match self {
             QueryResult::Select { columns, rows } => Some((columns.clone(), rows.clone())),
+            QueryResult::Batch { .. } => None,
             QueryResult::Explain { columns, rows } => Some((columns.clone(), rows.clone())),
             QueryResult::Tables { tables } => {
                 let rows = tables
@@ -151,6 +155,7 @@ impl QueryResult {
             QueryResult::Describe { table, columns, .. } => {
                 format!("表 {} · {} 列", table, columns.len())
             }
+            QueryResult::Batch { results } => format!("批量执行 {} 条语句", results.len()),
         }
     }
 
@@ -272,6 +277,13 @@ impl QueryResult {
                 ),
                 ("rows".to_string(), rows_to_json(rows)),
             ]),
+            QueryResult::Batch { results } => Json::Obj(vec![
+                ("type".to_string(), Json::str("batch")),
+                (
+                    "results".to_string(),
+                    Json::Arr(results.iter().map(|r| r.to_wire_json()).collect()),
+                ),
+            ]),
         }
     }
 }
@@ -370,8 +382,15 @@ impl Session {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        let statement = Parser::parse(sql)?;
-        self.execute_statement(&statement, params)
+        let statements = Parser::parse_batch(sql)?;
+        if statements.len() == 1 {
+            return self.execute_statement(&statements[0], params);
+        }
+        let mut results = Vec::new();
+        for stmt in &statements {
+            results.push(self.execute_statement(stmt, params)?);
+        }
+        Ok(QueryResult::Batch { results })
     }
 
     pub fn execute_statement(
@@ -435,39 +454,54 @@ impl ConnSession {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        let statement = Parser::parse(sql)?;
-        let needs_write = !statement.is_read_only()
-            || self.in_txn
-            || matches!(
-                statement,
-                Statement::Begin | Statement::Commit | Statement::Rollback
-            );
+        let statements = Parser::parse_batch(sql)?;
+        let needs_write = statements.iter().any(|s| {
+            !s.is_read_only()
+                || self.in_txn
+                || matches!(s, Statement::Begin | Statement::Commit | Statement::Rollback)
+        });
+
         if needs_write {
             let (outcome, barrier, seq) = {
                 let mut guard = self
                     .engine
                     .write()
                     .map_err(|_| DbError::internal("数据库锁状态异常"))?;
-                let outcome =
-                    execute_on(&mut *guard, &mut self.in_txn, &statement, params, self.session_id);
-                // full 模式下在【释放写锁之后】等待 fsync 确认（组提交：
-                // 等待期间其它会话可以继续执行写语句）
+                let mut results = Vec::new();
+                for stmt in &statements {
+                    let r = execute_on(
+                        &mut *guard,
+                        &mut self.in_txn,
+                        stmt,
+                        params,
+                        self.session_id,
+                    )?;
+                    results.push(r);
+                }
                 let barrier = guard.store.commit_barrier();
                 let seq = guard.store.last_commit_seq();
-                (outcome, barrier, seq)
+                (QueryResult::Batch { results }, barrier, seq)
             };
             if self.engine.read().unwrap().store.durable_commits() {
                 barrier.wait_for(seq)?;
             }
-            outcome
+            Ok(outcome)
         } else {
             let guard = self
                 .engine
                 .read()
                 .map_err(|_| DbError::internal("数据库锁状态异常"))?;
-            // 其它会话可能有开放写事务：只读路径只见已提交数据（绕开含未提交键的索引）
             let committed_only = guard.store.in_txn();
-            run_read_only(&guard, &statement, params, committed_only, self.session_id)
+            let mut results = Vec::new();
+            for stmt in &statements {
+                if stmt.is_read_only() {
+                    results.push(run_read_only(&guard, stmt, params, committed_only, self.session_id)?);
+                }
+            }
+            if results.len() == 1 {
+                return Ok(results.pop().unwrap());
+            }
+            Ok(QueryResult::Batch { results })
         }
     }
 
@@ -1439,84 +1473,6 @@ struct ColumnRange {
     upper: Option<(Value, bool)>,
 }
 
-/// 从 AND 树中收集某列的范围约束；不支持的范围形式返回 None
-fn collect_range(
-    expr: &Expr,
-    column_name: &str,
-    params: &[Value],
-    empty: &RowContext,
-) -> Option<ColumnRange> {
-    let mut stack: Vec<&Expr> = vec![expr];
-    let mut range = ColumnRange::default();
-    while let Some(current) = stack.pop() {
-        match current {
-            Expr::Binary {
-                op: BinOp::And,
-                left,
-                right,
-            } => {
-                stack.push(left.as_ref());
-                stack.push(right.as_ref());
-            }
-            Expr::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => {
-                if *negated {
-                    return None; // NOT BETWEEN 无法用单一范围表达
-                }
-                if let Expr::Column { name, .. } = expr.as_ref() {
-                    if !name.eq_ignore_ascii_case(column_name) {
-                        continue;
-                    }
-                    let lo = eval(low, empty, params).ok()?;
-                    let hi = eval(high, empty, params).ok()?;
-                    if lo.is_null() || hi.is_null() {
-                        return None;
-                    }
-                    merge_lower(&mut range, lo, true)?;
-                    merge_upper(&mut range, hi, true)?;
-                }
-            }
-            Expr::Binary {
-                op,
-                left,
-                right,
-            } if matches!(
-                op,
-                BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le
-            ) =>
-            {
-                // 只支持 列 OP 常量 形式（常量在右侧）
-                if let (Expr::Column { name, .. }, operand) = (left.as_ref(), right.as_ref()) {
-                    if !name.eq_ignore_ascii_case(column_name) {
-                        continue;
-                    }
-                    let bound = eval(operand, empty, params).ok()?;
-                    if bound.is_null() {
-                        return None;
-                    }
-                    let (value, inclusive) = match op {
-                        BinOp::Ge => (bound, true),
-                        BinOp::Gt => (bound, false),
-                        BinOp::Le => (bound, true),
-                        BinOp::Lt => (bound, false),
-                        _ => unreachable!(),
-                    };
-                    if matches!(op, BinOp::Gt | BinOp::Ge) {
-                        merge_lower(&mut range, value, inclusive)?;
-                    } else {
-                        merge_upper(&mut range, value, inclusive)?;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Some(range)
-}
 
 fn merge_lower(range: &mut ColumnRange, value: Value, inclusive: bool) -> Option<()> {
     match &range.lower {

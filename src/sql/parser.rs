@@ -43,6 +43,23 @@ impl Parser {
         })
     }
 
+    /// 解析多语句块：按分号拆分，返回所有语句。
+    /// 分号在字符串字面量/注释内不算边界（lexer 已处理）。
+    pub fn parse_batch(sql: &str) -> Result<Vec<Statement>> {
+        let mut parser = Parser::new(sql)?;
+        let mut statements = Vec::new();
+        loop {
+            parser.eat_punct(";");
+            if parser.at_eof() {
+                break;
+            }
+            statements.push(parser.parse_statement()?);
+            // 吃掉语句末尾的分号
+            while parser.eat_punct(";") {}
+        }
+        Ok(statements)
+    }
+
     pub fn parse(sql: &str) -> Result<Statement> {
         let mut parser = Parser::new(sql)?;
         let statement = parser.parse_statement()?;

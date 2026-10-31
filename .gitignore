@@ -3,3 +3,6 @@
 # Python 字节码（sdk/ 下有 Python 客户端与测试）
 __pycache__/
 *.pyc
+
+# 基准测试输出
+tools/bench-result.txt

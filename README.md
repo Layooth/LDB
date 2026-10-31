@@ -535,6 +535,41 @@ $payload = json_decode(curl_exec($ch), true);   // $payload['result']
 4. **改表结构用 `ALTER TABLE`**：列变更走影子表重建，数据保留但表 id 会变（应用无感知）；
 5. **大结果用 `LIMIT`/分页**：结果整体物化，单帧上限 16MB。
 
+## 性能测试
+
+`tools/bench.py` 按真实部署形态（HTTP + 认证 + 参数化）测六类场景：
+
+```powershell
+# 起一个服务（建议用 release 版 dist\littledb.exe）
+.\dist\littledb.exe serve .\bench-data --http-port 7802 --no-open --token bench
+
+# 跑基准（约 30 秒，规模可用 BENCH_* 环境变量调）
+$env:LDB_BASE = "http://127.0.0.1:7802"; $env:LDB_TOKEN = "bench"
+python tools\bench.py
+```
+
+本机基线（Windows，release 版，2 万行表，走 HTTP）：
+
+| 场景 | sync=full（默认） | sync=normal |
+|---|---|---|
+| 逐条插入（每行一次提交） | 102 ops/s | 279 ops/s |
+| 批量插入（500 行/批） | 27,920 行/s | 36,792 行/s |
+| 主键点查 | 309 ops/s（p50=0.6ms） | 246 ops/s（p50=0.6ms） |
+| 索引范围扫 | 238 ops/s（p50=0.8ms） | 182 ops/s（p50=0.9ms） |
+| 单行更新 | 108 ops/s | 202 ops/s |
+| 混合并发（4 会话 插入+查询） | 454 ops/s | 1,258 ops/s |
+
+解读：
+
+- **写入路径基本由 fsync 主导**：`sync=full` 每笔提交刷盘，逐条插入/更新 ≈100 ops/s
+  是「最坏情况下的持久写」；要吞吐就用批量插入（**27,900 行/s**）或 `--sync normal`
+  （掉电可能丢最近提交，进程崩溃仍安全）。
+- **读路径快且稳**：点查 p50 ≈ 0.6ms。
+- **已知尾巴**：读延迟 p95 ≈ 15ms（两种 sync 模式都有）——与 fsync 无关，怀疑是后台
+  checkpoint 周期性持写锁所致，尚未深挖；对吞吐无影响，介意尾延迟可作为第一个调查项。
+- 批量写入会把 WAL 撑大，checkpoint 后回落；持续写入场景关注 `data\` 目录体积。
+- HTTP 开销已计入这些数字；想测引擎极限可用 CLI（`littledb.exe sql`，独占模式，无 HTTP 层）。
+
 ## 限制一览
 
 | 项 | 值 |

@@ -180,24 +180,6 @@ pub fn scan(store: &mut Store, table: &Table) -> Result<Vec<(u32, Vec<Value>)>> 
     Ok(rows)
 }
 
-/// 只读已提交数据的全表扫描：其它会话查询时避免脏读。
-/// 内存索引在事务里会混入未提交的键，所以这条路径也不能走索引。
-pub fn scan_committed(store: &mut Store, table: &Table) -> Result<Vec<(u32, Vec<Value>)>> {
-    let pages = store.page_count(table.id);
-    let mut rows = Vec::new();
-    for page_no in 0..pages {
-        let page = store.read_page_committed(table.id, page_no)?;
-        let count = pg::slot_count(&page);
-        for slot in 0..count {
-            if let Some(record) = pg::read_record(&page, slot) {
-                let values = codec::decode_row(&table.columns, &record)?;
-                rows.push((make_row_id(page_no, slot), values));
-            }
-        }
-    }
-    Ok(rows)
-}
-
 /// 共享视图扫描（&store，读锁下并发安全）
 pub fn scan_shared(store: &Store, table: &Table, owner: Option<u64>) -> Result<Vec<(u32, Vec<Value>)>> {
     let pages = store.page_count_shared(table.id);

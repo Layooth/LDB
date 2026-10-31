@@ -65,6 +65,12 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `expr IN (SELECT ...)`：执行期被解析成 InList（非关联子查询）
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<SelectStmt>,
+        negated: bool,
+    },
     Between {
         expr: Box<Expr>,
         low: Box<Expr>,
@@ -78,7 +84,7 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectItem {
     pub expr: Expr,
     pub alias: Option<String>,
@@ -95,7 +101,7 @@ pub enum JoinKind {
 }
 
 /// FROM 子句：单表或 JOIN 树（左深）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TableSource {
     Table { name: String, alias: Option<String> },
     Join {
@@ -131,13 +137,13 @@ pub enum UnionKind {
     All,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderItem {
     pub expr: Expr,
     pub desc: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub distinct: bool,
     pub items: Vec<SelectItem>,

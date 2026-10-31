@@ -322,6 +322,7 @@ fn expr_label(expr: &Expr) -> String {
             UnOp::Plus => format!("+{}", expr_label(operand)),
             UnOp::Not => format!("NOT {}", expr_label(operand)),
         },
+        Expr::InSubquery { expr, .. } => format!("{} IN (subquery)", expr_label(expr)),
         _ => "expr".to_string(),
     }
 }
@@ -699,6 +700,107 @@ struct TablePlan {
 /// 无索引辅助的 JOIN 组合行数上限，超过直接报错而不是挂死
 const MAX_JOIN_PAIRS: usize = 2_000_000;
 
+/// 把表达式里的 `IN (SELECT ...)` 执行成 `IN (值列表)`（非关联子查询）。
+fn resolve_subqueries(
+    engine: &Engine,
+    expr: &Expr,
+    params: &[Value],
+    committed_only: bool,
+    owner: Option<u64>,
+) -> Result<Expr> {
+    match expr {
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            let inner = resolve_subqueries(engine, expr, params, committed_only, owner)?;
+            let result = exec_select(engine, query, params, committed_only, owner)?;
+            let values = match result {
+                QueryResult::Select { columns, rows } => {
+                    if columns.len() != 1 {
+                        return Err(DbError::syntax(format!(
+                            "IN 子查询只能返回一列，实际 {} 列",
+                            columns.len()
+                        )));
+                    }
+                    let mut values = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        values.push(match row.into_iter().next() {
+                            Some(Value::Null) => Literal::Null,
+                            Some(Value::Int(n)) => Literal::Int(n),
+                            Some(Value::Real(n)) => Literal::Real(n),
+                            Some(Value::Text(s)) => Literal::Text(s),
+                            Some(Value::Bool(b)) => Literal::Bool(b),
+                            None => Literal::Null,
+                        });
+                    }
+                    values
+                }
+                other => {
+                    return Err(DbError::syntax(format!(
+                        "IN 子查询必须是 SELECT，实际是 {}",
+                        other.summary()
+                    )))
+                }
+            };
+            Ok(Expr::InList {
+                expr: Box::new(inner),
+                list: values.into_iter().map(Expr::Literal).collect(),
+                negated: *negated,
+            })
+        }
+        Expr::Binary { op, left, right } => Ok(Expr::Binary {
+            op: *op,
+            left: Box::new(resolve_subqueries(engine, left, params, committed_only, owner)?),
+            right: Box::new(resolve_subqueries(engine, right, params, committed_only, owner)?),
+        }),
+        Expr::Unary { op, operand } => Ok(Expr::Unary {
+            op: *op,
+            operand: Box::new(resolve_subqueries(engine, operand, params, committed_only, owner)?),
+        }),
+        Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
+            expr: Box::new(resolve_subqueries(engine, expr, params, committed_only, owner)?),
+            negated: *negated,
+        }),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Ok(Expr::Like {
+            expr: Box::new(resolve_subqueries(engine, expr, params, committed_only, owner)?),
+            pattern: Box::new(resolve_subqueries(
+                engine,
+                pattern,
+                params,
+                committed_only,
+                owner,
+            )?),
+            negated: *negated,
+        }),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Ok(Expr::Between {
+            expr: Box::new(resolve_subqueries(engine, expr, params, committed_only, owner)?),
+            low: Box::new(resolve_subqueries(engine, low, params, committed_only, owner)?),
+            high: Box::new(resolve_subqueries(engine, high, params, committed_only, owner)?),
+            negated: *negated,
+        }),
+        Expr::InList { expr, list, negated } => Ok(Expr::InList {
+            expr: Box::new(resolve_subqueries(engine, expr, params, committed_only, owner)?),
+            list: list
+                .iter()
+                .map(|e| resolve_subqueries(engine, e, params, committed_only, owner))
+                .collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        }),
+        other => Ok(other.clone()),
+    }
+}
+
 /// SELECT 管线：输出列 + (投影值, 排序键) 对，尚未做 ORDER BY / LIMIT / UNION
 fn select_base(
     engine: &Engine,
@@ -708,6 +810,11 @@ fn select_base(
     owner: Option<u64>,
 ) -> Result<(Vec<String>, Vec<(Vec<Value>, Vec<Value>)>)> {
     // ---------------------------------------------------------------- 行来源
+    // 先解析 WHERE 里的子查询（索引候选与行过滤都用转换后的条件）
+    let where_clause = match &stmt.where_clause {
+        Some(expr) => Some(resolve_subqueries(engine, expr, params, committed_only, owner)?),
+        None => None,
+    };
     let mut plans: Vec<TablePlan> = Vec::new();
     let mut raw_rows: Vec<Vec<Value>> = Vec::new();
 
@@ -725,7 +832,7 @@ fn select_base(
                     offset: 0,
                 });
                 let candidates =
-                    index_candidates(engine, name, stmt.where_clause.as_ref(), params)?;
+                    index_candidates(engine, name, where_clause.as_ref(), params)?;
                 match candidates {
                     Some(ids) => {
                         for id in ids {
@@ -762,7 +869,7 @@ fn select_base(
         .collect();
 
     // ---------------------------------------------------------------- WHERE
-    if let Some(where_clause) = &stmt.where_clause {
+    if let Some(where_clause) = &where_clause {
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows {
             let value = eval(where_clause, &row, params)?;

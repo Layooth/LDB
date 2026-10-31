@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -142,11 +142,19 @@ pub struct TableFile {
 
 struct Txn {
     id: i64,
+    /// 事务开始时的提交序号（快照）：之后提交的内容对本事务不可见
+    snapshot: u64,
     pages: HashMap<PageKey, Vec<u8>>,
     dirty: HashSet<PageKey>,
     catalog_dirty: bool,
     drops: Vec<u32>,
     page_count_before: HashMap<u32, u32>,
+}
+
+/// 一次提交产生的页集合（按 seq 有序存放，checkpoint 时按水位线落盘）
+struct CommittedPages {
+    seq: u64,
+    pages: HashMap<PageKey, Vec<u8>>,
 }
 
 pub struct Store {
@@ -161,11 +169,13 @@ pub struct Store {
     read_handles: HashMap<u32, File>,
     /// 当前写事务的属主（会话 id）；读路径据此判断能否看到未提交页
     txn_owner: Option<u64>,
+    /// 每会话一个开放事务（P1 阶段由单写者门禁保证同时最多一个）
+    txns: HashMap<u64, Txn>,
+    /// 已提交未落盘的页集合，按 seq 升序
+    committed: Vec<CommittedPages>,
     pub catalog: Catalog,
     committed_catalog: Catalog,
     wal: Wal,
-    txn: Option<Txn>,
-    pending: HashMap<PageKey, Vec<u8>>,
     pending_drops: Vec<u32>,
     catalog_pending: bool,
     wal_limit: u64,
@@ -205,8 +215,8 @@ impl Store {
             catalog: Catalog::empty(),
             committed_catalog: Catalog::empty(),
             wal: Wal::open(&wal_path)?,
-            txn: None,
-            pending: HashMap::new(),
+            txns: HashMap::new(),
+            committed: Vec::new(),
             pending_drops: Vec::new(),
             catalog_pending: false,
             wal_limit: 8 * 1024 * 1024,
@@ -382,18 +392,6 @@ impl Store {
         Ok(())
     }
 
-    fn read_from_disk(&mut self, table_id: u32, page_no: u32) -> Result<Vec<u8>> {
-        let f = self.table_file(table_id)?;
-        if page_no >= f.pages {
-            return Ok(init_page(page_no));
-        }
-        let mut buf = vec![0u8; PAGE_SIZE];
-        f.file
-            .seek(SeekFrom::Start(page_no as u64 * PAGE_SIZE as u64))?;
-        f.file.read_exact(&mut buf)?;
-        Ok(buf)
-    }
-
     /// 把 catalog 里没登记的表文件改名隔离（.orphan 后缀），而不是直接删除。
     ///
     /// 直接删除在「catalog 回退到旧版本」的掉电场景下等于丢整张表；
@@ -427,38 +425,64 @@ impl Store {
 
     // ------------------------------------------------------------ 事务
 
+    /// 是否有任何开放事务（其它会话的）——只读路径据此走已提交视图
     pub fn in_txn(&self) -> bool {
-        self.txn.is_some()
+        !self.txns.is_empty()
+    }
+
+    /// 最老活跃快照：checkpoint 只能落盘 seq <= watermark 的已提交页，
+    /// 否则会破坏开放事务的读视图
+    fn snapshot_watermark(&self) -> u64 {
+        self.txns
+            .values()
+            .map(|t| t.snapshot)
+            .min()
+            .unwrap_or(self.commit_seq)
     }
 
     pub fn begin(&mut self, owner: u64) -> Result<()> {
         self.assert_usable()?;
-        if self.txn.is_some() {
+        // P1 单写者门禁：其它会话持有事务时仍拒绝（P2 换成写冲突检测）
+        if self
+            .txns
+            .keys()
+            .any(|existing| *existing != owner)
+        {
             return Err(DbError::new(
                 crate::error::LOCKED,
                 "数据库正被其它写事务占用，请稍后重试",
             ));
         }
+        if self.txns.contains_key(&owner) {
+            return Err(DbError::new(
+                crate::error::LOCKED,
+                "本会话已有进行中的事务",
+            ));
+        }
         self.txn_seq += 1;
         self.txn_owner = Some(owner);
-        self.txn = Some(Txn {
-            id: self.txn_seq,
-            pages: HashMap::new(),
-            dirty: HashSet::new(),
-            catalog_dirty: false,
-            drops: Vec::new(),
-            page_count_before: HashMap::new(),
-        });
+        self.txns.insert(
+            owner,
+            Txn {
+                id: self.txn_seq,
+                snapshot: self.commit_seq,
+                pages: HashMap::new(),
+                dirty: HashSet::new(),
+                catalog_dirty: false,
+                drops: Vec::new(),
+                page_count_before: HashMap::new(),
+            },
+        );
         Ok(())
     }
 
     pub fn commit(&mut self) -> Result<()> {
         self.assert_usable()?;
-        let txn = match self.txn.take() {
+        let owner = self.txn_owner.take().unwrap_or(0);
+        let txn = match self.txns.remove(&owner) {
             Some(t) => t,
             None => return Err(DbError::internal("没有进行中的事务")),
         };
-        self.txn_owner = None;
 
         let empty = txn.dirty.is_empty() && !txn.catalog_dirty;
         if empty {
@@ -502,11 +526,16 @@ impl Store {
             )));
         }
 
-        for key in &txn.dirty {
-            if let Some(page) = txn.pages.get(key) {
-                self.pending.insert(*key, page.clone());
-            }
-        }
+        // 提交页集合挂入有序列表；seq 在下方递增后回填
+        let entry_seq = self.commit_seq + 1;
+        self.committed.push(CommittedPages {
+            seq: entry_seq,
+            pages: txn
+                .dirty
+                .iter()
+                .filter_map(|key| txn.pages.get(key).map(|p| (*key, p.clone())))
+                .collect(),
+        });
         if txn.catalog_dirty {
             self.catalog_pending = true;
             self.committed_catalog = self.catalog.clone();
@@ -527,13 +556,14 @@ impl Store {
 
         // 发布提交序号；full 模式由调用方在【释放引擎写锁之后】等待 fsync 确认
         self.commit_seq += 1;
+        debug_assert_eq!(self.committed.last().unwrap().seq, self.commit_seq);
         self.commit_barrier.publish(self.commit_seq);
         Ok(())
     }
 
     pub fn rollback(&mut self) -> bool {
-        self.txn_owner = None;
-        match self.txn.take() {
+        let owner = self.txn_owner.take().unwrap_or(0);
+        match self.txns.remove(&owner) {
             Some(txn) => {
                 self.discard_txn(&txn);
                 true
@@ -554,12 +584,26 @@ impl Store {
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
-        if self.txn.is_some() {
+        if !self.txns.is_empty() {
             return Err(DbError::internal("不能在事务进行中执行 checkpoint"));
         }
         // WAL 截断前必须确认所有已写入的提交都已 fsync
         self.commit_barrier.wait_all()?;
-        let pending = std::mem::take(&mut self.pending);
+        // 水位线：只落盘 seq <= 最老活跃快照 的提交页，
+        // 更新的条目留给开放事务的快照读
+        let watermark = self.snapshot_watermark();
+        let mut pending: HashMap<PageKey, Vec<u8>> = HashMap::new();
+        self.committed.retain(|entry| {
+            if entry.seq <= watermark {
+                // 升序合并：同一页以更高的 seq 为准
+                for (key, page) in &entry.pages {
+                    pending.insert(*key, page.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
         let mut touched: HashSet<u32> = HashSet::new();
         for ((table_id, page_no), page) in pending.iter() {
             self.write_page_raw(*table_id, *page_no, page)?;
@@ -590,23 +634,11 @@ impl Store {
         self.assert_usable()?;
         let key: PageKey = (table_id, page_no);
 
-        if let Some(txn) = &self.txn {
-            if let Some(page) = txn.pages.get(&key) {
-                return Ok(page.clone());
+        let page = self.read_shared(table_id, page_no, self.txn_owner)?;
+        if let Some(txn_owner) = self.txn_owner {
+            if let Some(txn) = self.txns.get_mut(&txn_owner) {
+                txn.pages.insert(key, page.clone());
             }
-        }
-
-        if let Some(page) = self.pending.get(&key) {
-            let copy = page.clone();
-            if let Some(txn) = &mut self.txn {
-                txn.pages.insert(key, copy.clone());
-            }
-            return Ok(copy);
-        }
-
-        let page = self.read_from_disk(table_id, page_no)?;
-        if let Some(txn) = &mut self.txn {
-            txn.pages.insert(key, page.clone());
         }
         Ok(page)
     }
@@ -617,17 +649,8 @@ impl Store {
     /// 否则只见已提交数据（pending + 磁盘）。
     /// 文件读取用定位读（Windows seek_read / Unix read_at），不改共享文件位置。
     pub fn read_shared(&self, table_id: u32, page_no: u32, owner: Option<u64>) -> Result<Vec<u8>> {
-        if let Some(o) = owner {
-            if self.txn_owner == Some(o) {
-                if let Some(txn) = &self.txn {
-                    if let Some(page) = txn.pages.get(&(table_id, page_no)) {
-                        return Ok(page.clone());
-                    }
-                }
-            }
-        }
-        if let Some(page) = self.pending.get(&(table_id, page_no)) {
-            return Ok(page.clone());
+        if let Some(page) = self.read_at(table_id, page_no, owner, self.commit_seq)? {
+            return Ok(page);
         }
         match self.read_handles.get(&table_id) {
             None => Ok(init_page(page_no)),
@@ -656,38 +679,56 @@ impl Store {
         self.files.get(&table_id).map(|f| f.pages).unwrap_or(0)
     }
 
-    /// 已提交视图的页读取：跳过活动事务的页缓存。
-    ///
-    /// 引擎是全局单写锁 + 单一 `store.txn`，其它会话的只读查询不能看到
-    /// 未提交事务的脏页（脏读），也不能把自己的读缓存写进别人的事务。
-    pub fn read_page_committed(&mut self, table_id: u32, page_no: u32) -> Result<Vec<u8>> {
-        self.assert_usable()?;
-        if let Some(page) = self.pending.get(&(table_id, page_no)) {
-            return Ok(page.clone());
+    /// 快照可见性核心：先看属主事务自己的未提交页，再从新到旧
+    /// 找第一个 `seq <= 快照` 且包含该页的已提交条目，最后落磁盘。
+    /// 返回 None 表示三层都没有（磁盘读由调用方处理）。
+    fn read_at(
+        &self,
+        table_id: u32,
+        page_no: u32,
+        owner: Option<u64>,
+        latest_visible: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let key: PageKey = (table_id, page_no);
+        if let Some(o) = owner {
+            if let Some(txn) = self.txns.get(&o) {
+                if let Some(page) = txn.pages.get(&key) {
+                    return Ok(Some(page.clone()));
+                }
+                // 属主事务：已提交条目按它自己的快照过滤
+                for entry in self.committed.iter().rev() {
+                    if entry.seq > txn.snapshot {
+                        continue;
+                    }
+                    if let Some(page) = entry.pages.get(&key) {
+                        return Ok(Some(page.clone()));
+                    }
+                }
+                return Ok(None);
+            }
         }
-        let f = self.table_file(table_id)?;
-        if page_no >= f.pages {
-            return Ok(init_page(page_no));
+        // 非属主（普通读）：可见全部已提交内容，直到 latest_visible
+        for entry in self.committed.iter().rev() {
+            if entry.seq > latest_visible {
+                continue;
+            }
+            if let Some(page) = entry.pages.get(&key) {
+                return Ok(Some(page.clone()));
+            }
         }
-        let mut buf = vec![0u8; PAGE_SIZE];
-        f.file
-            .seek(SeekFrom::Start(page_no as u64 * PAGE_SIZE as u64))?;
-        match f.file.read_exact(&mut buf) {
-            Ok(()) => Ok(buf),
-            // 页号在内存页数内但磁盘上还没有：那是活动事务刚分配的页，
-            // 对已提交视图来说就是空页
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(init_page(page_no)),
-            Err(err) => Err(err.into()),
-        }
+        Ok(None)
     }
 
-    /// 把修改后的页写回事务缓存并标记为脏页
+    /// 把修改后的页写回事务缓存并标记为脏页（写锁路径，owner 必须已 begin）
     pub fn dirty_page(&mut self, table_id: u32, page_no: u32, data: Vec<u8>) -> Result<()> {
         let key: PageKey = (table_id, page_no);
-        let txn = match &mut self.txn {
-            Some(t) => t,
-            None => return Err(DbError::internal("写操作必须在事务内执行")),
-        };
+        let owner = self.txn_owner.ok_or_else(|| {
+            DbError::internal("写操作必须在事务内执行")
+        })?;
+        let txn = self
+            .txns
+            .get_mut(&owner)
+            .ok_or_else(|| DbError::internal("写操作必须在事务内执行"))?;
         if data.len() != PAGE_SIZE {
             return Err(DbError::internal("页长度必须为 4096 字节"));
         }
@@ -698,9 +739,9 @@ impl Store {
 
     /// 分配新页并初始化为空页
     pub fn alloc_page(&mut self, table_id: u32) -> Result<u32> {
-        if self.txn.is_none() {
-            return Err(DbError::internal("分配页面必须在事务内执行"));
-        }
+        let owner = self.txn_owner.ok_or_else(|| {
+            DbError::internal("分配页面必须在事务内执行")
+        })?;
         self.table_file(table_id)?;
         let current = match self.files.get(&table_id) {
             Some(f) => f.pages,
@@ -710,7 +751,7 @@ impl Store {
         if let Some(f) = self.files.get_mut(&table_id) {
             f.pages = current + 1;
         }
-        if let Some(txn) = &mut self.txn {
+        if let Some(txn) = self.txns.get_mut(&owner) {
             txn.page_count_before.entry(table_id).or_insert(current);
             let page = init_page(current);
             txn.pages.insert((table_id, current), page);
@@ -731,7 +772,10 @@ impl Store {
     // ------------------------------------------------------------ 元数据变更
 
     pub fn mark_catalog_dirty(&mut self) -> Result<()> {
-        match &mut self.txn {
+        let owner = self
+            .txn_owner
+            .ok_or_else(|| DbError::internal("元数据修改必须在事务内执行"))?;
+        match self.txns.get_mut(&owner) {
             Some(txn) => {
                 txn.catalog_dirty = true;
                 Ok(())
@@ -741,7 +785,10 @@ impl Store {
     }
 
     pub fn add_drop(&mut self, table_id: u32) -> Result<()> {
-        match &mut self.txn {
+        let owner = self
+            .txn_owner
+            .ok_or_else(|| DbError::internal("删除表必须在事务内执行"))?;
+        match self.txns.get_mut(&owner) {
             Some(txn) => {
                 if !txn.drops.contains(&table_id) {
                     txn.drops.push(table_id);
@@ -753,7 +800,7 @@ impl Store {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        if self.txn.is_some() {
+        if !self.txns.is_empty() {
             self.rollback();
         }
         // 先确认全部提交落盘，再 checkpoint（会截断 WAL）
@@ -787,7 +834,7 @@ impl Store {
             pages,
             bytes: pages * PAGE_SIZE as u64,
             wal_bytes: self.wal.bytes,
-            pending_pages: self.pending.len(),
+            pending_pages: self.committed.iter().map(|e| e.pages.len()).sum::<usize>(),
             checkpoints: self.checkpoints,
         }
     }

@@ -315,13 +315,6 @@ impl Engine {
         table::scan(&mut self.store, table)
     }
 
-    /// 只读已提交数据：其它会话有未提交事务时，SELECT 用这条路径避免脏读
-    pub fn scan_committed(&mut self, table_name: &str) -> Result<Vec<(u32, Vec<Value>)>> {
-        let position = self.table_index(table_name)?;
-        let table = &self.tables[position];
-        table::scan_committed(&mut self.store, table)
-    }
-
     /// 共享视图扫描（读锁 / &self）：owner 匹配事务属主时可见其未提交页
     pub fn scan_shared(&self, table_name: &str, owner: Option<u64>) -> Result<Vec<(u32, Vec<Value>)>> {
         let position = self.table_index(table_name)?;

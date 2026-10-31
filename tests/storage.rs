@@ -587,3 +587,45 @@ fn concurrent_writers_group_commit() {
     engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 子查询：WHERE 列 IN (SELECT ...)
+#[test]
+fn subquery_in_where() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("subquery");
+    let mut session = Session::open(&dir).unwrap();
+    session.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)", &[]).unwrap();
+    session.execute("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, item TEXT)", &[]).unwrap();
+    session.execute("INSERT INTO users VALUES (1,'alice'), (2,'bob'), (3,'carol')", &[]).unwrap();
+    session.execute("INSERT INTO orders VALUES (10,1,'book'), (11,2,'cup')", &[]).unwrap();
+
+    macro_rules! rows {
+        ($sql:expr) => {
+            match session.execute($sql, &[]).unwrap() {
+                QueryResult::Select { rows, .. } => rows,
+                other => panic!("期望 SELECT，得到 {:?}", other),
+            }
+        };
+    }
+
+    // 基本语义
+    let got = rows!("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY name");
+    assert_eq!(got, vec![vec![Value::Text("alice".into())], vec![Value::Text("bob".into())]]);
+    // NOT IN
+    let got = rows!("SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders) ORDER BY name");
+    assert_eq!(got, vec![vec![Value::Text("carol".into())]]);
+    // 子查询带 WHERE / LIMIT
+    let got = rows!("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE item = 'cup') ");
+    assert_eq!(got, vec![vec![Value::Text("bob".into())]]);
+    // 空子查询 → 无命中
+    let got = rows!("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE id > 999)");
+    assert!(got.is_empty());
+    // 多列子查询报错
+    assert!(session.execute("SELECT name FROM users WHERE id IN (SELECT id, user_id FROM orders)", &[]).is_err());
+    // 与 AND/OR 组合
+    let got = rows!("SELECT name FROM users WHERE (id IN (SELECT user_id FROM orders) AND id > 1) OR name = 'carol' ORDER BY name");
+    assert_eq!(got, vec![vec![Value::Text("bob".into())], vec![Value::Text("carol".into())]]);
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

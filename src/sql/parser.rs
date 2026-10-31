@@ -794,6 +794,17 @@ impl Parser {
 
             if self.eat_keyword("IN") {
                 self.expect_punct("(")?;
+                // IN (SELECT ...)：子查询形式
+                if self.at_keyword("SELECT") {
+                    let query = Box::new(self.parse_select_body()?);
+                    self.expect_punct(")")?;
+                    left = Expr::InSubquery {
+                        expr: Box::new(left),
+                        query,
+                        negated,
+                    };
+                    continue;
+                }
                 let mut list = Vec::new();
                 if !self.at_punct(")") {
                     loop {

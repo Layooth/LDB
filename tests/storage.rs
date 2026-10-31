@@ -2122,6 +2122,204 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// CTE（WITH）：只在当前语句可见，可链式引用、可重复引用
+#[test]
+fn cte_with_clause() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("cte");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE s (id INT PRIMARY KEY, tag TEXT, v INT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO s VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',7),(5,'c',1)",
+            &[],
+        )
+        .unwrap();
+
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 单 CTE：聚合后外层再过滤
+    assert_eq!(
+        rows(
+            &mut session,
+            "WITH g AS (SELECT tag, COUNT(*) AS n FROM s GROUP BY tag) \
+             SELECT tag, n FROM g WHERE n > 1 ORDER BY tag"
+        ),
+        vec![
+            vec![Value::Text("a".into()), Value::Int(2)],
+            vec![Value::Text("b".into()), Value::Int(2)],
+        ]
+    );
+
+    // 多 CTE 链式：后一个引用前一个
+    assert_eq!(
+        rows(
+            &mut session,
+            "WITH a AS (SELECT id, v FROM s WHERE v >= 7), \
+                  b AS (SELECT id FROM a WHERE v < 15) \
+             SELECT id FROM b ORDER BY id"
+        ),
+        vec![vec![Value::Int(1)], vec![Value::Int(4)]]
+    );
+
+    // 同一 CTE 引用两次（自连接）
+    assert_eq!(
+        rows(
+            &mut session,
+            "WITH c AS (SELECT v FROM s WHERE tag = 'a') \
+             SELECT x.v, y.v FROM c x JOIN c y ON x.v < y.v"
+        ),
+        vec![vec![Value::Int(10), Value::Int(20)]]
+    );
+
+    // CTE 与真表 JOIN（CTE 侧用 DISTINCT 去重，否则 'b' 两行会让结果翻倍）
+    assert_eq!(
+        rows(
+            &mut session,
+            "WITH c AS (SELECT DISTINCT tag FROM s WHERE tag = 'b') \
+             SELECT s.id FROM s JOIN c ON s.tag = c.tag WHERE s.v > 5 ORDER BY s.id"
+        ),
+        vec![vec![Value::Int(4)]]
+    );
+
+    // 重名 CTE
+    let err = session
+        .execute(
+            "WITH x AS (SELECT 1 AS a), x AS (SELECT 2 AS a) SELECT * FROM x",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, "ALREADY_EXISTS", "{}", err.message);
+
+    // 递归 CTE 暂不支持，但报错要说明
+    let err = session
+        .execute("WITH RECURSIVE r AS (SELECT 1 AS n) SELECT * FROM r", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    assert!(err.message.contains("递归"), "{}", err.message);
+
+    // CTE 不跨语句：上一条语句的 g 在这里应当找不到
+    let err = session.execute("SELECT * FROM g", &[]).unwrap_err();
+    assert_eq!(err.code, "NOT_FOUND", "{}", err.message);
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 派生表：FROM (SELECT ...) AS t
+#[test]
+fn derived_table_in_from_and_join() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("derived");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE s (id INT PRIMARY KEY, tag TEXT, v INT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO s VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',7),(5,'c',1)",
+            &[],
+        )
+        .unwrap();
+
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 1. 最基本的派生表 + 列名可裸用/可限定
+    assert_eq!(
+        rows(&mut session, "SELECT s.id, s.v FROM (SELECT id, v FROM s WHERE v >= 10) AS s ORDER BY id"),
+        vec![vec![Value::Int(1), Value::Int(10)], vec![Value::Int(2), Value::Int(20)]]
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT * FROM (SELECT id FROM s WHERE id = 3) AS t"),
+        vec![vec![Value::Int(3)]],
+        "SELECT * 应按子查询的列展开"
+    );
+    // 外层 WHERE 作用在派生表结果上
+    assert_eq!(
+        rows(
+            &mut session,
+            "SELECT id FROM (SELECT id, v FROM s) AS s WHERE v > 15"
+        ),
+        vec![vec![Value::Int(2)]]
+    );
+
+    // 2. 子查询里做聚合，外层再过滤聚合结果
+    assert_eq!(
+        rows(
+            &mut session,
+            "SELECT g.tag, g.n FROM (SELECT tag, COUNT(*) AS n FROM s GROUP BY tag) AS g \
+             WHERE g.n > 1 ORDER BY g.tag"
+        ),
+        vec![
+            vec![Value::Text("a".into()), Value::Int(2)],
+            vec![Value::Text("b".into()), Value::Int(2)],
+        ]
+    );
+
+    // 3. 派生表参与 JOIN
+    assert_eq!(
+        rows(
+            &mut session,
+            "SELECT a.id, b.total FROM s a JOIN \
+             (SELECT tag, SUM(v) AS total FROM s GROUP BY tag) b ON a.tag = b.tag \
+             WHERE a.id = 3"
+        ),
+        vec![vec![Value::Int(3), Value::Int(12)]],
+        "b 组合计 5+7=12"
+    );
+    // LEFT JOIN 到派生表
+    assert_eq!(
+        rows(
+            &mut session,
+            "SELECT a.id FROM s a LEFT JOIN (SELECT tag FROM s WHERE tag = 'a') b ON a.tag = b.tag \
+             WHERE a.id = 5"
+        ),
+        vec![vec![Value::Int(5)]],
+        "不匹配时保留左行"
+    );
+
+    // 4. 必须起别名
+    let err = session
+        .execute("SELECT * FROM (SELECT 1 AS x)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    assert!(err.message.contains("别名"), "{}", err.message);
+
+    // 5. EXPLAIN 要说明派生表被整体物化
+    match session
+        .execute("EXPLAIN SELECT * FROM (SELECT id FROM s) AS d", &[])
+        .unwrap()
+    {
+        QueryResult::Explain { rows, .. } => {
+            let text: String = rows
+                .iter()
+                .map(|row| format!("{}={}", row[0].as_text(), row[1].as_text()))
+                .collect::<Vec<_>>()
+                .join(";");
+            assert!(text.contains("子查询"), "{}", text);
+            assert!(text.contains("物化"), "{}", text);
+        }
+        other => panic!("期望 EXPLAIN，得到 {:?}", other),
+    }
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// UPDATE / DELETE 走索引定位：只取候选行，WHERE 仍逐行复检
 #[test]
 fn update_delete_use_index() {

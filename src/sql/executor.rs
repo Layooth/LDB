@@ -1341,6 +1341,12 @@ pub(crate) fn exec_select(
     committed_only: bool,
     owner: Option<u64>,
 ) -> Result<QueryResult> {
+    // CTE 先展开成派生表（展开后 ctes 为空，不会再递归）
+    if !stmt.ctes.is_empty() {
+        let expanded = expand_ctes(stmt)?;
+        return exec_select(engine, &expanded, params, committed_only, owner);
+    }
+
     let (columns, mut types, mut pairs) =
         select_base(engine, stmt, params, committed_only, owner)?;
 
@@ -1455,6 +1461,30 @@ fn join_frame(
             // committed_only 与共享读的语义一致：owner 不匹配开放事务时只见已提交
             let pairs = engine.scan_shared(name, owner)?;
             Ok((vec![plan], pairs.into_iter().map(|(_, v)| v).collect()))
+        }
+        // 派生表：先跑子查询把行物化出来，再当成一张「只有列定义、没有底层表」的表。
+        // 空 table_name 就是「不是真表」的标记（索引辅助等路径靠它识别）。
+        TableSource::Derived { query, alias } => {
+            let (columns, types, rows) =
+                run_subquery(engine, query, params, committed_only, owner)?;
+            let cols: Vec<Column> = columns
+                .iter()
+                .zip(types.iter())
+                .map(|(name, ty)| {
+                    Column::new(
+                        name.clone(),
+                        ColumnType::parse(ty).unwrap_or(ColumnType::Text),
+                    )
+                })
+                .collect();
+            let plan = TablePlan {
+                alias: alias.to_lowercase(),
+                display: alias.clone(),
+                table_name: String::new(),
+                columns: cols,
+                offset: 0,
+            };
+            Ok((vec![plan], rows))
         }
         TableSource::Join {
             left,
@@ -1586,6 +1616,10 @@ fn find_join_assist(
         return Ok(None);
     }
     let right = &rplans[0];
+    // 派生表/CTE 没有底层表 id，也就没有索引可回表
+    if right.table_name.is_empty() {
+        return Ok(None);
+    }
 
     let mut stack: Vec<&Expr> = vec![on];
     while let Some(current) = stack.pop() {
@@ -1652,6 +1686,94 @@ fn find_join_assist(
         }
     }
     Ok(None)
+}
+
+/// 把 CTE 引用展开成派生表。
+///
+/// CTE 只在本语句内可见，所以展开比在执行器里维护命名空间简单得多：
+/// `FROM cte` 直接换成 `FROM (子查询) AS cte`，之后走派生表同一条路径。
+///
+/// 限制（README 已写明）：只展开 FROM 树里的引用；`WHERE x IN (SELECT ... FROM cte)`
+/// 这类内层引用暂不支持。
+fn expand_ctes(stmt: &SelectStmt) -> Result<SelectStmt> {
+    // 依次展开：每个 CTE 只能引用**前面**定义好的（不支持递归/前向引用）
+    let mut resolved: Vec<Cte> = Vec::with_capacity(stmt.ctes.len());
+    for cte in &stmt.ctes {
+        let body = rewrite_cte_sources(&cte.query, &resolved)?;
+        resolved.push(Cte {
+            name: cte.name.clone(),
+            query: Box::new(body),
+        });
+    }
+    let mut main = stmt.clone();
+    main.ctes.clear();
+    rewrite_cte_sources(&main, &resolved)
+}
+
+fn rewrite_cte_sources(stmt: &SelectStmt, ctes: &[Cte]) -> Result<SelectStmt> {
+    let mut out = stmt.clone();
+    out.ctes.clear();
+    if let Some(from) = &stmt.from {
+        out.from = Some(rewrite_source(from, ctes)?);
+    }
+    Ok(out)
+}
+
+fn rewrite_source(source: &TableSource, ctes: &[Cte]) -> Result<TableSource> {
+    Ok(match source {
+        TableSource::Table { name, alias } => {
+            match ctes.iter().find(|cte| cte.name.eq_ignore_ascii_case(name)) {
+                Some(cte) => TableSource::Derived {
+                    query: Box::new((*cte.query).clone()),
+                    // 没写别名就用 CTE 名（`FROM cte` 里 cte.列 依旧可用）
+                    alias: alias.clone().unwrap_or_else(|| cte.name.clone()),
+                },
+                None => source.clone(),
+            }
+        }
+        TableSource::Derived { query, alias } => TableSource::Derived {
+            query: Box::new(rewrite_cte_sources(query, ctes)?),
+            alias: alias.clone(),
+        },
+        TableSource::Join {
+            left,
+            right,
+            kind,
+            on,
+        } => TableSource::Join {
+            left: Box::new(rewrite_source(left, ctes)?),
+            right: Box::new(rewrite_source(right, ctes)?),
+            kind: *kind,
+            on: on.clone(),
+        },
+    })
+}
+
+/// 执行派生表 / CTE 的子查询，取出「列名、列类型、物化行」。
+/// 行数受统一上限保护：派生表本身也是整体物化的。
+fn run_subquery(
+    engine: &Engine,
+    stmt: &SelectStmt,
+    params: &[Value],
+    committed_only: bool,
+    owner: Option<u64>,
+) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
+    match exec_select(engine, stmt, params, committed_only, owner)? {
+        QueryResult::Select {
+            columns,
+            types,
+            rows,
+        } => {
+            if rows.len() > MAX_SCAN_ROWS {
+                return Err(scan_limit_error());
+            }
+            Ok((columns, types, rows))
+        }
+        other => Err(DbError::syntax(format!(
+            "派生表只能是查询，实际得到 {}",
+            other.summary()
+        ))),
+    }
 }
 
 fn concat_rows(lrow: &[Value], rrow: &[Value]) -> Vec<Value> {
@@ -2575,6 +2697,31 @@ fn exec_explain(
     let mut rows: Vec<Vec<Value>> = Vec::new();
     rows.push(kv("语句", statement.kind_name().to_uppercase()));
 
+    // 带 CTE 的语句先展开，否则 FROM 里的 CTE 名会被当成真表去查
+    if let Statement::Select(select) = statement {
+        if !select.ctes.is_empty() {
+            let names: Vec<String> = select.ctes.iter().map(|c| c.name.clone()).collect();
+            let expanded = expand_ctes(select)?;
+            rows.push(kv("CTE", names.join(", ")));
+            rows.push(kv(
+                "说明",
+                "CTE 会被展开成派生表（整体物化），不产生独立执行计划".to_string(),
+            ));
+            let inner = exec_explain(engine, &Statement::Select(expanded), params, owner)?;
+            if let QueryResult::Explain {
+                rows: mut inner_rows,
+                ..
+            } = inner
+            {
+                rows.append(&mut inner_rows);
+            }
+            return Ok(QueryResult::Explain {
+                columns: vec!["步骤".to_string(), "内容".to_string()],
+                rows,
+            });
+        }
+    }
+
     match statement {
         Statement::Select(select) => {
             if let Some(from) = &select.from {
@@ -2652,6 +2799,28 @@ fn exec_explain(
                             },
                         ));
                         rows.push(kv("说明", "等值连接列上有索引时自动改走索引查找".to_string()));
+                    }
+                    TableSource::Derived { alias, query } => {
+                        rows.push(kv("表", format!("(子查询) {}", alias)));
+                        rows.push(kv(
+                            "访问方式",
+                            "先把子查询整体物化，再当作临时表参与过滤/连接".to_string(),
+                        ));
+                        rows.push(kv(
+                            "子查询",
+                            format!(
+                                "{} 个投影列{}",
+                                query.items.len(),
+                                if query.from.is_some() { "" } else { "（无 FROM）" }
+                            ),
+                        ));
+                        rows.push(kv(
+                            "说明",
+                            format!(
+                                "派生表不支持索引下推；子查询结果超过 {} 行会直接报错",
+                                MAX_SCAN_ROWS
+                            ),
+                        ));
                     }
                 }
 

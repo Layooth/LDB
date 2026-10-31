@@ -39,6 +39,7 @@ const KEYWORDS: &[&str] = &[
     "ROLLBACK", "TRANSACTION", "SHOW", "TABLES", "DESCRIBE", "EXPLAIN", "JOIN", "LEFT", "RIGHT",
     "INNER", "OUTER", "CROSS", "FULL", "UNION", "CAST", "ALTER", "ADD", "COLUMN", "RENAME", "TO",
     "AUTO_INCREMENT", "AUTOINCREMENT", "CONFLICT", "DO", "NOTHING", "EXCLUDED",
+    "WITH", "RECURSIVE", "EXISTS",
 ];
 
 fn is_keyword(word: &str) -> bool {

@@ -113,6 +113,11 @@ pub enum JoinKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableSource {
     Table { name: String, alias: Option<String> },
+    /// 派生表：`FROM (SELECT ...) AS t`
+    Derived {
+        query: Box<SelectStmt>,
+        alias: String,
+    },
     Join {
         left: Box<TableSource>,
         right: Box<TableSource>,
@@ -126,6 +131,7 @@ impl TableSource {
     pub fn describe(&self) -> String {
         match self {
             TableSource::Table { name, .. } => name.clone(),
+            TableSource::Derived { alias, .. } => format!("(子查询) {}", alias),
             TableSource::Join { left, right, kind, .. } => {
                 let word = match kind {
                     JoinKind::Inner => "JOIN",
@@ -152,8 +158,17 @@ pub struct OrderItem {
     pub desc: bool,
 }
 
+/// `WITH 名称 AS (SELECT ...)` 定义的公共表表达式
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub query: Box<SelectStmt>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
+    /// 本语句可见的 CTE（只在当前语句内有效，不跨语句）
+    pub ctes: Vec<Cte>,
     pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Option<TableSource>,

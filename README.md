@@ -190,15 +190,20 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 |---|---|
 | DDL | `CREATE TABLE`（列级 PK/NOT NULL/UNIQUE/DEFAULT/**AUTO_INCREMENT**、表级 PK、IF NOT EXISTS）、`DROP TABLE`、`CREATE/DROP [UNIQUE] INDEX`、`ALTER TABLE`（`ADD [COLUMN]` / `DROP [COLUMN]` / `RENAME COLUMN a TO b` / `RENAME TO c`） |
 | DML | `INSERT INTO t [(列)] VALUES (...),(...)`、`INSERT ... ON CONFLICT [(列)] DO UPDATE SET ... / DO NOTHING`（UPSERT，可用 `EXCLUDED.列` 引用待插入行）、`UPDATE ... SET ... [WHERE]`、`DELETE FROM ... [WHERE]` |
-| 查询 | `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`/`UNION [ALL]`、`INNER/LEFT/CROSS JOIN`（左深树，嵌套循环）、`IN (SELECT ...)`（非关联单列） |
+| 查询 | `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`/`UNION [ALL]`、`INNER/LEFT/CROSS JOIN`（左深树，嵌套循环）、`IN (SELECT ...)`（非关联单列）、**派生表** `FROM (SELECT ...) AS t`、**CTE** `WITH x AS (...) SELECT ... FROM x` |
 | 事务 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` |
 | 元命令 | `SHOW TABLES`、`DESCRIBE t`、`EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` |
 | 表达式 | 算术、比较、`AND/OR/NOT`、`IS [NOT] NULL`、`IN (...)`、`BETWEEN`、`LIKE`、`CAST(x AS 类型)`、`?` 参数 |
 | 函数 | `COALESCE LENGTH UPPER LOWER ABS ROUND NOW CURDATE`；聚合 `COUNT SUM AVG MIN MAX`（含 DISTINCT / `COUNT(*)`） |
 
-**不支持**：`RIGHT/FULL JOIN`、派生表、CTE、`EXISTS`、标量子查询、窗口函数、
+**不支持**：`RIGHT/FULL JOIN`、`EXISTS`、标量子查询、窗口函数、
 `INSERT ... SELECT`、`TRUNCATE`、视图/触发器/序列。`ALTER TABLE` 的列变更通过
 「影子表重建」实现：**表 id 会变、行号会重排、数据完整保留**，索引按列名迁移。
+
+派生表与 CTE 都是**整体物化**（先跑子查询把行读进内存，再当临时表用），没有索引下推；
+子查询结果超过 50 万行直接报 `LIMIT_EXCEEDED`。CTE 只在**当前语句**内可见，
+按顺序展开（后一个可引用前一个），不支持 `WITH RECURSIVE`，也不支持
+`WHERE ... IN (SELECT ... FROM cte)` 这类内层引用。
 
 ## LDBP/1 协议（TCP，默认 7801）
 

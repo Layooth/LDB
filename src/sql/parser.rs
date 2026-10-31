@@ -181,6 +181,10 @@ impl Parser {
     // ------------------------------------------------------------ 语句
 
     pub fn parse_statement(&mut self) -> Result<Statement> {
+        // `WITH ... SELECT ...`：CTE 与 SELECT 一起解析
+        if self.at_keyword("WITH") {
+            return self.parse_select();
+        }
         if self.at_keyword("SELECT") {
             return self.parse_select();
         }
@@ -272,6 +276,7 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
+        let ctes = self.parse_ctes()?;
         self.expect_keyword("SELECT")?;
         let distinct = self.eat_keyword("DISTINCT");
         let items = self.parse_select_items()?;
@@ -368,6 +373,7 @@ impl Parser {
         };
 
         Ok(Statement::Select(SelectStmt {
+            ctes,
             distinct,
             items,
             from,
@@ -379,6 +385,40 @@ impl Parser {
             offset,
             union,
         }))
+    }
+
+    /// `WITH 名称 AS (SELECT ...) [, ...]`
+    fn parse_ctes(&mut self) -> Result<Vec<Cte>> {
+        if !self.eat_keyword("WITH") {
+            return Ok(Vec::new());
+        }
+        if self.at_keyword("RECURSIVE") {
+            return Err(DbError::syntax(
+                "暂不支持递归 CTE（WITH RECURSIVE）：请改用派生表或多次查询",
+            ));
+        }
+        let mut list: Vec<Cte> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            let _ = self.eat_keyword("AS");
+            self.expect_punct("(")?;
+            let query = self.parse_select_body()?;
+            self.expect_punct(")")?;
+            if list.iter().any(|cte| cte.name.eq_ignore_ascii_case(&name)) {
+                return Err(DbError::new(
+                    crate::error::ALREADY_EXISTS,
+                    format!("CTE 名称重复：{}", name),
+                ));
+            }
+            list.push(Cte {
+                name,
+                query: Box::new(query),
+            });
+            if !self.eat_punct(",") {
+                break;
+            }
+        }
+        Ok(list)
     }
 
     /// parse_select 的内部形式：返回 SelectStmt 本身（供 UNION 右侧递归）
@@ -481,6 +521,29 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableSource> {
+        // 派生表：`FROM (SELECT ...) AS t`
+        if self.at_punct("(") {
+            self.advance();
+            let statement = self.parse_select()?;
+            self.expect_punct(")")?;
+            let query = match statement {
+                Statement::Select(select) => select,
+                _ => {
+                    return Err(DbError::syntax(
+                        "派生表里只能是 SELECT（不支持 INSERT/UPDATE/DELETE）",
+                    ))
+                }
+            };
+            let _ = self.eat_keyword("AS");
+            let alias = self.expect_ident().map_err(|_| {
+                DbError::syntax("派生表必须起别名：FROM (SELECT ...) AS 别名")
+            })?;
+            return Ok(TableSource::Derived {
+                query: Box::new(query),
+                alias,
+            });
+        }
+
         let table = self.expect_ident()?;
         let alias = if self.eat_keyword("AS") {
             Some(self.expect_ident()?)

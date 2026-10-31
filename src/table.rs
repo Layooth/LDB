@@ -3,7 +3,7 @@
 //! 行号编码：`row_id = (page_no << 16) | slot`。
 //! 索引全部在内存，启动时通过扫描数据页重建。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::catalog::{IndexDef, TableDef};
 use crate::codec::{self, Column, Value};
@@ -24,7 +24,7 @@ pub struct Index {
     pub unique: bool,
     pub primary: bool,
     pub implicit: bool,
-    pub map: HashMap<String, Vec<u32>>,
+    pub map: BTreeMap<String, Vec<u32>>,
 }
 
 impl Index {
@@ -35,7 +35,7 @@ impl Index {
             unique: def.unique,
             primary: def.primary,
             implicit: def.implicit,
-            map: HashMap::new(),
+            map: BTreeMap::new(),
         }
     }
 }
@@ -520,6 +520,45 @@ pub fn find_by_equality(table: &Table, column_name: &str, value: &Value) -> Opti
         Some(list) => Some(list.clone()),
         None => Some(Vec::new()),
     }
+}
+
+/// 范围扫描的边界（键已按 index_key 编码；None 表示该侧无界）
+pub struct RangeBounds {
+    pub lower: Option<(String, bool)>, // (key, inclusive)
+    pub upper: Option<(String, bool)>,
+}
+
+/// 按范围查索引；只有目标列存在单列索引时才可用
+pub fn find_by_range(table: &Table, column_name: &str, bounds: &RangeBounds) -> Option<Vec<u32>> {
+    let index = table.single_column_index(column_name)?;
+    // BTreeMap 的范围迭代天然按键升序输出
+    let lower_bound = bounds
+        .lower
+        .as_ref()
+        .map(|(k, inc)| {
+            if *inc {
+                std::ops::Bound::Included(k.clone())
+            } else {
+                std::ops::Bound::Excluded(k.clone())
+            }
+        })
+        .unwrap_or(std::ops::Bound::Unbounded);
+    let upper_bound = bounds
+        .upper
+        .as_ref()
+        .map(|(k, inc)| {
+            if *inc {
+                std::ops::Bound::Included(k.clone())
+            } else {
+                std::ops::Bound::Excluded(k.clone())
+            }
+        })
+        .unwrap_or(std::ops::Bound::Unbounded);
+    let mut ids = Vec::new();
+    for (_, list) in index.map.range((lower_bound, upper_bound)) {
+        ids.extend_from_slice(list);
+    }
+    Some(ids)
 }
 
 #[cfg(test)]

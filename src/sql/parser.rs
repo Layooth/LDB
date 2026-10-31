@@ -1,6 +1,7 @@
 //! 递归下降语法分析。支持：SELECT / INSERT /
 //! UPDATE / DELETE、CREATE/DROP TABLE、CREATE/DROP INDEX、事务控制与元命令。
 
+use crate::codec::ColumnType;
 use crate::error::{DbError, Result};
 
 use super::ast::*;
@@ -1005,6 +1006,41 @@ impl Parser {
                 Err(DbError::syntax(format!("表达式中的意外符号 \"{}\"", token.text)))
             }
             TokenKind::Keyword => match token.text.as_str() {
+                "CAST" => {
+                    // CAST(expr AS 类型)：类型支持 DECIMAL(p,s)
+                    self.advance();
+                    self.expect_punct("(")?;
+                    let inner = self.parse_expr()?;
+                    self.expect_keyword("AS")?;
+                    let mut type_name = self.expect_ident()?;
+                    if type_name.to_uppercase() == "DECIMAL" && self.at_punct("(") {
+                        self.advance();
+                        let mut parts = Vec::new();
+                        loop {
+                            let token = self.peek().clone();
+                            if token.kind != TokenKind::Number {
+                                return Err(DbError::syntax(format!(
+                                    "DECIMAL 声明需要整数参数，实际是 \"{}\"",
+                                    token.text
+                                )));
+                            }
+                            parts.push(self.advance().text);
+                            if !self.eat_punct(",") {
+                                break;
+                            }
+                        }
+                        self.expect_punct(")")?;
+                        type_name = format!("DECIMAL({})", parts.join(","));
+                    }
+                    let ty = ColumnType::parse(&type_name)?;
+                    let scale = ColumnType::decimal_scale_from_type(&type_name)?;
+                    self.expect_punct(")")?;
+                    Ok(Expr::Cast {
+                        expr: Box::new(inner),
+                        ty,
+                        scale,
+                    })
+                }
                 "TRUE" => {
                     self.advance();
                     Ok(Expr::Literal(Literal::Bool(true)))

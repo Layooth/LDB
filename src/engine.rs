@@ -3,7 +3,7 @@
 //! 借用约定：写操作必须在事务内。用 `write(|engine| ...)` 包裹可以自动
 //! 处理 begin / commit / rollback，避免调用方忘记。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::catalog::{IndexDef, TableDef};
@@ -325,7 +325,7 @@ impl Engine {
             unique,
             primary: false,
             implicit: false,
-            map: HashMap::new(),
+            map: BTreeMap::new(),
         };
         self.tables[position].indexes.push(index);
 

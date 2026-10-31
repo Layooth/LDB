@@ -71,6 +71,12 @@ pub enum Expr {
         query: Box<SelectStmt>,
         negated: bool,
     },
+    /// CAST(expr AS 类型)
+    Cast {
+        expr: Box<Expr>,
+        ty: crate::codec::ColumnType,
+        scale: u8,
+    },
     Between {
         expr: Box<Expr>,
         low: Box<Expr>,

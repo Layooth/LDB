@@ -144,6 +144,7 @@ pub fn contains_aggregate(expr: &Expr) -> bool {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
         }
         Expr::InSubquery { expr, .. } => contains_aggregate(expr),
+        Expr::Cast { expr, .. } => contains_aggregate(expr),
         Expr::Between {
             expr, low, high, ..
         } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
@@ -226,6 +227,13 @@ pub fn eval(expr: &Expr, ctx: &RowContext, params: &[Value]) -> Result<Value> {
         Expr::InSubquery { .. } => Err(DbError::syntax(
             "子查询只支持在 WHERE 的 IN 条件中使用（且不支持关联外部列）",
         )),
+        Expr::Cast { expr, ty, scale } => {
+            let value = eval(expr, ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            crate::codec::cast_value(*ty, *scale, &value)
+        }
         Expr::InList {
             expr,
             list,

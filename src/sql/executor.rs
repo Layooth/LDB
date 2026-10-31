@@ -327,6 +327,7 @@ fn expr_label(expr: &Expr) -> String {
             UnOp::Not => format!("NOT {}", expr_label(operand)),
         },
         Expr::InSubquery { expr, .. } => format!("{} IN (subquery)", expr_label(expr)),
+        Expr::Cast { expr, ty, .. } => format!("CAST({} AS {})", expr_label(expr), ty.as_str()),
         _ => "expr".to_string(),
     }
 }
@@ -814,6 +815,11 @@ fn resolve_subqueries(
                 .collect::<Result<Vec<_>>>()?,
             negated: *negated,
         }),
+        Expr::Cast { expr, ty, scale } => Ok(Expr::Cast {
+            expr: Box::new(resolve_subqueries(engine, expr, params, committed_only, owner)?),
+            ty: *ty,
+            scale: *scale,
+        }),
         other => Ok(other.clone()),
     }
 }
@@ -848,9 +854,15 @@ fn select_base(
                     columns: table.columns.clone(),
                     offset: 0,
                 });
+                // 等值索引 → 范围索引 → 全表扫描，逐级降级
                 let candidates =
                     index_candidates(engine, name, where_clause.as_ref(), params, owner)?;
-                match candidates {
+                let range_ids = if candidates.is_none() {
+                    range_candidates(engine, name, where_clause.as_ref(), params)?
+                } else {
+                    None
+                };
+                match candidates.or(range_ids) {
                     Some(ids) => {
                         for id in ids {
                             if let Some(values) = engine.get_shared(name, id, owner)? {
@@ -1418,6 +1430,259 @@ fn eval_in_group(expr: &Expr, rows: &[RowContext], params: &[Value]) -> Result<V
         }
         _ => Err(DbError::syntax("聚合表达式的组合形式不受支持")),
     }
+}
+
+/// 单列上的范围约束（ WHERE 重写后由 BTreeMap 范围扫描消费）
+#[derive(Default)]
+struct ColumnRange {
+    lower: Option<(Value, bool)>, // (值, 是否含端点)
+    upper: Option<(Value, bool)>,
+}
+
+/// 从 AND 树中收集某列的范围约束；不支持的范围形式返回 None
+fn collect_range(
+    expr: &Expr,
+    column_name: &str,
+    params: &[Value],
+    empty: &RowContext,
+) -> Option<ColumnRange> {
+    let mut stack: Vec<&Expr> = vec![expr];
+    let mut range = ColumnRange::default();
+    while let Some(current) = stack.pop() {
+        match current {
+            Expr::Binary {
+                op: BinOp::And,
+                left,
+                right,
+            } => {
+                stack.push(left.as_ref());
+                stack.push(right.as_ref());
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                if *negated {
+                    return None; // NOT BETWEEN 无法用单一范围表达
+                }
+                if let Expr::Column { name, .. } = expr.as_ref() {
+                    if !name.eq_ignore_ascii_case(column_name) {
+                        continue;
+                    }
+                    let lo = eval(low, empty, params).ok()?;
+                    let hi = eval(high, empty, params).ok()?;
+                    if lo.is_null() || hi.is_null() {
+                        return None;
+                    }
+                    merge_lower(&mut range, lo, true)?;
+                    merge_upper(&mut range, hi, true)?;
+                }
+            }
+            Expr::Binary {
+                op,
+                left,
+                right,
+            } if matches!(
+                op,
+                BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le
+            ) =>
+            {
+                // 只支持 列 OP 常量 形式（常量在右侧）
+                if let (Expr::Column { name, .. }, operand) = (left.as_ref(), right.as_ref()) {
+                    if !name.eq_ignore_ascii_case(column_name) {
+                        continue;
+                    }
+                    let bound = eval(operand, empty, params).ok()?;
+                    if bound.is_null() {
+                        return None;
+                    }
+                    let (value, inclusive) = match op {
+                        BinOp::Ge => (bound, true),
+                        BinOp::Gt => (bound, false),
+                        BinOp::Le => (bound, true),
+                        BinOp::Lt => (bound, false),
+                        _ => unreachable!(),
+                    };
+                    if matches!(op, BinOp::Gt | BinOp::Ge) {
+                        merge_lower(&mut range, value, inclusive)?;
+                    } else {
+                        merge_upper(&mut range, value, inclusive)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(range)
+}
+
+fn merge_lower(range: &mut ColumnRange, value: Value, inclusive: bool) -> Option<()> {
+    match &range.lower {
+        None => range.lower = Some((value, inclusive)),
+        Some((existing, existing_inc)) => {
+            let ord = codec::compare(&value, existing)?;
+            if ord == std::cmp::Ordering::Greater
+                || (ord == std::cmp::Ordering::Equal && *existing_inc && !inclusive)
+            {
+                // 取更紧的下界
+                range.lower = Some((value, inclusive));
+            }
+        }
+    }
+    Some(())
+}
+
+fn merge_upper(range: &mut ColumnRange, value: Value, inclusive: bool) -> Option<()> {
+    match &range.upper {
+        None => range.upper = Some((value, inclusive)),
+        Some((existing, existing_inc)) => {
+            let ord = codec::compare(&value, existing)?;
+            if ord == std::cmp::Ordering::Less
+                || (ord == std::cmp::Ordering::Equal && *existing_inc && !inclusive)
+            {
+                range.upper = Some((value, inclusive));
+            }
+        }
+    }
+    Some(())
+}
+
+/// 从 WHERE 里提取某列的范围索引条件（AND 树，列 OP 常量 / BETWEEN）
+fn range_candidates(
+    engine: &Engine,
+    table_name: &str,
+    where_clause: Option<&Expr>,
+    params: &[Value],
+) -> Result<Option<Vec<u32>>> {
+    let expr = match where_clause {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let candidates = extract_range_columns(expr, params)?;
+
+    // 逐列尝试：找到第一个有索引且能取到范围的列
+    for (column_name, range) in &candidates {
+        let table = engine.table(table_name)?;
+        let has_index = table.single_column_index(column_name).is_some();
+        if !has_index {
+            continue;
+        }
+        // 边界值必须 coerce 到列的类型/标度，否则索引键格式不匹配
+        let col = table.columns.iter().find(|c| c.name.eq_ignore_ascii_case(column_name));
+        let (ty, scale) = col.map(|c| (c.ty, c.scale)).unwrap_or((ColumnType::Text, 0));
+        let coerce_bound = |v: &Value| -> Option<String> {
+            codec::coerce(ty, scale, v).ok().and_then(|cv| codec::index_key(&cv))
+        };
+        let bounds = crate::table::RangeBounds {
+            lower: range
+                .lower
+                .as_ref()
+                .and_then(|(v, inc)| coerce_bound(v).map(|k| (k, *inc))),
+            upper: range
+                .upper
+                .as_ref()
+                .and_then(|(v, inc)| coerce_bound(v).map(|k| (k, *inc))),
+        };
+        if bounds.lower.is_none() && bounds.upper.is_none() {
+            continue;
+        }
+        if let Some(ids) = crate::table::find_by_range(table, column_name, &bounds) {
+            return Ok(Some(ids));
+        }
+    }
+    Ok(None)
+}
+
+/// 收集 WHERE 中所有单列范围约束（列名 → 约束）
+fn extract_range_columns(
+    expr: &Expr,
+    params: &[Value],
+) -> Result<HashMap<String, ColumnRange>> {
+    let empty = RowContext::new(&[], Vec::new());
+    // 按 AND 拆开后，每个子句若是指向单列的范围条件则收下
+    let mut out: HashMap<String, ColumnRange> = HashMap::new();
+    let mut stack: Vec<&Expr> = vec![expr];
+    while let Some(current) = stack.pop() {
+        match current {
+            Expr::Binary {
+                op: BinOp::And,
+                left,
+                right,
+            } => {
+                stack.push(left.as_ref());
+                stack.push(right.as_ref());
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } => {
+                if let Expr::Column { name, .. } = expr.as_ref() {
+                    let mut entry = out.entry(name.clone()).or_default();
+                    let empty = RowContext::new(&[], Vec::new());
+                    let lo = eval(low, &empty, params)?;
+                    let hi = eval(high, &empty, params)?;
+                    if !lo.is_null() && !hi.is_null() {
+                        merge_lower(&mut entry, lo, true);
+                        merge_upper(&mut entry, hi, true);
+                    }
+                }
+            }
+            Expr::Binary {
+                op,
+                left,
+                right,
+            } if matches!(
+                op,
+                BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le
+            ) =>
+            {
+                // 列在左、常量在右；列在右的 (常量 OP 列) 形式交换方向
+                let (column_expr, operand, op) = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column { .. }, other) => (left.as_ref(), other, *op),
+                    (other_side, Expr::Column { .. }) => {
+                        let _ = other_side;
+                        let flipped = match op {
+                            BinOp::Gt => BinOp::Lt,
+                            BinOp::Ge => BinOp::Le,
+                            BinOp::Lt => BinOp::Gt,
+                            BinOp::Le => BinOp::Ge,
+                            other_op => *other_op,
+                        };
+                        (right.as_ref(), left.as_ref(), flipped)
+                    }
+                    _ => continue,
+                };
+                if let Expr::Column { name, .. } = column_expr {
+                    let bound = eval(operand, &empty, params)?;
+                    if bound.is_null() {
+                        continue;
+                    }
+                    let mut entry = out.entry(name.clone()).or_default();
+                    match op {
+                        BinOp::Gt => {
+                            merge_lower(&mut entry, bound, false);
+                        }
+                        BinOp::Ge => {
+                            merge_lower(&mut entry, bound, true);
+                        }
+                        BinOp::Lt => {
+                            merge_upper(&mut entry, bound, false);
+                        }
+                        BinOp::Le => {
+                            merge_upper(&mut entry, bound, true);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// 找到 WHERE 里可用的等值索引条件

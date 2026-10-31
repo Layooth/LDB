@@ -1098,3 +1098,106 @@ fn concurrent_writes_to_different_tables_scale() {
     engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P3 补充：范围索引扫描
+#[test]
+fn range_index_scan() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("rangescan");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT, tag TEXT)", &[])
+        .unwrap();
+    // 0..50，tag 交替
+    for i in 0..50 {
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO scores VALUES ({}, {}, '{}')",
+                    i,
+                    i,
+                    if i % 2 == 0 { "even" } else { "odd" }
+                ),
+                &[],
+            )
+            .unwrap();
+    }
+    session.execute("CREATE INDEX idx_score ON scores(score)", &[]).unwrap();
+
+    let mut rows = |sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 范围：>45（走索引后行集应与全表扫描+过滤一致）
+    let got = rows("SELECT COUNT(*) FROM scores WHERE score > 45");
+    assert_eq!(got, vec![vec![Value::Int(4)]], "> 45");
+    let got = rows("SELECT COUNT(*) FROM scores WHERE score >= 45");
+    assert_eq!(got, vec![vec![Value::Int(5)]], ">= 45");
+    let got = rows("SELECT COUNT(*) FROM scores WHERE score < 5");
+    assert_eq!(got, vec![vec![Value::Int(5)]], "< 5");
+    let got = rows("SELECT COUNT(*) FROM scores WHERE score <= 5");
+    assert_eq!(got, vec![vec![Value::Int(6)]], "<= 5");
+    let got = rows("SELECT COUNT(*) FROM scores WHERE score BETWEEN 10 AND 19");
+    assert_eq!(got, vec![vec![Value::Int(10)]], "BETWEEN");
+    // 组合范围 + 额外条件
+    let got = rows("SELECT score FROM scores WHERE score BETWEEN 10 AND 19 AND tag = 'even' ORDER BY score");
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Int(10)],
+            vec![Value::Int(12)],
+            vec![Value::Int(14)],
+            vec![Value::Int(16)],
+            vec![Value::Int(18)],
+        ]
+    );
+    // 反向形式（常量在左）
+    let got = rows("SELECT COUNT(*) FROM scores WHERE 45 < score");
+    assert_eq!(got, vec![vec![Value::Int(4)]], "45 < score");
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CAST 语法
+#[test]
+fn cast_syntax() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("cast");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, price DECIMAL(10,2), qty INT)", &[])
+        .unwrap();
+    session
+        .execute("INSERT INTO items VALUES (1, '19.99', 3)", &[])
+        .unwrap();
+
+    let mut first = |sql: &str| -> Value {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows[0][0].clone(),
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+    // DECIMAL 精确转换（类型化值，非文本）
+    assert_eq!(
+        first("SELECT CAST('123.45' AS DECIMAL(10,2))"),
+        Value::Decimal { v: 12345, scale: 2 }
+    );
+    // INT → TEXT
+    assert_eq!(first("SELECT CAST(42 AS TEXT)"), Value::Text("42".into()));
+    // REAL → INT
+    assert_eq!(first("SELECT CAST(3.7 AS INT)"), Value::Int(3));
+    // 表列上的 CAST
+    assert_eq!(
+        first("SELECT CAST(price * qty AS TEXT) FROM items WHERE id = 1"),
+        Value::Text("59.97".into())
+    );
+    // NULL 传播
+    assert_eq!(first("SELECT CAST(NULL AS INT)"), Value::Null);
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

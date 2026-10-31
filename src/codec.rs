@@ -211,16 +211,9 @@ pub fn format_decimal(v: i128, scale: u8) -> String {
     let divisor = 10u128.pow(scale as u32);
     let int_part = abs / divisor;
     let frac_part = abs % divisor;
-    let mut frac = format!("{:0width$}", frac_part, width = scale as usize);
-    while frac.ends_with('0') {
-        frac.pop();
-    }
+    let frac = format!("{:0width$}", frac_part, width = scale as usize);
     let sign = if negative { "-" } else { "" };
-    if frac.is_empty() {
-        format!("{}{}", sign, int_part)
-    } else {
-        format!("{}{}.{}", sign, int_part, frac)
-    }
+    format!("{}{}.{}", sign, int_part, frac)
 }
 
 /// 解析十进制文本到指定标度（四舍五入到标度位）
@@ -543,6 +536,44 @@ pub fn coerce(ty: ColumnType, scale: u8, value: &Value) -> Result<Value> {
     }
 }
 
+/// CAST 语义的显式转换：与 coerce（列赋值，严格）不同，
+/// CAST 到 INT 时对 Real/Decimal 截断小数部分（标准 SQL 行为）
+pub fn cast_value(ty: ColumnType, scale: u8, value: &Value) -> Result<Value> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if ty == ColumnType::Int {
+        return match value {
+            Value::Int(n) => Ok(Value::Int(*n)),
+            Value::Real(n) => Ok(Value::Int(n.trunc() as i64)),
+            Value::Decimal { v, scale: vs } => {
+                let divisor = 10i128.pow(*vs as u32);
+                let q = v.div_euclid(divisor);
+                i64::try_from(q)
+                    .map(Value::Int)
+                    .map_err(|_| DbError::type_error("DECIMAL 整数值超出 INT 范围"))
+            }
+            Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+            Value::Text(s) => {
+                let t = s.trim();
+                // 截断小数部分（标准 CAST 语义）
+                if let Ok(n) = t.parse::<i64>() {
+                    return Ok(Value::Int(n));
+                }
+                match t.parse::<f64>() {
+                    Ok(f) => Ok(Value::Int(f.trunc() as i64)),
+                    Err(_) => Err(DbError::type_error(format!(
+                        "无法把 \"{}\" 转换为 INT",
+                        s
+                    ))),
+                }
+            }
+            Value::Null => Ok(Value::Null),
+        };
+    }
+    coerce(ty, scale, value)
+}
+
 // ------------------------------------------------------------------ 日期
 
 /// Howard Hinnant 的 civil_from_days 算法
@@ -719,13 +750,28 @@ pub fn values_equal(a: &Value, b: &Value) -> Option<bool> {
 }
 
 /// 索引 key；返回 None 表示 NULL，不参与索引
+/// 索引键：**保序编码**——键的字典序 == 值的大小序，
+/// 使 BTreeMap 索引支持范围扫描。同一逻辑值的编码必须稳定一致。
 pub fn index_key(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
-        Value::Int(n) => Some(format!("n{}", n)),
-        Value::Real(n) => Some(format!("n{}", n)),
-        Value::Decimal { v, scale } => Some(format!("d{}", format_decimal(*v, *scale))),
+        // 符号翻转 + 大端 hex：负数 < 正数全序成立
+        Value::Int(n) => Some(format!(
+            "i{:016x}",
+            (*n as u64).wrapping_add(0x8000_0000_0000_0000)
+        )),
+        Value::Real(n) => {
+            let bits = n.to_bits();
+            let ordered = if bits >> 63 == 1 { !bits } else { bits | 0x8000_0000_0000_0000 };
+            Some(format!("r{:016x}", ordered))
+        }
+        Value::Decimal { v, .. } => {
+            // 同列同标度：符号翻转 + 大端 hex 保序
+            let ordered = (*v as u128) ^ (1u128 << 127);
+            Some(format!("d{:032x}", ordered))
+        }
         Value::Bool(b) => Some(format!("b{}", if *b { 1 } else { 0 })),
+        // UTF-8 字节序 == 码点序，天然保序
         Value::Text(s) => Some(format!("s{}", s)),
     }
 }
@@ -828,7 +874,12 @@ mod tests {
 
     #[test]
     fn index_keys() {
-        assert_eq!(index_key(&Value::Int(5)).unwrap(), "n5");
+        // 保序编码：键的字典序 == 值的大小序（范围扫描依赖此性质）
+        let i5 = index_key(&Value::Int(5)).unwrap();
+        let i10 = index_key(&Value::Int(10)).unwrap();
+        let ineg = index_key(&Value::Int(-1)).unwrap();
+        assert!(ineg < i5, "负数键应小于正数键");
+        assert!(i5 < i10, "5 应小于 10");
         assert_eq!(
             index_key(&Value::Text("x".to_string())).unwrap(),
             "sx"
@@ -843,7 +894,8 @@ mod decimal_tests {
 
     #[test]
     fn parse_and_format_roundtrip() {
-        for (text, scale) in [("123.45", 2u8), ("0.1", 4), ("-99.999", 3), ("42", 0), ("0.0001", 4)] {
+        // 标度固定：DECIMAL(p,s) 值总是显示 s 位小数（金额格式化）
+        for (text, scale) in [("123.45", 2u8), ("0.1000", 4), ("-99.999", 3), ("42", 0), ("0.0001", 4)] {
             let v = parse_decimal(text, scale).unwrap();
             assert_eq!(format_decimal(v, scale), text, "roundtrip {}", text);
         }
@@ -851,9 +903,6 @@ mod decimal_tests {
         assert_eq!(parse_decimal("1.005", 2).unwrap(), 101); // 1.01
         assert_eq!(parse_decimal("1.004", 2).unwrap(), 100); // 1.00
         assert_eq!(format_decimal(parse_decimal("1.006", 2).unwrap(), 2), "1.01");
-        // 尾随 0
-        assert_eq!(format_decimal(parse_decimal("10.50", 4).unwrap(), 4), "10.5");
-        assert_eq!(format_decimal(parse_decimal("10.0000", 4).unwrap(), 4), "10");
     }
 
     #[test]
@@ -868,11 +917,14 @@ mod decimal_tests {
     }
 
     #[test]
-    fn decimal_index_key_stable() {
-        let k1 = index_key(&Value::Decimal { v: 12345, scale: 4 }).unwrap();
-        let k2 = index_key(&Value::Decimal { v: 123450, scale: 5 }).unwrap();
-        assert_eq!(k1, "d1.2345");
-        assert_eq!(k2, "d1.2345"); // 同值不同标度 → 同键
+    fn decimal_index_key_ordered() {
+        // 同列同标度下保序；不同标度各自编码（delta 键只在同列内比较）
+        let a = index_key(&Value::Decimal { v: 12345, scale: 4 }).unwrap();
+        let b = index_key(&Value::Decimal { v: 12346, scale: 4 }).unwrap();
+        assert!(a < b, "键应保序");
+        let neg = index_key(&Value::Decimal { v: -1, scale: 4 }).unwrap();
+        let zero = index_key(&Value::Decimal { v: 0, scale: 4 }).unwrap();
+        assert!(neg < zero, "负数键应小于零键");
     }
 
     #[test]

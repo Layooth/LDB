@@ -1,0 +1,291 @@
+//! 存储层集成测试：从建表到重开，覆盖事务、约束、索引与恢复。
+
+use std::path::PathBuf;
+
+use littledb::{Column, ColumnType, Engine, Result, Value};
+
+fn temp_dir(name: &str) -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("littledb-it-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn players_columns() -> Vec<Column> {
+    let mut id = Column::new("id", ColumnType::Int);
+    id.primary_key = true;
+    id.not_null = true;
+    let mut name = Column::new("name", ColumnType::Text);
+    name.unique = true;
+    vec![id, name, Column::new("score", ColumnType::Int)]
+}
+
+fn setup(engine: &mut Engine) -> Result<()> {
+    engine.write(|e| -> Result<()> {
+        e.create_table("players", players_columns(), false)
+    })
+}
+
+#[test]
+fn crud_and_reopen() {
+    let dir = temp_dir("crud");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        setup(&mut engine).unwrap();
+
+        engine
+            .write(|e| -> Result<()> {
+                for i in 0..20 {
+                    e.insert(
+                        "players",
+                        vec![
+                            Value::Int(i),
+                            Value::Text(format!("p{}", i)),
+                            Value::Int(i * 10),
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let rows = engine.scan("players").unwrap();
+        assert_eq!(rows.len(), 20);
+
+        let ids = engine.find_by_equality("players", "id", &Value::Int(7)).unwrap();
+        assert_eq!(ids.as_ref().map(|v| v.len()), Some(1));
+        let row = engine.get("players", ids.unwrap()[0]).unwrap().unwrap();
+        assert_eq!(row[1], Value::Text("p7".to_string()));
+        engine.close().unwrap();
+    }
+
+    let mut engine = Engine::open(&dir).unwrap();
+    let rows = engine.scan("players").unwrap();
+    assert_eq!(rows.len(), 20, "重新打开后数据应完整");
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn transaction_rollback_keeps_data() {
+    let dir = temp_dir("rollback");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+
+    engine
+        .write(|e| -> Result<()> {
+            e.insert(
+                "players",
+                vec![Value::Int(1), Value::Text("keep".to_string()), Value::Int(0)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let result: Result<()> = engine.write(|e| -> Result<()> {
+        e.insert(
+            "players",
+            vec![Value::Int(2), Value::Text("temp".to_string()), Value::Int(0)],
+        )?;
+        Err(littledb::DbError::internal("故意失败"))
+    });
+    assert!(result.is_err());
+
+    let rows = engine.scan("players").unwrap();
+    assert_eq!(rows.len(), 1, "失败的事务必须整体回滚");
+    assert_eq!(rows[0].1[1], Value::Text("keep".to_string()));
+
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn constraints_enforced() {
+    let dir = temp_dir("constraint");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+
+    engine
+        .write(|e| -> Result<()> {
+            e.insert(
+                "players",
+                vec![Value::Int(1), Value::Text("a".to_string()), Value::Int(0)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let dup_pk: Result<()> = engine.write(|e| -> Result<()> {
+        e.insert(
+            "players",
+            vec![Value::Int(1), Value::Text("b".to_string()), Value::Int(0)],
+        )?;
+        Ok(())
+    });
+    assert!(dup_pk.is_err());
+
+    let dup_unique: Result<()> = engine.write(|e| -> Result<()> {
+        e.insert(
+            "players",
+            vec![Value::Int(2), Value::Text("a".to_string()), Value::Int(0)],
+        )?;
+        Ok(())
+    });
+    assert!(dup_unique.is_err());
+
+    let null_pk: Result<()> = engine.write(|e| -> Result<()> {
+        e.insert(
+            "players",
+            vec![Value::Null, Value::Text("c".to_string()), Value::Int(0)],
+        )?;
+        Ok(())
+    });
+    assert!(null_pk.is_err());
+
+    assert_eq!(engine.scan("players").unwrap().len(), 1);
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn update_replaces_row_and_keeps_index_consistent() {
+    let dir = temp_dir("update");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+
+    let row_id = engine
+        .write(|e| -> Result<u32> {
+            e.insert(
+                "players",
+                vec![Value::Int(1), Value::Text("old".to_string()), Value::Int(10)],
+            )
+        })
+        .unwrap();
+
+    engine
+        .write(|e| -> Result<()> {
+            e.update(
+                "players",
+                row_id,
+                vec![Value::Int(1), Value::Text("new".to_string()), Value::Int(20)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let ids = engine.find_by_equality("players", "name", &Value::Text("new".to_string())).unwrap();
+    assert_eq!(ids.as_ref().map(|v| v.len()), Some(1));
+    assert!(engine
+        .find_by_equality("players", "name", &Value::Text("old".to_string()))
+        .unwrap()
+        .map(|v| v.is_empty())
+        .unwrap_or(false));
+
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn drop_table_removes_file() {
+    let dir = temp_dir("drop");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+    engine
+        .write(|e| -> Result<()> {
+            e.insert(
+                "players",
+                vec![Value::Int(1), Value::Text("x".to_string()), Value::Int(0)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    engine.close().unwrap();
+
+    let data_dir = dir.join("data");
+    let before = std::fs::read_dir(&data_dir).unwrap().count();
+    assert!(before >= 1);
+
+    let mut engine = Engine::open(&dir).unwrap();
+    engine.write(|e| -> Result<()> { e.drop_table("players", false) }).unwrap();
+    engine.close().unwrap();
+
+    let after = std::fs::read_dir(&data_dir).unwrap().count();
+    assert_eq!(after, 0, "表文件应被清理");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_recovery_after_crash() {
+    let dir = temp_dir("recover");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        setup(&mut engine).unwrap();
+        engine
+            .write(|e| -> Result<()> {
+                for i in 0..5 {
+                    e.insert(
+                        "players",
+                        vec![
+                            Value::Int(i),
+                            Value::Text(format!("r{}", i)),
+                            Value::Int(i),
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        // 不 close：模拟进程被强杀
+    }
+
+    let mut engine = Engine::open(&dir).unwrap();
+    assert!(engine.store.recovered_txns >= 1, "应从 WAL 恢复出已提交事务");
+    assert_eq!(engine.scan("players").unwrap().len(), 5);
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn many_rows_cross_pages() {
+    let dir = temp_dir("pages");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+
+    // 每行约 40 字节，500 行必然跨多页
+    engine
+        .write(|e| -> Result<()> {
+            for i in 0..500 {
+                e.insert(
+                    "players",
+                    vec![
+                        Value::Int(i),
+                        Value::Text(format!("user-{:04}", i)),
+                        Value::Int(i),
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let rows = engine.scan("players").unwrap();
+    assert_eq!(rows.len(), 500);
+
+    let stats = engine.stats();
+    assert!(stats.pages > 1, "500 行应占用多页，实际 {}", stats.pages);
+
+    // 删除一半再验证
+    engine
+        .write(|e| -> Result<()> {
+            let ids: Vec<u32> = e.scan("players")?.iter().map(|item| item.0).take(250).collect();
+            for id in ids {
+                e.delete("players", id)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(engine.scan("players").unwrap().len(), 250);
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

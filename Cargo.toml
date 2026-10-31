@@ -1,0 +1,23 @@
+[package]
+name = "littledb"
+version = "1.0.0"
+edition = "2021"
+description = "LittleDB 的 Rust 实现，与 Node 版共享同一套磁盘格式"
+license = "MIT"
+
+[[bin]]
+name = "littledb"
+path = "src/main.rs"
+
+[lib]
+name = "littledb"
+path = "src/lib.rs"
+
+[dependencies]
+# 刻意保持零依赖：只用 std，避免网络拉包和版本不匹配
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

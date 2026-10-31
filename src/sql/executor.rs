@@ -629,8 +629,8 @@ fn run_with_engine(
             exec_select(engine, select, params, committed_only, Some(owner))
         }
         Statement::Insert(insert) => exec_insert(engine, insert, params),
-        Statement::Update(update) => exec_update(engine, update, params),
-        Statement::Delete(delete) => exec_delete(engine, delete, params),
+        Statement::Update(update) => exec_update(engine, update, params, owner),
+        Statement::Delete(delete) => exec_delete(engine, delete, params, owner),
         Statement::CreateTable(create) => {
             engine.ensure_ddl_exclusive(owner)?;
             exec_create_table(engine, create, params)
@@ -1884,7 +1884,31 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
     Ok(QueryResult::Insert { inserted })
 }
 
-fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Result<QueryResult> {
+/// UPDATE / DELETE 的行来源：能用索引就只取候选行，否则退回全表扫描。
+///
+/// 索引只用来筛**候选**，WHERE 依旧逐行复检（索引条件可能只是 WHERE 的一部分）。
+fn write_candidates(
+    engine: &Engine,
+    table: &str,
+    where_clause: Option<&Expr>,
+    params: &[Value],
+    owner: u64,
+) -> Result<Option<Vec<u32>>> {
+    let Some(expr) = where_clause else {
+        return Ok(None);
+    };
+    if let Some(lookup) = index_candidates(engine, table, Some(expr), params, Some(owner))? {
+        return Ok(Some(lookup.ids));
+    }
+    range_candidates(engine, table, Some(expr), params)
+}
+
+fn exec_update(
+    engine: &mut Engine,
+    stmt: &UpdateStmt,
+    params: &[Value],
+    owner: u64,
+) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
     let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
     let _table_guard = table_write(&table_guard);
@@ -1906,16 +1930,37 @@ fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Resu
         }
     }
 
-    let snapshot = engine.scan(&stmt.table)?;
-    // UPDATE 全表物化：超限宁可报错，也不要把进程内存打满
-    if snapshot.len() > MAX_SCAN_ROWS {
-        return Err(scan_limit_error());
-    }
-    let mut updated = 0usize;
+    // 先展开 WHERE 里的子查询（索引候选与行过滤都用同一个条件）
+    let where_clause = match &stmt.where_clause {
+        Some(expr) => Some(resolve_subqueries(&*engine, expr, params, false, Some(owner))?),
+        None => None,
+    };
 
-    for (row_id, values) in snapshot {
+    // 行来源：索引候选（通常只有几行）→ 全表快照（受行数上限保护）
+    let rows: Vec<(u32, Vec<Value>)> =
+        match write_candidates(&*engine, &stmt.table, where_clause.as_ref(), params, owner)? {
+            Some(ids) => {
+                let mut rows = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(values) = engine.get(&stmt.table, id)? {
+                        rows.push((id, values));
+                    }
+                }
+                rows
+            }
+            None => {
+                let snapshot = engine.scan(&stmt.table)?;
+                if snapshot.len() > MAX_SCAN_ROWS {
+                    return Err(scan_limit_error());
+                }
+                snapshot
+            }
+        };
+
+    let mut updated = 0usize;
+    for (row_id, values) in rows {
         let ctx = RowContext::new(&columns, values.clone());
-        if let Some(where_clause) = &stmt.where_clause {
+        if let Some(where_clause) = &where_clause {
             let value = eval(where_clause, &ctx, params)?;
             if !matches(&value) {
                 continue;
@@ -1935,18 +1980,43 @@ fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Resu
     Ok(QueryResult::Update { updated })
 }
 
-fn exec_delete(engine: &mut Engine, stmt: &DeleteStmt, params: &[Value]) -> Result<QueryResult> {
+fn exec_delete(
+    engine: &mut Engine,
+    stmt: &DeleteStmt,
+    params: &[Value],
+    owner: u64,
+) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
     let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
     let _table_guard = table_write(&table_guard);
-    let snapshot = engine.scan(&stmt.table)?;
-    if snapshot.len() > MAX_SCAN_ROWS {
-        return Err(scan_limit_error());
-    }
+
+    let where_clause = match &stmt.where_clause {
+        Some(expr) => Some(resolve_subqueries(&*engine, expr, params, false, Some(owner))?),
+        None => None,
+    };
+    let rows: Vec<(u32, Vec<Value>)> =
+        match write_candidates(&*engine, &stmt.table, where_clause.as_ref(), params, owner)? {
+            Some(ids) => {
+                let mut rows = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(values) = engine.get(&stmt.table, id)? {
+                        rows.push((id, values));
+                    }
+                }
+                rows
+            }
+            None => {
+                let snapshot = engine.scan(&stmt.table)?;
+                if snapshot.len() > MAX_SCAN_ROWS {
+                    return Err(scan_limit_error());
+                }
+                snapshot
+            }
+        };
     let mut deleted = 0usize;
 
-    for (row_id, values) in snapshot {
-        if let Some(where_clause) = &stmt.where_clause {
+    for (row_id, values) in rows {
+        if let Some(where_clause) = &where_clause {
             let ctx = RowContext::new(&columns, values);
             let value = eval(where_clause, &ctx, params)?;
             if !matches(&value) {
@@ -2173,6 +2243,33 @@ fn exec_alter_table(
 
 // ------------------------------------------------------------------ EXPLAIN
 
+/// UPDATE / DELETE 的行来源说明（与 `write_candidates` 的实际决策保持一致）
+fn explain_write_source(
+    rows: &mut Vec<Vec<Value>>,
+    engine: &Engine,
+    table: &str,
+    where_clause: Option<&Expr>,
+    params: &[Value],
+    owner: u64,
+) -> Result<()> {
+    match write_candidates(engine, table, where_clause, params, owner)? {
+        Some(ids) => {
+            rows.push(kv(
+                "访问方式",
+                format!("索引定位后逐行处理（候选 {} 行，WHERE 仍逐行复检）", ids.len()),
+            ));
+        }
+        None => {
+            let total = engine.table(table).map(|t| t.row_count).unwrap_or(0);
+            rows.push(kv(
+                "访问方式",
+                format!("全表扫描后逐行处理（约 {} 行，受 50 万行上限保护）", total),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn kv(key: &str, value: String) -> Vec<Value> {
     vec![Value::Text(key.to_string()), Value::Text(value)]
 }
@@ -2277,12 +2374,14 @@ fn exec_explain(
         }
         Statement::Update(update) => {
             rows.push(kv("表", update.table.clone()));
-            rows.push(kv("访问方式", "全表扫描后逐行更新".to_string()));
+            explain_write_source(&mut rows, engine, &update.table, update.where_clause.as_ref(), params, owner)?;
+            rows.push(kv("访问方式追加", "逐行更新（先删旧行再插新行，索引 delta 延迟到提交期）".to_string()));
             rows.push(kv("赋值", format!("{} 个列", update.assignments.len())));
         }
         Statement::Delete(delete) => {
             rows.push(kv("表", delete.table.clone()));
-            rows.push(kv("访问方式", "全表扫描后逐行删除".to_string()));
+            explain_write_source(&mut rows, engine, &delete.table, delete.where_clause.as_ref(), params, owner)?;
+            rows.push(kv("访问方式追加", "逐行删除（死空间超过阈值会就地整理页）".to_string()));
         }
         _ => {
             rows.push(kv("说明", "该语句没有执行计划".to_string()));

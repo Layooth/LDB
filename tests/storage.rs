@@ -1380,11 +1380,21 @@ fn row_cap_rejects_full_scan_but_allows_limit() {
     let err = session.execute("SELECT COUNT(*) FROM big", &[]).unwrap_err();
     assert_eq!(err.code, "LIMIT_EXCEEDED", "{}", err.message);
 
-    // DML 同样受保护
+    // 无条件的 DML 仍受上限保护
     let err = session.execute("UPDATE big SET v = 1", &[]).unwrap_err();
     assert_eq!(err.code, "LIMIT_EXCEEDED", "{}", err.message);
     let err = session.execute("DELETE FROM big", &[]).unwrap_err();
     assert_eq!(err.code, "LIMIT_EXCEEDED", "{}", err.message);
+
+    // 但带主键条件的 DML 走索引定位，不受上限影响（E2 的核心收益）
+    match session.execute("UPDATE big SET v = 1 WHERE id = 42", &[]).unwrap() {
+        QueryResult::Update { updated } => assert_eq!(updated, 1),
+        other => panic!("期望 UPDATE，得到 {:?}", other),
+    }
+    match session.execute("DELETE FROM big WHERE id = 43", &[]).unwrap() {
+        QueryResult::Delete { deleted } => assert_eq!(deleted, 1),
+        other => panic!("期望 DELETE，得到 {:?}", other),
+    }
 
     // LIMIT 下推 / 索引查找都不受影响
     match session.execute("SELECT id FROM big LIMIT 5", &[]).unwrap() {
@@ -1445,6 +1455,68 @@ fn deleted_space_is_reclaimed() {
     );
     assert_eq!(engine.scan("players").unwrap().len(), 0);
     engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// UPDATE / DELETE 走索引定位：只取候选行，WHERE 仍逐行复检
+#[test]
+fn update_delete_use_index() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("writeidx");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE w (id INT PRIMARY KEY, v INT)", &[])
+        .unwrap();
+    session.execute("INSERT INTO w VALUES (1,0),(2,0),(3,0),(4,0),(42,0),(43,0)", &[]).unwrap();
+
+    let mut affected = |session: &mut Session, sql: &str| -> usize {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Update { updated } => updated,
+            QueryResult::Delete { deleted } => deleted,
+            other => panic!("期望 UPDATE/DELETE，得到 {:?}", other),
+        }
+    };
+
+    // 主键定位
+    assert_eq!(affected(&mut session, "UPDATE w SET v = 9 WHERE id = 42"), 1);
+    // 索引候选 + 复检：条件只命中一部分时不能多改
+    assert_eq!(affected(&mut session, "UPDATE w SET v = 8 WHERE id = 42 AND v = 9"), 1);
+    assert_eq!(affected(&mut session, "UPDATE w SET v = 7 WHERE id = 42 AND v = 0"), 0);
+    // 复检通过后确实落盘
+    match session.execute("SELECT v FROM w WHERE id = 42", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(8)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // 不存在的键：候选为空，一行也不动
+    assert_eq!(affected(&mut session, "DELETE FROM w WHERE id = 999"), 0);
+    assert_eq!(affected(&mut session, "DELETE FROM w WHERE id = 43"), 1);
+
+    // DELETE 的 WHERE 里带 IN 子查询（E2 顺带打通：写语句现在也会展开子查询）
+    assert_eq!(
+        affected(&mut session, "DELETE FROM w WHERE id IN (SELECT id FROM w WHERE id < 3)"),
+        2
+    );
+
+    // 访问方式要如实反映：主键等值 → 索引定位；无索引列 → 全表扫描
+    fn plan(session: &mut Session, sql: &str) -> Vec<(String, String)> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| (row[0].as_text(), row[1].as_text()))
+                .collect(),
+            other => panic!("期望 EXPLAIN，得到 {:?}", other),
+        }
+    }
+    let rows = plan(&mut session, "EXPLAIN UPDATE w SET v = 1 WHERE id = 2");
+    let way = rows.iter().find(|(k, _)| k == "访问方式").map(|(_, v)| v.clone()).unwrap();
+    assert!(way.contains("索引定位"), "{}", way);
+
+    let rows = plan(&mut session, "EXPLAIN DELETE FROM w WHERE v = 0");
+    let way = rows.iter().find(|(k, _)| k == "访问方式").map(|(_, v)| v.clone()).unwrap();
+    assert!(way.contains("全表扫描"), "{}", way);
+
+    session.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -496,11 +496,30 @@ fn error_frame(id: Json, code: &str, message: &str) -> Json {
     ])
 }
 
+/// 发送一帧。
+///
+/// 响应超过 16MB 上限时改发一个错误帧——旧实现直接 `if let Ok(...)` 吞掉错误，
+/// 客户端会**永远等一个不会到来的响应**，看起来就像服务端挂死了。
 fn send(stream: &mut TcpStream, payload: &Json) {
-    if let Ok(frame) = encode_frame(payload) {
-        if stream.write_all(&frame).is_ok() {
-            let _ = stream.flush();
+    let frame = match encode_frame(payload) {
+        Ok(frame) => frame,
+        Err(err) => {
+            let fallback = error_frame(
+                Json::Null,
+                err.code,
+                &format!(
+                    "响应超过单帧 16MB 上限，请加 LIMIT 或分页后重试（{}）",
+                    err.message
+                ),
+            );
+            match encode_frame(&fallback) {
+                Ok(frame) => frame,
+                Err(_) => return,
+            }
         }
+    };
+    if stream.write_all(&frame).is_ok() {
+        let _ = stream.flush();
     }
 }
 
@@ -544,6 +563,36 @@ mod tests {
         for host in ["0.0.0.0", "192.168.1.10", "[::]", "example.com"] {
             assert!(!is_loopback(host), "{} 不应判定为回环", host);
         }
+    }
+
+    /// 超大响应必须回一个错误帧，而不是静默丢弃（客户端会当成挂死）
+    #[test]
+    fn oversized_response_yields_error_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).unwrap();
+            buf
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let payload = Json::Obj(vec![(
+            "result".to_string(),
+            Json::str("x".repeat(17 * 1024 * 1024)),
+        )]);
+        send(&mut stream, &payload);
+        drop(stream);
+
+        let bytes = reader.join().unwrap();
+        assert!(bytes.len() > 4, "应收到一帧");
+        let text = String::from_utf8_lossy(&bytes[4..]).to_string();
+        assert!(
+            text.contains("16MB") && text.contains("LIMIT"),
+            "应回明确的超限错误帧，实际: {}",
+            &text[..text.len().min(200)]
+        );
     }
 
     #[test]

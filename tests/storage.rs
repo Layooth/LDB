@@ -1980,6 +1980,53 @@ fn alter_table_add_drop_rename() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// ALTER 走影子表重建（删表+建表+逐行写回），中途崩溃后必须能靠 WAL 恢复
+#[test]
+fn alter_survives_crash() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("altercrash");
+    {
+        let mut session = Session::open(&dir).unwrap();
+        session
+            .execute("CREATE TABLE a (id INT PRIMARY KEY, n TEXT)", &[])
+            .unwrap();
+        session
+            .execute("INSERT INTO a VALUES (1,'one'),(2,'two'),(3,'three')", &[])
+            .unwrap();
+        session
+            .execute("ALTER TABLE a ADD COLUMN score INT DEFAULT 7", &[])
+            .unwrap();
+        session
+            .execute("INSERT INTO a VALUES (4,'four',4)", &[])
+            .unwrap();
+        // 直接丢弃 = 进程被强杀（不 close、不 checkpoint）
+    }
+
+    let mut session = Session::open(&dir).unwrap();
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+    assert_eq!(
+        rows(&mut session, "SELECT COUNT(*) FROM a"),
+        vec![vec![Value::Int(4)]],
+        "重放后行数应完整（含 ALTER 之后插入的那行）"
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT score FROM a WHERE id = 1"),
+        vec![vec![Value::Int(7)]],
+        "ALTER 加的列与其默认值都要恢复"
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT score FROM a WHERE id = 4"),
+        vec![vec![Value::Int(4)]]
+    );
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// ALTER TABLE 的拒绝路径：主键列、重名、NOT NULL 无默认值
 #[test]
 fn alter_table_rejects_unsafe_changes() {

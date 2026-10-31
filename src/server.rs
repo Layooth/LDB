@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,8 @@ pub struct ServerOptions {
     pub verbose: bool,
     pub web_dir: std::path::PathBuf,
     pub open_browser: bool,
+    /// true = 每次提交 fsync（full，默认）；false = normal 模式
+    pub durable_commits: bool,
 }
 
 impl Default for ServerOptions {
@@ -44,12 +46,13 @@ impl Default for ServerOptions {
             verbose: false,
             web_dir: crate::http::find_web_dir(),
             open_browser: true,
+            durable_commits: true,
         }
     }
 }
 
 pub struct Server {
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<RwLock<Engine>>,
     options: ServerOptions,
     active: Arc<AtomicUsize>,
     pub connections: Arc<AtomicUsize>,
@@ -59,9 +62,10 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(engine: Engine, options: ServerOptions) -> Server {
+    pub fn new(mut engine: Engine, options: ServerOptions) -> Server {
+        engine.store.set_sync_mode(options.durable_commits);
         Server {
-            engine: Arc::new(Mutex::new(engine)),
+            engine: Arc::new(RwLock::new(engine)),
             options,
             active: Arc::new(AtomicUsize::new(0)),
             connections: Arc::new(AtomicUsize::new(0)),
@@ -160,7 +164,7 @@ impl Server {
 #[allow(clippy::too_many_arguments)]
 fn handle_connection(
     mut stream: TcpStream,
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<RwLock<Engine>>,
     options: ServerOptions,
     active: Arc<AtomicUsize>,
     queries: Arc<AtomicUsize>,

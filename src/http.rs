@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,7 +41,7 @@ const TXN_SESSION_TTL_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub struct HttpState {
-    pub engine: Arc<Mutex<Engine>>,
+    pub engine: Arc<RwLock<Engine>>,
     sessions: Arc<Mutex<HashMap<String, (ConnSession, Instant)>>>,
     counter: Arc<AtomicU64>,
     started: Instant,
@@ -57,7 +57,7 @@ pub struct HttpState {
 impl HttpState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        engine: Arc<Mutex<Engine>>,
+        engine: Arc<RwLock<Engine>>,
         token: Option<String>,
         web_dir: PathBuf,
         connections: Arc<AtomicUsize>,
@@ -135,6 +135,7 @@ pub fn serve(state: HttpState, host: &str, port: u16) -> Result<()> {
 
 struct Request {
     method: String,
+    version: String,
     path: String,
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
@@ -165,58 +166,80 @@ fn handle(state: HttpState, mut stream: TcpStream) {
     // 否则线程不会永远等下去（防 slowloris；正常请求毫秒级完成）
     let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+    let _ = stream.set_nodelay(true);
 
-    let request = match read_request(&mut stream) {
-        Ok(Some(r)) => r,
-        _ => return,
-    };
+    // keep-alive：HTTP/1.1 默认复用连接，客户端省掉每请求的 TCP 建立。
+    // pending 保存流水线场景下「上一条请求多读出来的下一请求字节」。
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        let request = match read_request(&mut stream, &mut pending) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        let keep_alive = wants_keep_alive(&request);
 
-    if request.method == "OPTIONS" {
-        send_response(&mut stream, 204, "No Content", "text/plain", b"", &[]);
-        return;
+        if request.method == "OPTIONS" {
+            send_response(&mut stream, 204, "No Content", "text/plain", b"", &[], keep_alive);
+        } else if request.path.starts_with("/api/") {
+            let (status, payload, extra) = route(&state, &request);
+            let body = payload.to_string();
+            send_response(
+                &mut stream,
+                status,
+                status_text(status),
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+                &extra,
+                keep_alive,
+            );
+        } else {
+            serve_static(&state, &mut stream, &request, keep_alive);
+        }
+
+        if !keep_alive {
+            return;
+        }
     }
+}
 
-    if request.path.starts_with("/api/") {
-        let (status, payload, extra) = route(&state, &request);
-        let body = payload.to_string();
-        send_response(
-            &mut stream,
-            status,
-            status_text(status),
-            "application/json; charset=utf-8",
-            body.as_bytes(),
-            &extra,
-        );
-        return;
+/// HTTP/1.1 默认 keep-alive；HTTP/1.0 需要显式声明；Connection: close 一票否决
+fn wants_keep_alive(request: &Request) -> bool {
+    let connection = request
+        .header("connection")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if connection.split(',').any(|t| t.trim() == "close") {
+        return false;
     }
-
-    serve_static(&state, &mut stream, &request);
+    if request.version == "HTTP/1.0" {
+        return connection.split(',').any(|t| t.trim() == "keep-alive");
+    }
+    true
 }
 
 // ------------------------------------------------------------------ 请求解析
 
-fn read_request(stream: &mut TcpStream) -> Result<Option<Request>> {
-    let mut buffer: Vec<u8> = Vec::new();
+/// 读取一条请求。`pending` 是上一条请求遗留的字节（流水线），优先消费；
+/// 本次多读出来的字节同样写回 `pending` 供下一条请求使用。
+fn read_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<Option<Request>> {
+    let mut buffer = std::mem::take(pending);
     let mut chunk = [0u8; 4096];
     let header_end;
 
     loop {
+        if let Some(pos) = find_subsequence(&buffer, b"\r\n\r\n") {
+            header_end = pos;
+            break;
+        }
+        if buffer.len() > MAX_HEADER {
+            return Err(DbError::new(error::PROTOCOL, "请求头过大"));
+        }
         let read = match stream.read(&mut chunk) {
             Ok(0) => return Ok(None),
             Ok(n) => n,
             Err(_) => return Ok(None),
         };
         buffer.extend_from_slice(&chunk[..read]);
-        if buffer.len() > MAX_HEADER {
-            return Err(DbError::new(error::PROTOCOL, "请求头过大"));
-        }
-        match find_subsequence(&buffer, b"\r\n\r\n") {
-            Some(pos) => {
-                header_end = pos;
-                break;
-            }
-            None => continue,
-        }
     }
 
     let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
@@ -225,6 +248,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<Request>> {
     let mut tokens = request_line.split_whitespace();
     let method = tokens.next().unwrap_or("").to_uppercase();
     let target = tokens.next().unwrap_or("/").to_string();
+    let version = tokens.next().unwrap_or("HTTP/1.0").to_uppercase();
 
     let mut headers = HashMap::new();
     for line in lines {
@@ -243,7 +267,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<Request>> {
         return Err(DbError::new(error::PROTOCOL, "请求体超过 2MB 上限"));
     }
 
-    let mut body = buffer[header_end + 4..].to_vec();
+    let mut body: Vec<u8> = buffer[header_end + 4..].to_vec();
     while body.len() < content_length {
         let read = match stream.read(&mut chunk) {
             Ok(0) => break,
@@ -252,12 +276,17 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<Request>> {
         };
         body.extend_from_slice(&chunk[..read]);
     }
-    body.truncate(content_length);
+    if body.len() > content_length {
+        // 超出本请求 body 的部分属于流水线中的下一条请求
+        *pending = body[content_length..].to_vec();
+        body.truncate(content_length);
+    }
 
     let (path, query) = split_target(&target);
 
     Ok(Some(Request {
         method,
+        version,
         path,
         query,
         headers,
@@ -333,11 +362,16 @@ fn send_response(
     content_type: &str,
     body: &[u8],
     extra: &[(String, String)],
+    keep_alive: bool,
 ) {
     let mut head = format!("HTTP/1.1 {} {}\r\n", status, reason);
     head.push_str(&format!("Content-Type: {}\r\n", content_type));
     head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    head.push_str("Connection: close\r\n");
+    head.push_str(if keep_alive {
+        "Connection: keep-alive\r\n"
+    } else {
+        "Connection: close\r\n"
+    });
     head.push_str("Access-Control-Allow-Origin: *\r\n");
     head.push_str("Access-Control-Allow-Headers: Content-Type, Authorization, X-Session-Id\r\n");
     head.push_str("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
@@ -351,7 +385,9 @@ fn send_response(
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body);
     let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    if !keep_alive {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 fn status_text(status: u16) -> &'static str {
@@ -522,8 +558,16 @@ fn with_session<T>(
         Some((session, _)) => session,
         None => ConnSession::new(Arc::clone(&state.engine)),
     };
+    // 会话已从 map 取出：执行期间不再持有 sessions 互斥锁，
+    // 长查询不会阻塞 health/tables 等其它请求的会话解析
+    drop(guard);
 
     let outcome = action(&mut session);
+
+    let mut guard = match state.sessions.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     guard.insert(id.clone(), (session, Instant::now()));
     (id, outcome)
 }
@@ -531,7 +575,7 @@ fn with_session<T>(
 fn health(state: &HttpState) -> Result<Json> {
     let engine = state
         .engine
-        .lock()
+        .read()
         .map_err(|_| DbError::internal("数据库锁状态异常"))?;
     let stats = engine.store.stats();
     let total_rows: u64 = engine.tables.iter().map(|t| t.row_count as u64).sum();
@@ -588,9 +632,9 @@ fn health(state: &HttpState) -> Result<Json> {
 }
 
 fn list_tables(state: &HttpState) -> Result<Json> {
-    let mut engine = state
+    let engine = state
         .engine
-        .lock()
+        .read()
         .map_err(|_| DbError::internal("数据库锁状态异常"))?;
 
     let names = engine.table_names();
@@ -600,7 +644,7 @@ fn list_tables(state: &HttpState) -> Result<Json> {
             let table = engine.table(&name)?;
             (table.id, table.row_count, table.columns.len())
         };
-        let pages = engine.store.page_count(table_id);
+        let pages = engine.store.page_count_shared(table_id);
         items.push(Json::Obj(vec![
             ("name".to_string(), Json::str(name)),
             ("rows".to_string(), Json::Num(rows as f64)),
@@ -618,7 +662,7 @@ fn list_tables(state: &HttpState) -> Result<Json> {
 fn schema(state: &HttpState) -> Result<Json> {
     let engine = state
         .engine
-        .lock()
+        .read()
         .map_err(|_| DbError::internal("数据库锁状态异常"))?;
 
     let mut items = Vec::new();
@@ -734,7 +778,7 @@ fn table_rows(
     {
         let engine = state
             .engine
-            .lock()
+            .read()
             .map_err(|_| DbError::internal("数据库锁状态异常"))?;
         if engine.table(&name).is_err() {
             return Err(DbError::not_found(format!("表 \"{}\" 不存在", name)));
@@ -756,7 +800,7 @@ fn table_rows(
     let (total, schema_json) = {
         let engine = state
             .engine
-            .lock()
+            .read()
             .map_err(|_| DbError::internal("数据库锁状态异常"))?;
         let table = engine.table(&name)?;
         (table.row_count, describe_table(table))
@@ -799,11 +843,11 @@ fn alter_table(
 
     let mut engine = state
         .engine
-        .lock()
+        .write()
         .map_err(|_| DbError::internal("数据库锁状态异常"))?;
 
     // 重建是「删表 + 建表 + 逐行写回」，必须在单个事务里完成
-    engine.begin()?;
+    engine.begin(crate::engine::INTERNAL_TXN_OWNER)?;
     let outcome = match engine.rebuild_table(&name, &columns) {
         Ok(out) => match engine.commit() {
             Ok(()) => out,
@@ -864,7 +908,7 @@ fn json_to_value(value: &Json) -> Value {
 
 // ------------------------------------------------------------------ 静态文件
 
-fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request) {
+fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request, keep_alive: bool) {
     let mime_for = |path: &Path| -> &'static str {
         match path
             .extension()
@@ -909,6 +953,7 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request) {
             "text/plain; charset=utf-8",
             b"403 Forbidden",
             &[],
+            keep_alive,
         );
         return;
     }
@@ -929,6 +974,7 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request) {
             "text/plain; charset=utf-8",
             b"403 Forbidden",
             &[],
+            keep_alive,
         );
         return;
     }
@@ -943,6 +989,7 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request) {
                 "text/plain; charset=utf-8",
                 b"404 Not Found",
                 &[],
+                keep_alive,
             );
             return;
         }
@@ -958,6 +1005,7 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request) {
                 mime_for(&file_path),
                 &body,
                 &extra,
+                keep_alive,
             );
         }
         Err(err) => {
@@ -969,6 +1017,7 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request) {
                 "text/plain; charset=utf-8",
                 text.as_bytes(),
                 &[],
+                keep_alive,
             );
         }
     }

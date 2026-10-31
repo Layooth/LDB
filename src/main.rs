@@ -36,6 +36,8 @@ fn print_help() {
     println!("  --token <令牌>       启用认证，客户端需携带相同 token");
     println!("  --max-connections <n> 最大并发连接数（默认 64）");
     println!("  --slow-ms <毫秒>     超过该耗时打印慢查询");
+    println!("  --sync <full|normal> 提交耐久性（默认 full）：normal 在 checkpoint 时才 fsync，");
+    println!("                       进程崩溃仍安全，但掉电可能丢失最近的提交");
     println!("  --verbose            输出每条查询耗时");
     println!();
     println!("示例:");
@@ -285,6 +287,17 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
                     options.slow_ms = value.parse().unwrap_or(0.0);
                 }
             }
+            "--sync" => {
+                i += 1;
+                match extra.get(i).map(|s| s.as_str()) {
+                    Some("full") => options.durable_commits = true,
+                    Some("normal") => options.durable_commits = false,
+                    other => {
+                        eprintln!("--sync 需要 full 或 normal，实际是 {:?}", other);
+                        exit(1);
+                    }
+                }
+            }
             "--verbose" => options.verbose = true,
             other => {
                 eprintln!("未知参数: {}", other);
@@ -304,6 +317,9 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
     );
     if options.token.is_some() {
         println!("[LittleDB] 已启用 token 认证");
+    }
+    if !options.durable_commits {
+        println!("[LittleDB] 同步模式 normal：提交不 fsync，掉电可能丢失最近的提交");
     }
 
     let server = Server::new(engine, options);

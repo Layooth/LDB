@@ -6,7 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::codec::{self, Column, ColumnType, Value};
 use crate::engine::Engine;
@@ -372,7 +373,13 @@ impl Session {
         statement: &Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        execute_on(&mut self.engine, &mut self.in_txn, statement, params)
+        execute_on(
+            &mut self.engine,
+            &mut self.in_txn,
+            statement,
+            params,
+            crate::engine::EXCLUSIVE_TXN_OWNER,
+        )
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -392,28 +399,51 @@ impl Drop for Session {
     }
 }
 
-/// 服务端使用的会话：多个连接共享同一个引擎，靠互斥锁串行化，
-/// 等价于 Node 版的「全局单写锁」语义。
+/// 服务端使用的会话：多连接共享同一个引擎。
+///
+/// 锁策略：写语句 / 事务控制 / 事务内语句拿写锁（独占，单写者语义不变）；
+/// 非事务只读语句拿读锁，多个会话的 SELECT 可以真正并行。
+/// 行可见性由会话 id 决定（read_shared 的 owner 检查）。
 pub struct ConnSession {
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<RwLock<Engine>>,
+    session_id: u64,
     in_txn: bool,
 }
 
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 impl ConnSession {
-    pub fn new(engine: Arc<Mutex<Engine>>) -> ConnSession {
+    pub fn new(engine: Arc<RwLock<Engine>>) -> ConnSession {
         ConnSession {
             engine,
+            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst),
             in_txn: false,
         }
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         let statement = Parser::parse(sql)?;
-        let mut guard = self
-            .engine
-            .lock()
-            .map_err(|_| DbError::internal("数据库锁状态异常"))?;
-        execute_on(&mut *guard, &mut self.in_txn, &statement, params)
+        let needs_write = !statement.is_read_only()
+            || self.in_txn
+            || matches!(
+                statement,
+                Statement::Begin | Statement::Commit | Statement::Rollback
+            );
+        if needs_write {
+            let mut guard = self
+                .engine
+                .write()
+                .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+            execute_on(&mut *guard, &mut self.in_txn, &statement, params, self.session_id)
+        } else {
+            let guard = self
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+            // 其它会话可能有开放写事务：只读路径只见已提交数据（绕开含未提交键的索引）
+            let committed_only = guard.store.in_txn();
+            run_read_only(&guard, &statement, params, committed_only, self.session_id)
+        }
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -422,7 +452,7 @@ impl ConnSession {
 
     pub fn close(&mut self) {
         if self.in_txn {
-            if let Ok(mut guard) = self.engine.lock() {
+            if let Ok(mut guard) = self.engine.write() {
                 guard.rollback();
             }
             self.in_txn = false;
@@ -442,6 +472,7 @@ pub fn execute_on(
     in_txn: &mut bool,
     statement: &Statement,
     params: &[Value],
+    owner: u64,
 ) -> Result<QueryResult> {
     match statement {
         Statement::Begin => {
@@ -450,7 +481,7 @@ pub fn execute_on(
                     message: "事务已在进行中".to_string(),
                 });
             }
-            engine.begin()?;
+            engine.begin(owner)?;
             *in_txn = true;
             return Ok(QueryResult::Transaction {
                 message: "事务已开始".to_string(),
@@ -487,11 +518,11 @@ pub fn execute_on(
     if statement.is_read_only() || *in_txn {
         // 其它会话持有写事务时，本会话的只读语句只能看已提交数据
         let committed_only = !*in_txn && engine.store.in_txn();
-        return run_with_engine(engine, statement, params, committed_only);
+        return run_with_engine(engine, statement, params, committed_only, owner);
     }
 
     // 单语句隐式事务
-    let outcome = engine.write(|inner| run_with_engine(inner, statement, params, false));
+    let outcome = engine.write(|inner| run_with_engine(inner, statement, params, false, owner));
     if outcome.is_err() {
         *in_txn = false;
     }
@@ -503,9 +534,12 @@ fn run_with_engine(
     statement: &Statement,
     params: &[Value],
     committed_only: bool,
+    owner: u64,
 ) -> Result<QueryResult> {
     match statement {
-        Statement::Select(select) => exec_select(engine, select, params, committed_only),
+        Statement::Select(select) => {
+            exec_select(engine, select, params, committed_only, Some(owner))
+        }
         Statement::Insert(insert) => exec_insert(engine, insert, params),
         Statement::Update(update) => exec_update(engine, update, params),
         Statement::Delete(delete) => exec_delete(engine, delete, params),
@@ -539,6 +573,28 @@ fn run_with_engine(
                 message: format!("已删除索引 \"{}\"", name),
             })
         }
+        Statement::ShowTables | Statement::Describe { .. } | Statement::Explain { .. } => {
+            run_read_only(engine, statement, params, committed_only, owner)
+        }
+        Statement::Begin | Statement::Commit | Statement::Rollback => {
+            Err(DbError::internal("事务控制语句不应到达执行器"))
+        }
+    }
+}
+
+/// 只读语句的 `&Engine` 执行路径：读锁（并发只读）下使用。
+/// 与 run_with_engine 的对应分支语义一致，但全部走共享视图。
+fn run_read_only(
+    engine: &Engine,
+    statement: &Statement,
+    params: &[Value],
+    committed_only: bool,
+    owner: u64,
+) -> Result<QueryResult> {
+    match statement {
+        Statement::Select(select) => {
+            exec_select(engine, select, params, committed_only, Some(owner))
+        }
         Statement::ShowTables => {
             let mut tables = Vec::new();
             for name in engine.table_names() {
@@ -546,7 +602,7 @@ fn run_with_engine(
                     let table = engine.table(&name)?;
                     (table.id, table.row_count, table.columns.len())
                 };
-                let pages = engine.store.page_count(table_id);
+                let pages = engine.store.page_count_shared(table_id);
                 tables.push(TableInfo {
                     name,
                     rows,
@@ -599,9 +655,7 @@ fn run_with_engine(
             })
         }
         Statement::Explain { statement } => exec_explain(engine, statement, params),
-        Statement::Begin | Statement::Commit | Statement::Rollback => {
-            Err(DbError::internal("事务控制语句不应到达执行器"))
-        }
+        _ => Err(DbError::internal("run_read_only 只接受只读语句")),
     }
 }
 
@@ -628,10 +682,11 @@ const MAX_JOIN_PAIRS: usize = 2_000_000;
 
 /// SELECT 管线：输出列 + (投影值, 排序键) 对，尚未做 ORDER BY / LIMIT / UNION
 fn select_base(
-    engine: &mut Engine,
+    engine: &Engine,
     stmt: &SelectStmt,
     params: &[Value],
     committed_only: bool,
+    owner: Option<u64>,
 ) -> Result<(Vec<String>, Vec<(Vec<Value>, Vec<Value>)>)> {
     // ---------------------------------------------------------------- 行来源
     let mut plans: Vec<TablePlan> = Vec::new();
@@ -651,17 +706,17 @@ fn select_base(
                     offset: 0,
                 });
                 let candidates =
-                    index_candidates(&*engine, name, stmt.where_clause.as_ref(), params)?;
+                    index_candidates(engine, name, stmt.where_clause.as_ref(), params)?;
                 match candidates {
                     Some(ids) => {
                         for id in ids {
-                            if let Some(values) = engine.get(name, id)? {
+                            if let Some(values) = engine.get_shared(name, id, owner)? {
                                 raw_rows.push(values);
                             }
                         }
                     }
                     None => {
-                        for (_, values) in engine.scan(name)? {
+                        for (_, values) in engine.scan_shared(name, owner)? {
                             raw_rows.push(values);
                         }
                     }
@@ -669,7 +724,7 @@ fn select_base(
             }
             // JOIN 树，或 committed_only 的单表（绕开含未提交键的索引）
             source => {
-                let (p, rows) = join_frame(engine, source, committed_only, params)?;
+                let (p, rows) = join_frame(engine, source, committed_only, params, owner)?;
                 plans = p;
                 raw_rows = rows;
             }
@@ -825,15 +880,16 @@ fn apply_offset_limit(
 
 /// SELECT 执行入口：处理 UNION 与最终 ORDER BY / LIMIT
 pub(crate) fn exec_select(
-    engine: &mut Engine,
+    engine: &Engine,
     stmt: &SelectStmt,
     params: &[Value],
     committed_only: bool,
+    owner: Option<u64>,
 ) -> Result<QueryResult> {
-    let (columns, mut pairs) = select_base(engine, stmt, params, committed_only)?;
+    let (columns, mut pairs) = select_base(engine, stmt, params, committed_only, owner)?;
 
     if let Some((kind, right)) = &stmt.union {
-        let (rcolumns, mut rpairs) = select_base(engine, right, params, committed_only)?;
+        let (rcolumns, mut rpairs) = select_base(engine, right, params, committed_only, owner)?;
         if rcolumns.len() != columns.len() {
             return Err(DbError::syntax(format!(
                 "UNION 两侧列数不一致：左侧 {} 列，右侧 {} 列",
@@ -908,10 +964,11 @@ pub(crate) fn exec_select(
 
 /// 递归生成 JOIN 树的行：叶子全扫，连接处优先走「跨表等值 + 右表索引」
 fn join_frame(
-    engine: &mut Engine,
+    engine: &Engine,
     source: &TableSource,
     committed_only: bool,
     params: &[Value],
+    owner: Option<u64>,
 ) -> Result<(Vec<TablePlan>, Vec<Vec<Value>>)> {
     match source {
         TableSource::Table { name, alias } => {
@@ -924,11 +981,8 @@ fn join_frame(
                 columns: table.columns.clone(),
                 offset: 0,
             };
-            let pairs = if committed_only {
-                engine.scan_committed(name)?
-            } else {
-                engine.scan(name)?
-            };
+            // committed_only 与共享读的语义一致：owner 不匹配开放事务时只见已提交
+            let pairs = engine.scan_shared(name, owner)?;
             Ok((vec![plan], pairs.into_iter().map(|(_, v)| v).collect()))
         }
         TableSource::Join {
@@ -937,8 +991,8 @@ fn join_frame(
             kind,
             on,
         } => {
-            let (lplans, lrows) = join_frame(engine, left, committed_only, params)?;
-            let (rplans, rrows) = join_frame(engine, right, committed_only, params)?;
+            let (lplans, lrows) = join_frame(engine, left, committed_only, params, owner)?;
+            let (rplans, rrows) = join_frame(engine, right, committed_only, params, owner)?;
             let left_width: usize = lplans.iter().map(|p| p.columns.len()).sum();
             let total_width = left_width + rplans.iter().map(|p| p.columns.len()).sum::<usize>();
 
@@ -970,7 +1024,9 @@ fn join_frame(
                                 .find_by_equality(&assist.table_name, &assist.column_name, &key)?
                             {
                                 for id in ids {
-                                    if let Some(rvals) = engine.get(&assist.table_name, id)? {
+                                    if let Some(rvals) =
+                                        engine.get_shared(&assist.table_name, id, owner)?
+                                    {
                                         let combined = concat_rows(lrow, &rvals);
                                         // ON 可能还带其它条件，候选行统一再过滤
                                         if let Some(on_expr) = on {
@@ -1461,7 +1517,7 @@ fn kv(key: &str, value: String) -> Vec<Value> {
 }
 
 fn exec_explain(
-    engine: &mut Engine,
+    engine: &Engine,
     statement: &Statement,
     params: &[Value],
 ) -> Result<QueryResult> {

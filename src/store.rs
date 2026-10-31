@@ -39,6 +39,11 @@ pub struct Store {
     /// 独占锁文件。`close()` 时置空以释放锁，析构时也会自动释放。
     _lock: Option<File>,
     files: HashMap<u32, TableFile>,
+    /// 只读文件句柄：与写句柄分离，配合定位读（seek_read/read_at），
+    /// 多个读线程并发读同一表文件不会互相干扰文件位置
+    read_handles: HashMap<u32, File>,
+    /// 当前写事务的属主（会话 id）；读路径据此判断能否看到未提交页
+    txn_owner: Option<u64>,
     pub catalog: Catalog,
     committed_catalog: Catalog,
     wal: Wal,
@@ -71,6 +76,8 @@ impl Store {
             catalog_path,
             _lock: Some(lock),
             files: HashMap::new(),
+            read_handles: HashMap::new(),
+            txn_owner: None,
             catalog: Catalog::empty(),
             committed_catalog: Catalog::empty(),
             wal: Wal::open(&wal_path)?,
@@ -91,11 +98,22 @@ impl Store {
         store.catalog = Catalog::load(&store.catalog_path)?;
         store.committed_catalog = store.catalog.clone();
         store.orphans_removed = store.cleanup_orphans();
+        // 只读句柄就绪后，读路径（RwLock 读锁）不再需要惰性打开文件
+        let table_ids: Vec<u32> = store.catalog.tables.iter().map(|d| d.id).collect();
+        for id in table_ids {
+            let _ = store.table_file(id);
+        }
         Ok(store)
     }
 
     pub fn set_wal_limit(&mut self, bytes: u64) {
         self.wal_limit = bytes;
+    }
+
+    /// 提交耐久性：true = 每次提交 fsync（默认，掉电安全）；
+    /// false = synchronous NORMAL（checkpoint 时才 fsync，掉电可能丢最近提交）
+    pub fn set_sync_mode(&mut self, durable: bool) {
+        self.wal.set_durable_commits(durable);
     }
 
     pub fn assert_usable(&self) -> Result<()> {
@@ -166,6 +184,8 @@ impl Store {
                     pages: (size / PAGE_SIZE as u64) as u32,
                 },
             );
+            let read_handle = OpenOptions::new().read(true).open(&path)?;
+            self.read_handles.insert(table_id, read_handle);
         }
         self.files
             .get_mut(&table_id)
@@ -216,6 +236,7 @@ impl Store {
                 continue;
             }
             self.files.remove(&id);
+            self.read_handles.remove(&id);
             let mut orphan = entry.file_name();
             orphan.push(".orphan");
             if fs::rename(entry.path(), self.data_dir.join(orphan)).is_ok() {
@@ -231,7 +252,7 @@ impl Store {
         self.txn.is_some()
     }
 
-    pub fn begin(&mut self) -> Result<()> {
+    pub fn begin(&mut self, owner: u64) -> Result<()> {
         self.assert_usable()?;
         if self.txn.is_some() {
             return Err(DbError::new(
@@ -240,6 +261,7 @@ impl Store {
             ));
         }
         self.txn_seq += 1;
+        self.txn_owner = Some(owner);
         self.txn = Some(Txn {
             id: self.txn_seq,
             pages: HashMap::new(),
@@ -257,6 +279,7 @@ impl Store {
             Some(t) => t,
             None => return Err(DbError::internal("没有进行中的事务")),
         };
+        self.txn_owner = None;
 
         let empty = txn.dirty.is_empty() && !txn.catalog_dirty;
         if empty {
@@ -316,6 +339,7 @@ impl Store {
     }
 
     pub fn rollback(&mut self) -> bool {
+        self.txn_owner = None;
         match self.txn.take() {
             Some(txn) => {
                 self.discard_txn(&txn);
@@ -357,6 +381,7 @@ impl Store {
         }
         for table_id in std::mem::take(&mut self.pending_drops) {
             self.files.remove(&table_id);
+            self.read_handles.remove(&table_id);
             let _ = fs::remove_file(self.table_file_path(table_id));
         }
         self.wal.truncate(false)?;
@@ -389,6 +414,51 @@ impl Store {
             txn.pages.insert(key, page.clone());
         }
         Ok(page)
+    }
+
+    /// 共享读：读锁下的页读取（多个读线程并发安全）。
+    ///
+    /// 可见性：`owner` 匹配当前写事务属主时可见未提交页（自己的事务），
+    /// 否则只见已提交数据（pending + 磁盘）。
+    /// 文件读取用定位读（Windows seek_read / Unix read_at），不改共享文件位置。
+    pub fn read_shared(&self, table_id: u32, page_no: u32, owner: Option<u64>) -> Result<Vec<u8>> {
+        if let Some(o) = owner {
+            if self.txn_owner == Some(o) {
+                if let Some(txn) = &self.txn {
+                    if let Some(page) = txn.pages.get(&(table_id, page_no)) {
+                        return Ok(page.clone());
+                    }
+                }
+            }
+        }
+        if let Some(page) = self.pending.get(&(table_id, page_no)) {
+            return Ok(page.clone());
+        }
+        match self.read_handles.get(&table_id) {
+            None => Ok(init_page(page_no)),
+            Some(handle) => {
+                let offset = page_no as u64 * PAGE_SIZE as u64;
+                let mut buf = vec![0u8; PAGE_SIZE];
+                // 定位读：可能部分读取，循环补齐
+                let mut filled = 0usize;
+                while filled < PAGE_SIZE {
+                    let n = positional_read(handle, &mut buf[filled..], offset + filled as u64)?;
+                    if n == 0 {
+                        // 页在内存页数内但磁盘上还没有：活动事务刚分配的页，
+                        // 对共享/已提交视图就是空页
+                        return Ok(init_page(page_no));
+                    }
+                    filled += n;
+                }
+                Ok(buf)
+            }
+        }
+    }
+
+    /// 共享读的页数：写路径分配页时同步递增了 `files.pages`，
+    /// 读侧按此值扫描，越界内容会读到空页（对未提交分配是正确语义）
+    pub fn page_count_shared(&self, table_id: u32) -> u32 {
+        self.files.get(&table_id).map(|f| f.pages).unwrap_or(0)
     }
 
     /// 已提交视图的页读取：跳过活动事务的页缓存。
@@ -496,6 +566,7 @@ impl Store {
             let _ = f.file.sync_all();
         }
         self.files.clear();
+        self.read_handles.clear();
         // 释放目录锁，允许之后重新打开
         self._lock = None;
         Ok(())
@@ -552,6 +623,34 @@ fn acquire_lock(dir: &Path) -> Result<File> {
     }
 }
 
+/// 位置无关读取：Windows seek_read / 其它平台 read_at。
+/// 同一文件句柄可被多个读线程并发使用（不移动共享文件位置）。
+fn positional_read(file: &File, buf: &mut [u8], offset: u64) -> Result<usize> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        match file.seek_read(buf, offset) {
+            Ok(n) => Ok(n),
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+            Err(err) => Err(err.into()),
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        match file.read_at(buf, offset) {
+            Ok(n) => Ok(n),
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+            Err(err) => Err(err.into()),
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (file, buf, offset);
+        Err(DbError::internal("该平台不支持并发定位读"))
+    }
+}
+
 fn parse_table_file_name(name: &str) -> Option<u32> {
     if !name.starts_with('t') || !name.ends_with(".tbl") {
         return None;
@@ -579,7 +678,7 @@ mod tests {
         let dir = temp_dir("a");
         {
             let mut store = Store::open(&dir).unwrap();
-            store.begin().unwrap();
+            store.begin(0).unwrap();
             let page_no = store.alloc_page(1).unwrap();
             assert_eq!(page_no, 0);
             let mut page = store.read_page(1, 0).unwrap();
@@ -600,14 +699,14 @@ mod tests {
         let dir = temp_dir("b");
         {
             let mut store = Store::open(&dir).unwrap();
-            store.begin().unwrap();
+            store.begin(0).unwrap();
             store.alloc_page(1).unwrap();
             assert_eq!(store.page_count(1), 1);
             store.rollback();
             assert_eq!(store.page_count(1), 0);
 
             // 回滚后重新分配应得到同一个页号
-            store.begin().unwrap();
+            store.begin(0).unwrap();
             let page_no = store.alloc_page(1).unwrap();
             assert_eq!(page_no, 0);
             store.commit().unwrap();
@@ -621,7 +720,7 @@ mod tests {
         let dir = temp_dir("c");
         {
             let mut store = Store::open(&dir).unwrap();
-            store.begin().unwrap();
+            store.begin(0).unwrap();
             store.alloc_page(7).unwrap();
             let mut page = store.read_page(7, 0).unwrap();
             page[10] = 9;
@@ -629,7 +728,7 @@ mod tests {
             store.commit().unwrap();
 
             // 还没 checkpoint，但新事务必须能读到
-            store.begin().unwrap();
+            store.begin(0).unwrap();
             let page = store.read_page(7, 0).unwrap();
             assert_eq!(page[10], 9);
             store.rollback();
@@ -643,7 +742,7 @@ mod tests {
         let dir = temp_dir("d");
         {
             let mut store = Store::open(&dir).unwrap();
-            store.begin().unwrap();
+            store.begin(0).unwrap();
             store.alloc_page(3).unwrap();
             let mut page = store.read_page(3, 0).unwrap();
             page[500] = 77;

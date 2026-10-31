@@ -198,6 +198,41 @@ pub fn scan_committed(store: &mut Store, table: &Table) -> Result<Vec<(u32, Vec<
     Ok(rows)
 }
 
+/// 共享视图扫描（&store，读锁下并发安全）
+pub fn scan_shared(store: &Store, table: &Table, owner: Option<u64>) -> Result<Vec<(u32, Vec<Value>)>> {
+    let pages = store.page_count_shared(table.id);
+    let mut rows = Vec::new();
+    for page_no in 0..pages {
+        let page = store.read_shared(table.id, page_no, owner)?;
+        let count = pg::slot_count(&page);
+        for slot in 0..count {
+            if let Some(record) = pg::read_record(&page, slot) {
+                let values = codec::decode_row(&table.columns, &record)?;
+                rows.push((make_row_id(page_no, slot), values));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// 共享视图按 row_id 取行
+pub fn get_shared(
+    store: &Store,
+    table: &Table,
+    row_id: u32,
+    owner: Option<u64>,
+) -> Result<Option<Vec<Value>>> {
+    let (page_no, slot) = split_row_id(row_id);
+    if page_no >= store.page_count_shared(table.id) {
+        return Ok(None);
+    }
+    let page = store.read_shared(table.id, page_no, owner)?;
+    match pg::read_record(&page, slot) {
+        Some(record) => Ok(Some(codec::decode_row(&table.columns, &record)?)),
+        None => Ok(None),
+    }
+}
+
 pub fn build_indexes(store: &mut Store, table: &mut Table) -> Result<()> {
     for index in table.indexes.iter_mut() {
         index.map.clear();
@@ -538,7 +573,7 @@ mod tests {
         let mut store = Store::open(&dir).unwrap();
         let mut table = sample_table(&mut store);
 
-        store.begin().unwrap();
+        store.begin(0).unwrap();
         let id = insert(
             &mut store,
             &mut table,
@@ -554,7 +589,7 @@ mod tests {
         let row = get(&mut store, &table, id).unwrap().unwrap();
         assert_eq!(row[1], Value::Text("alice".to_string()));
 
-        store.begin().unwrap();
+        store.begin(0).unwrap();
         assert!(delete(&mut store, &mut table, id).unwrap());
         store.commit().unwrap();
         assert!(get(&mut store, &table, id).unwrap().is_none());
@@ -568,7 +603,7 @@ mod tests {
         let dir = temp_dir("b");
         let mut store = Store::open(&dir).unwrap();
         let mut table = sample_table(&mut store);
-        store.begin().unwrap();
+        store.begin(0).unwrap();
         insert(
             &mut store,
             &mut table,
@@ -592,7 +627,7 @@ mod tests {
         let dir = temp_dir("c");
         let mut store = Store::open(&dir).unwrap();
         let mut table = sample_table(&mut store);
-        store.begin().unwrap();
+        store.begin(0).unwrap();
         insert(
             &mut store,
             &mut table,
@@ -616,7 +651,7 @@ mod tests {
         let dir = temp_dir("d");
         let mut store = Store::open(&dir).unwrap();
         let mut table = sample_table(&mut store);
-        store.begin().unwrap();
+        store.begin(0).unwrap();
         let err = insert(
             &mut store,
             &mut table,
@@ -635,7 +670,7 @@ mod tests {
         let mut store = Store::open(&dir).unwrap();
         let mut table = sample_table(&mut store);
 
-        store.begin().unwrap();
+        store.begin(0).unwrap();
         for i in 0..50 {
             insert(
                 &mut store,
@@ -665,7 +700,7 @@ mod tests {
         {
             let mut store = Store::open(&dir).unwrap();
             let mut table = sample_table(&mut store);
-            store.begin().unwrap();
+            store.begin(0).unwrap();
             store.mark_catalog_dirty().unwrap();
             for i in 0..20 {
                 insert(
@@ -690,7 +725,7 @@ mod tests {
         let ids = find_by_equality(&table, "id", &Value::Int(5)).unwrap();
         assert_eq!(ids.len(), 1);
 
-        store.begin().unwrap();
+        store.begin(0).unwrap();
         let err = insert(
             &mut store,
             &mut table,

@@ -251,7 +251,7 @@ fn wal_recovery_after_crash() {
 fn cross_session_reads_see_only_committed() {
     use littledb::sql::executor::ConnSession;
     use littledb::sql::QueryResult;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, RwLock};
 
     let dir = temp_dir("isolation");
     {
@@ -269,7 +269,7 @@ fn cross_session_reads_see_only_committed() {
         engine.close().unwrap();
     }
 
-    let engine = Arc::new(Mutex::new(Engine::open(&dir).unwrap()));
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
     let mut writer = ConnSession::new(Arc::clone(&engine));
     let mut reader = littledb::sql::executor::ConnSession::new(Arc::clone(&engine));
 
@@ -310,7 +310,7 @@ fn cross_session_reads_see_only_committed() {
     drop(writer);
     drop(reader);
     let engine = Arc::into_inner(engine).unwrap();
-    let mut engine = Mutex::into_inner(engine).unwrap();
+    let mut engine = RwLock::into_inner(engine).unwrap();
     engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -457,5 +457,80 @@ fn joins_and_unions() {
     assert_eq!(got, vec![vec![Value::Text("carol".into())]]);
 
     session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RwLock 并发读：写事务开放期间，其它会话的读不被阻塞、只见已提交数据
+#[test]
+fn concurrent_readers_during_open_txn() {
+    use littledb::sql::executor::ConnSession;
+    use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
+
+    let dir = temp_dir("concurrent");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+    engine
+        .write(|e| -> Result<()> {
+            e.insert("players", vec![Value::Int(1), Value::Text("base".into()), Value::Int(0)])?;
+            Ok(())
+        })
+        .unwrap();
+    engine.close().unwrap();
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+    let mut writer = ConnSession::new(Arc::clone(&engine));
+
+    writer.execute("BEGIN", &[]).unwrap();
+    writer
+        .execute("INSERT INTO players VALUES (2, 'uncommitted', 0)", &[])
+        .unwrap();
+
+    // 4 个读会话并发 SELECT：必须立即返回且只见已提交的 1 行
+    let reads_total = 400;
+    let success = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let engine = Arc::clone(&engine);
+        let success = Arc::clone(&success);
+        handles.push(std::thread::spawn(move || {
+            let mut reader = ConnSession::new(engine);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut done = 0usize;
+            while done < reads_total / 4 && Instant::now() < deadline {
+                match reader.execute("SELECT COUNT(*) FROM players", &[]) {
+                    Ok(littledb::sql::QueryResult::Select { rows, .. }) => {
+                        assert_eq!(rows, vec![vec![Value::Int(1)]], "未提交数据不可见");
+                        done += 1;
+                    }
+                    _ => panic!("并发读失败"),
+                }
+            }
+            success.fetch_add(done, std::sync::atomic::Ordering::SeqCst);
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        success.load(std::sync::atomic::Ordering::SeqCst),
+        reads_total,
+        "读会话应在写事务开放期间完成全部读"
+    );
+
+    // 提交后可见
+    writer.execute("COMMIT", &[]).unwrap();
+    let mut reader = ConnSession::new(Arc::clone(&engine));
+    match reader.execute("SELECT COUNT(*) FROM players", &[]).unwrap() {
+        littledb::sql::QueryResult::Select { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Int(2)]])
+        }
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    drop(writer);
+    drop(reader);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
+    engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

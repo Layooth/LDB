@@ -18,6 +18,12 @@ pub struct Engine {
     pub tables: Vec<Table>,
 }
 
+/// 引擎内部隐式事务（engine.write）的属主 id；
+/// 显式会话 id 由全局计数器分配，不会与它冲突
+pub const INTERNAL_TXN_OWNER: u64 = 0;
+/// CLI 独占引擎（Session）的属主 id
+pub const EXCLUSIVE_TXN_OWNER: u64 = u64::MAX;
+
 impl Engine {
     pub fn open(dir: &Path) -> Result<Engine> {
         let mut store = Store::open(dir)?;
@@ -51,7 +57,7 @@ impl Engine {
     where
         F: FnOnce(&mut Engine) -> Result<T>,
     {
-        self.store.begin()?;
+        self.store.begin(INTERNAL_TXN_OWNER)?;
         // 用 reborrow：FnOnce 会 move 掉 &mut，之后的 commit 还要用 self
         let outcome = action(&mut *self);
         match outcome {
@@ -316,6 +322,20 @@ impl Engine {
         table::scan_committed(&mut self.store, table)
     }
 
+    /// 共享视图扫描（读锁 / &self）：owner 匹配事务属主时可见其未提交页
+    pub fn scan_shared(&self, table_name: &str, owner: Option<u64>) -> Result<Vec<(u32, Vec<Value>)>> {
+        let position = self.table_index(table_name)?;
+        let table = &self.tables[position];
+        table::scan_shared(&self.store, table, owner)
+    }
+
+    /// 共享视图按 row_id 取行
+    pub fn get_shared(&self, table_name: &str, row_id: u32, owner: Option<u64>) -> Result<Option<Vec<Value>>> {
+        let position = self.table_index(table_name)?;
+        let table = &self.tables[position];
+        table::get_shared(&self.store, table, row_id, owner)
+    }
+
     pub fn find_by_equality(
         &self,
         table_name: &str,
@@ -328,8 +348,8 @@ impl Engine {
 
     // ------------------------------------------------------------ 事务
 
-    pub fn begin(&mut self) -> Result<()> {
-        self.store.begin()
+    pub fn begin(&mut self, owner: u64) -> Result<()> {
+        self.store.begin(owner)
     }
 
     pub fn commit(&mut self) -> Result<()> {

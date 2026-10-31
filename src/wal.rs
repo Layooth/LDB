@@ -70,6 +70,9 @@ pub struct Wal {
     pub bytes: u64,
     /// 打开时是 JSON 旧格式（恢复前不能按二进制扫描）
     legacy: bool,
+    /// 提交时是否 fsync。false = synchronous NORMAL 语义：
+    /// 进程崩溃仍安全（数据在 OS 页缓存），掉电可能丢最近提交
+    durable_commits: bool,
 }
 
 impl Wal {
@@ -84,6 +87,7 @@ impl Wal {
             file,
             bytes: len,
             legacy: false,
+            durable_commits: true,
         };
 
         if len == 0 {
@@ -100,6 +104,11 @@ impl Wal {
             wal.legacy = true;
             Ok(wal)
         }
+    }
+
+    /// 切换提交耐久性（full / normal）
+    pub fn set_durable_commits(&mut self, durable: bool) {
+        self.durable_commits = durable;
     }
 
     fn write_header(&mut self) -> Result<()> {
@@ -124,7 +133,9 @@ impl Wal {
         }
         self.file.seek(SeekFrom::Start(self.bytes))?;
         self.file.write_all(&buf)?;
-        self.file.sync_all()?;
+        if self.durable_commits {
+            self.file.sync_all()?;
+        }
         self.bytes += buf.len() as u64;
         Ok(())
     }

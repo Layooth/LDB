@@ -908,7 +908,7 @@ mod tests {
         let stmt = Parser::parse("SELECT 9007199254740993").unwrap();
         let result = match stmt {
             crate::sql::Statement::Select(select) => {
-                crate::sql::executor::exec_select(&mut test_engine(), &select, &[], false).unwrap()
+                crate::sql::executor::exec_select(&test_engine(), &select, &[], false, None).unwrap()
             }
             other => panic!("期望 SELECT，得到 {:?}", other),
         };

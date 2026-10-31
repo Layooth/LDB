@@ -1200,6 +1200,12 @@ fn select_base(
         }
         let mut sort_keys = Vec::with_capacity(stmt.order_by.len());
         for order in &stmt.order_by {
+            // `ORDER BY 别名`：别名不是源表列，直接取已算好的投影值。
+            // 不加这一步的话 `SELECT TO_DATE(at) AS d ... ORDER BY d` 会报「列 d 不存在」。
+            if let Some(slot) = order_alias_slot(&order.expr, &out_columns) {
+                sort_keys.push(values[slot].clone());
+                continue;
+            }
             sort_keys.push(eval_in_group(&order.expr, group, params)?);
         }
         output.push((values, sort_keys));
@@ -1217,6 +1223,20 @@ fn select_base(
         .collect();
 
     Ok((out_columns, out_types, output))
+}
+
+/// `ORDER BY` 里引用投影别名时，返回该别名在输出列中的下标。
+///
+/// 只处理裸列名（`ORDER BY d`）；`ORDER BY 表达式` 仍然走正常求值。
+/// 别名优先于源表列，与标准 SQL / MySQL 的既定行为一致
+/// （所以 `SELECT name AS id FROM t ORDER BY id` 按 `name` 排序）。
+fn order_alias_slot(expr: &Expr, out_columns: &[String]) -> Option<usize> {
+    let Expr::Column { table: None, name } = expr else {
+        return None;
+    };
+    out_columns
+        .iter()
+        .position(|column| column.eq_ignore_ascii_case(name))
 }
 
 /// 推定一个表达式的结果类型名。

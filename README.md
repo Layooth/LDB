@@ -211,7 +211,9 @@ JSON 列在存储层就是 TEXT，`JSON_*` 在求值期解析：路径语法 `$`
 的 `month`/`year` 按日历推进并对月末做裁剪（`2026-01-31 + 1 month = 2026-02-28`，
 闰年 `2024-01-31 + 1 month = 2024-02-29`），结果形态跟随输入（只有日期就只返回日期）。
 
-注意：`ORDER BY` **不能用投影别名**，要排序请重复写表达式（例如 `ORDER BY TO_DATE(at)`）。
+`ORDER BY` 可以直接用**投影别名**（`SELECT TO_DATE(at) AS d ... ORDER BY d`），
+别名优先于同名源表列（与标准 SQL / MySQL 一致）；限定名（`ORDER BY t.v`）与
+表达式的结果排序都不受影响。
 
 `EXISTS` 只在 **WHERE / JOIN ... ON** 里求值：执行时把子查询按当前行跑一遍（相关子查询靠
 `RowContext` 的 parent 链解析外层列），结果换成布尔字面量，所以它在 `SELECT` 列表、
@@ -332,6 +334,34 @@ await db.transaction(async () => {                                  // 抛错自
 `insert`/`upsert` 自动拼 `?` 参数、`transaction()` 失败自动回滚（可配 `{retries}` 重试写冲突）。
 
 测试：`LDB_BASE=http://127.0.0.1:7802 LDB_TOKEN=xxx node sdk/test.js`（`tools/verify.ps1` 已包含这一项）。
+
+### Python 客户端 SDK
+
+`sdk/littledb.py`：只用标准库（Python 3.8+），能力与 JS 版对齐。
+
+```python
+from littledb import connect
+
+db = connect("http://127.0.0.1:7802", token="...")
+
+db.sql("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, price DECIMAL(10,2))")
+
+ins = db.insert("t", [{"name": "a", "price": "1.50"}])   # ins.ids == [1], ins.last_id == 1
+rows = db.rows("SELECT id, name, price FROM t")          # [{'id': 1, 'name': 'a', 'price': '1.50'}]
+types = db.query("SELECT id, price FROM t").types        # ['INT', 'DECIMAL']
+
+db.upsert("t", [{"id": 1, "name": "a2"}], ["id"], ["name"])
+
+with db.transaction():                                   # 抛异常自动 ROLLBACK
+    db.sql("INSERT INTO t (name) VALUES ('b')")
+
+db.transaction(lambda c: c.sql("INSERT INTO t (name) VALUES ('c')"), retries=2)
+```
+
+`datetime`/`date`/`Decimal` 参数会自动转成服务端接受的文本（不经过浮点）；
+错误抛 `LittleDBError`（`.code` / `.status` / `.retry_after` / `.retryable`）。
+
+测试：`LDB_BASE=... LDB_TOKEN=... python sdk/test_littledb.py`（`tools/verify.ps1` 已包含）。
 
 ## 限制一览
 

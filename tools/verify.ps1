@@ -230,6 +230,21 @@ try {
         Write-Host "  [跳过] 未安装 node，跳过 SDK 测试"
     }
 
+    # Python SDK 端到端（没装 python 就跳过）
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        $env:LDB_BASE = $base
+        $env:LDB_TOKEN = $token
+        $env:PYTHONIOENCODING = "utf-8"
+        & $python.Source (Join-Path $src "sdk\test_littledb.py") | Out-Null
+        $pyExit = $LASTEXITCODE
+        Remove-Item Env:LDB_BASE, Env:LDB_TOKEN, Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+        if ($pyExit -ne 0) { Fail "Python SDK 测试失败：python sdk/test_littledb.py（单独跑一次看详情）" }
+        $checks++; Ok "Python SDK（12 项：insert/upsert/事务/错误码/分页）"
+    } else {
+        Write-Host "  [跳过] 未安装 python，跳过 Python SDK 测试"
+    }
+
     # 认证失败限速（放在最后：会把本机来源打入退避窗口）
     for ($i = 1; $i -le 6; $i++) {
         [void](Invoke-Api "GET" "$base/api/health" $null $null "definitely-wrong")

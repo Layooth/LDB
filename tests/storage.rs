@@ -2122,6 +2122,79 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// ORDER BY 可以用投影别名（含聚合列），且不影响按源表列排序
+#[test]
+fn order_by_projection_alias() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("orderalias");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, v INT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO t VALUES (1,'c',30),(2,'a',10),(3,'b',20)",
+            &[],
+        )
+        .unwrap();
+
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 普通别名
+    assert_eq!(
+        rows(&mut session, "SELECT id AS k FROM t ORDER BY k DESC"),
+        vec![vec![Value::Int(3)], vec![Value::Int(2)], vec![Value::Int(1)]]
+    );
+    // 别名也可用于表达式结果的排序（列名与别名不同）
+    assert_eq!(
+        rows(&mut session, "SELECT name AS n, v FROM t ORDER BY n"),
+        vec![
+            vec![Value::Text("a".into()), Value::Int(10)],
+            vec![Value::Text("b".into()), Value::Int(20)],
+            vec![Value::Text("c".into()), Value::Int(30)],
+        ]
+    );
+    // 聚合列的别名
+    assert_eq!(
+        rows(
+            &mut session,
+            "SELECT SUM(v) AS total, COUNT(*) AS n FROM t GROUP BY id ORDER BY total DESC"
+        ),
+        vec![
+            vec![Value::Int(30), Value::Int(1)],
+            vec![Value::Int(20), Value::Int(1)],
+            vec![Value::Int(10), Value::Int(1)],
+        ]
+    );
+    // 源表列名排序不受影响
+    assert_eq!(
+        rows(&mut session, "SELECT id, v FROM t ORDER BY v"),
+        vec![
+            vec![Value::Int(2), Value::Int(10)],
+            vec![Value::Int(3), Value::Int(20)],
+            vec![Value::Int(1), Value::Int(30)],
+        ]
+    );
+    // 限定名排序（t.v）也不受影响
+    assert_eq!(
+        rows(&mut session, "SELECT id, v FROM t ORDER BY t.v DESC"),
+        vec![
+            vec![Value::Int(1), Value::Int(30)],
+            vec![Value::Int(3), Value::Int(20)],
+            vec![Value::Int(2), Value::Int(10)],
+        ]
+    );
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// JSON 函数：JSON_VALID / JSON_TYPE / JSON_EXTRACT / JSON_ARRAY_LENGTH
 #[test]
 fn json_functions() {
@@ -2345,8 +2418,8 @@ fn date_time_functions() {
         .unwrap();
     match session
         .execute(
-            // 注意：本引擎的 ORDER BY 不能用投影别名，这里重复写表达式
-            "SELECT TO_DATE(at) AS d, SUM(v) AS total FROM ev GROUP BY TO_DATE(at) ORDER BY TO_DATE(at)",
+            // ORDER BY 引用投影别名（`ORDER BY d`），不必重复写表达式
+            "SELECT TO_DATE(at) AS d, SUM(v) AS total FROM ev GROUP BY TO_DATE(at) ORDER BY d",
             &[],
         )
         .unwrap()

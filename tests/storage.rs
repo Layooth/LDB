@@ -1650,6 +1650,66 @@ fn composite_index_prefix_lookup() {
         "回滚后不可见"
     );
 
+    // ---- 复合索引的**范围**扫描（前导列）
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a > 1"),
+        vec![4, 5],
+        "a > 1"
+    );
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a >= 1 AND a <= 1"),
+        vec![1, 2, 3],
+        "a 在 [1,1] 闭区间"
+    );
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a < 2"),
+        vec![1, 2, 3],
+        "a < 2"
+    );
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a BETWEEN 2 AND 2"),
+        vec![4, 5],
+        "BETWEEN 闭区间"
+    );
+    // 对照全表扫描（a + 0 用不上索引）
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a + 0 >= 2"),
+        vec![4, 5],
+        "与全表扫描结果一致"
+    );
+
+    // 文本前导列的范围（复合索引 ix_ca(c, id)）
+    session.execute("CREATE INDEX ix_ca ON m(c, id)", &[]).unwrap();
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE c > 'w'"),
+        vec![1, 2, 3],
+        "文本范围：'x'/'y'/'z' > 'w'"
+    );
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE c >= 'y'"),
+        vec![2, 3],
+        "文本范围：>= 'y'"
+    );
+    // `OR 1 = 0` 让条件不能被拆成 AND 里的裸列比较 → 强制全表扫描，用来对照
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE c >= 'y' OR 1 = 0"),
+        vec![2, 3],
+        "与全表扫描结果一致（文本）"
+    );
+
+    // EXPLAIN 要如实报告走了范围索引
+    match session.execute("EXPLAIN SELECT id FROM m WHERE a > 1", &[]).unwrap() {
+        QueryResult::Explain { rows, .. } => {
+            let way = rows
+                .iter()
+                .find(|row| row[0].as_text() == "访问方式")
+                .map(|row| row[1].as_text())
+                .unwrap_or_default();
+            assert!(way.contains("范围索引"), "{}", way);
+        }
+        other => panic!("期望 EXPLAIN，得到 {:?}", other),
+    }
+
     session.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

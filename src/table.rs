@@ -166,6 +166,14 @@ impl Table {
             .iter()
             .find(|ix| ix.columns.len() == 1 && ix.columns[0] == ci)
     }
+
+    /// 找到以该列为**第一列**的索引（范围扫描用；复合索引也可）
+    pub fn leading_index(&self, column_name: &str) -> Option<&Index> {
+        let ci = self.column_index(column_name)?;
+        self.indexes
+            .iter()
+            .find(|ix| ix.columns.first() == Some(&ci))
+    }
 }
 
 /// 扫描整表，返回 (row_id, values)
@@ -619,34 +627,44 @@ pub struct RangeBounds {
     pub upper: Option<(String, bool)>,
 }
 
-/// 按范围查索引；只有目标列存在单列索引时才可用
+/// 按范围查索引：目标列必须是某个索引的**第一列**（单列索引或复合索引的前导列）
 pub fn find_by_range(table: &Table, column_name: &str, bounds: &RangeBounds) -> Option<Vec<u32>> {
-    let index = table.single_column_index(column_name)?;
-    // BTreeMap 的范围迭代天然按键升序输出
-    let lower_bound = bounds
-        .lower
-        .as_ref()
-        .map(|(k, inc)| {
-            if *inc {
-                std::ops::Bound::Included(k.clone())
+    let ci = table.column_index(column_name)?;
+    let index = table
+        .indexes
+        .iter()
+        .find(|ix| ix.columns.first() == Some(&ci))?;
+    let composite = index.columns.len() > 1;
+
+    // 复合索引的键是「各列编码 + \u{1}」，范围只作用在第一列上：
+    //   >= v → Included("kv\u{1}")   同前缀的键都排在这之后
+    //   >  v → Included("kv\u{2}")   跳过整个前缀
+    //   <= v → Excluded("kv\u{2}")
+    //   <  v → Excluded("kv\u{1}")
+    // 分隔符 0x01 小于任何可打印字符，所以「前缀有序 == 值有序」。
+    let to_bound = |bound: &Option<(String, bool)>, is_lower: bool| -> std::ops::Bound<String> {
+        let Some((key, inclusive)) = bound else {
+            return std::ops::Bound::Unbounded;
+        };
+        if !composite {
+            return if *inclusive {
+                std::ops::Bound::Included(key.clone())
             } else {
-                std::ops::Bound::Excluded(k.clone())
-            }
-        })
-        .unwrap_or(std::ops::Bound::Unbounded);
-    let upper_bound = bounds
-        .upper
-        .as_ref()
-        .map(|(k, inc)| {
-            if *inc {
-                std::ops::Bound::Included(k.clone())
-            } else {
-                std::ops::Bound::Excluded(k.clone())
-            }
-        })
-        .unwrap_or(std::ops::Bound::Unbounded);
+                std::ops::Bound::Excluded(key.clone())
+            };
+        }
+        let skip_whole_prefix = *inclusive != is_lower;
+        let sentinel = if skip_whole_prefix { '\u{2}' } else { '\u{1}' };
+        let text = format!("{}{}", key, sentinel);
+        if is_lower {
+            std::ops::Bound::Included(text)
+        } else {
+            std::ops::Bound::Excluded(text)
+        }
+    };
+
     let mut ids = Vec::new();
-    for (_, list) in index.map.range((lower_bound, upper_bound)) {
+    for (_, list) in index.map.range((to_bound(&bounds.lower, true), to_bound(&bounds.upper, false))) {
         ids.extend_from_slice(list);
     }
     Some(ids)

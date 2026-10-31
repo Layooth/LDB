@@ -1642,11 +1642,11 @@ fn range_candidates(
     };
     let candidates = extract_range_columns(expr, params)?;
 
-    // 逐列尝试：找到第一个有索引且能取到范围的列
+    // 逐列尝试：找到第一个「索引前导列」且能取到范围的列
+    // （复合索引只对第一列的范围有效，后续列要靠 WHERE 复检）
     for (column_name, range) in &candidates {
         let table = engine.table(table_name)?;
-        let has_index = table.single_column_index(column_name).is_some();
-        if !has_index {
+        if table.leading_index(column_name).is_none() {
             continue;
         }
         // 边界值必须 coerce 到列的类型/标度，否则索引键格式不匹配

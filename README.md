@@ -40,6 +40,12 @@ littledb-rust\
 │   ├── web\                       控制台前端（单文件 index.html）
 │   └── data\                      数据目录（catalog.json + t<N>.tbl + *.wal）
 │
+├── bench\                         ← 性能测试台（双击 启动性能测试.bat；不在 git 里）
+│   ├── app.py / index.html        一键启动器与可视化界面
+│   └── （测试数据默认写到与它平级的 bench-data\）
+│
+├── bench-data\                    ← 基准测试的运行数据（可整目录删除）
+│
 └── littledb-rust-src\             ← 源码仓库（git）
     ├── src\                       服务端源码（main/server/http/engine/table/store/wal/sql/...）
     ├── web\index.html             控制台前端源码（部署时拷到 dist\web\）
@@ -539,7 +545,7 @@ $payload = json_decode(curl_exec($ch), true);   // $payload['result']
 
 ### 可视化测试台（推荐，双击即可）
 
-双击 `bench\启动性能测试.bat`（或 `python bench\app.py`）——**不需要手动启动数据库**：
+双击 `littledb-rust\bench\启动性能测试.bat`（或 `python bench\app.py`）——**不需要手动启动数据库**：
 
 - 测试台会自己拉起一个隔离的数据库实例（随机空闲端口，数据在 `bench\data\`，
   与真实数据完全隔离），测完自动停掉，不留残留进程；

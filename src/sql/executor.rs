@@ -1288,10 +1288,13 @@ fn infer_expr_type(expr: &Expr, plans: &[TablePlan]) -> String {
         Expr::Function { name, args, .. } => {
             let upper = name.to_uppercase();
             match upper.as_str() {
-                "COUNT" | "LENGTH" => "INT".to_string(),
+                "COUNT" | "LENGTH" | "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND"
+                | "DATEDIFF" => "INT".to_string(),
                 "AVG" => "REAL".to_string(),
                 "UPPER" | "LOWER" | "NOW" | "CURRENT_TIMESTAMP" | "CURDATE" | "CURRENT_DATE"
-                | "TODAY" => "TEXT".to_string(),
+                | "TODAY" | "DATE_ADD" | "DATE_SUB" | "DATE_FORMAT" | "TO_DATE" | "DATE_ONLY" => {
+                    "TEXT".to_string()
+                }
                 "COALESCE" => args
                     .first()
                     .map(|arg| infer_expr_type(arg, plans))

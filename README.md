@@ -194,11 +194,18 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | 事务 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` |
 | 元命令 | `SHOW TABLES`、`DESCRIBE t`、`EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` |
 | 表达式 | 算术、比较、`AND/OR/NOT`、`IS [NOT] NULL`、`IN (...)`、`BETWEEN`、`LIKE`、`CAST(x AS 类型)`、`?` 参数 |
-| 函数 | `COALESCE LENGTH UPPER LOWER ABS ROUND NOW CURDATE`；聚合 `COUNT SUM AVG MIN MAX`（含 DISTINCT / `COUNT(*)`） |
+| 函数 | `COALESCE LENGTH UPPER LOWER ABS ROUND`、`NOW CURDATE`；聚合 `COUNT SUM AVG MIN MAX`（含 DISTINCT / `COUNT(*)`） |
+| 日期时间 | `DATE_ADD(d, n, unit)` / `DATE_SUB(d, n, unit)`（unit: `day/week/hour/minute/second/month/year`）、`DATEDIFF(a, b)`、`YEAR MONTH DAY HOUR MINUTE SECOND`、`TO_DATE(d)`、`DATE_FORMAT(d, '%Y-%m-%d %H:%M:%S')` |
 
 **不支持**：`RIGHT/FULL JOIN`、标量子查询、`ANY/ALL`、窗口函数、
 `INSERT ... SELECT`、`TRUNCATE`、视图/触发器/序列。`ALTER TABLE` 的列变更通过
 「影子表重建」实现：**表 id 会变、行号会重排、数据完整保留**，索引按列名迁移。
+
+日期时间统一按 **UTC** 的 `YYYY-MM-DD[ HH:MM:SS]` 解析（`NOW()` 返回 UTC）；`DATE_ADD`/`DATE_SUB`
+的 `month`/`year` 按日历推进并对月末做裁剪（`2026-01-31 + 1 month = 2026-02-28`，
+闰年 `2024-01-31 + 1 month = 2024-02-29`），结果形态跟随输入（只有日期就只返回日期）。
+
+注意：`ORDER BY` **不能用投影别名**，要排序请重复写表达式（例如 `ORDER BY TO_DATE(at)`）。
 
 `EXISTS` 只在 **WHERE / JOIN ... ON** 里求值：执行时把子查询按当前行跑一遍（相关子查询靠
 `RowContext` 的 parent 链解析外层列），结果换成布尔字面量，所以它在 `SELECT` 列表、

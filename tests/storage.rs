@@ -2122,6 +2122,139 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 日期时间函数：加减、差值、取字段、格式化
+#[test]
+fn date_time_functions() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("datefn");
+    let mut session = Session::open(&dir).unwrap();
+
+    let one = |session: &mut Session, sql: &str| -> Value {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1, "{} 应返回 1 行", sql);
+                rows[0][0].clone()
+            }
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 加减：输出形态跟随输入（只有日期 → 只给日期）
+    assert_eq!(
+        one(&mut session, "SELECT DATE_ADD('2026-01-01', 7, 'day')"),
+        Value::Text("2026-01-08".into())
+    );
+    assert_eq!(
+        one(&mut session, "SELECT DATE_ADD('2026-01-01 10:00:00', 90, 'minute')"),
+        Value::Text("2026-01-01 11:30:00".into())
+    );
+    assert_eq!(
+        one(&mut session, "SELECT DATE_SUB('2026-01-01', 1, 'day')"),
+        Value::Text("2025-12-31".into())
+    );
+    // 月末裁剪（1-31 加一个月 = 2-28；闰年是 2-29）
+    assert_eq!(
+        one(&mut session, "SELECT DATE_ADD('2026-01-31', 1, 'month')"),
+        Value::Text("2026-02-28".into())
+    );
+    assert_eq!(
+        one(&mut session, "SELECT DATE_ADD('2024-01-31', 1, 'month')"),
+        Value::Text("2024-02-29".into())
+    );
+    assert_eq!(
+        one(&mut session, "SELECT DATE_ADD('2024-02-29', 1, 'year')"),
+        Value::Text("2025-02-28".into())
+    );
+
+    // 差值 / 字段提取
+    assert_eq!(
+        one(&mut session, "SELECT DATEDIFF('2026-03-01', '2026-02-01')"),
+        Value::Int(28)
+    );
+    assert_eq!(
+        one(&mut session, "SELECT DATEDIFF('2026-01-01', '2026-03-01')"),
+        Value::Int(-59)
+    );
+    assert_eq!(
+        one(&mut session, "SELECT YEAR('2026-10-31 12:34:56')"),
+        Value::Int(2026)
+    );
+    assert_eq!(
+        one(&mut session, "SELECT MONTH('2026-10-31 12:34:56')"),
+        Value::Int(10)
+    );
+    assert_eq!(
+        one(&mut session, "SELECT DAY('2026-10-31 12:34:56')"),
+        Value::Int(31)
+    );
+    assert_eq!(
+        one(&mut session, "SELECT HOUR('2026-10-31 12:34:56')"),
+        Value::Int(12)
+    );
+    assert_eq!(
+        one(&mut session, "SELECT SECOND('2026-10-31 12:34:56')"),
+        Value::Int(56)
+    );
+
+    // 格式化 / 取日期部分
+    assert_eq!(
+        one(&mut session, "SELECT DATE_FORMAT('2026-10-31 08:05:09', '%Y/%m/%d %H:%M:%S')"),
+        Value::Text("2026/10/31 08:05:09".into())
+    );
+    assert_eq!(
+        one(&mut session, "SELECT TO_DATE('2026-10-31 08:05:09')"),
+        Value::Text("2026-10-31".into())
+    );
+
+    // 错误路径：非法单位 / 非法日期 / 不支持的格式符
+    let err = session
+        .execute("SELECT DATE_ADD('2026-01-01', 1, 'fortnight')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    let err = session
+        .execute("SELECT DATE_ADD('2026-02-30', 1, 'day')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "TYPE_ERROR", "{}", err.message);
+    let err = session
+        .execute("SELECT DATE_FORMAT('2026-01-01', '%Q')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+
+    // 用在真实查询里：按天聚合
+    session
+        .execute("CREATE TABLE ev (id INT PRIMARY KEY, at TEXT, v INT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO ev VALUES \
+             (1,'2026-10-01 09:00:00',1),(2,'2026-10-01 18:00:00',2),\
+             (3,'2026-10-02 10:00:00',4)",
+            &[],
+        )
+        .unwrap();
+    match session
+        .execute(
+            // 注意：本引擎的 ORDER BY 不能用投影别名，这里重复写表达式
+            "SELECT TO_DATE(at) AS d, SUM(v) AS total FROM ev GROUP BY TO_DATE(at) ORDER BY TO_DATE(at)",
+            &[],
+        )
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("2026-10-01".into()), Value::Int(3)],
+                vec![Value::Text("2026-10-02".into()), Value::Int(4)],
+            ]
+        ),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// EXISTS / NOT EXISTS，含相关子查询（引用外层列）
 #[test]
 fn exists_and_correlated_subquery() {

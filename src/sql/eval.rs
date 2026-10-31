@@ -741,8 +741,135 @@ fn eval_scalar(
             Ok(Value::Text(now_datetime()))
         }
         "CURDATE" | "CURRENT_DATE" | "TODAY" => Ok(Value::Text(now_date())),
+        // ------------------------------------------------------------ 日期时间
+        // 输入统一按 UTC 的 "YYYY-MM-DD[ HH:MM:SS]" 解析；
+        // 输出形态跟随输入：带时分秒的给 DATETIME，只写日期的给 DATE。
+        "DATE_ADD" | "DATE_SUB" => {
+            require_args(name, args, 3)?;
+            let value = eval(&args[0], ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let amount_value = eval(&args[1], ctx, params)?;
+            if amount_value.is_null() {
+                return Ok(Value::Null);
+            }
+            let amount = match &amount_value {
+                Value::Int(n) => *n,
+                Value::Real(n) => *n as i64,
+                other => {
+                    return Err(DbError::type_error(format!(
+                        "{} 的第二个参数必须是整数，实际是 \"{}\"",
+                        name,
+                        other.as_text()
+                    )))
+                }
+            };
+            let unit_value = eval(&args[2], ctx, params)?;
+            if unit_value.is_null() {
+                return Ok(Value::Null);
+            }
+            let text = value.as_text();
+            let with_time = text.contains(':');
+            let millis = codec::parse_datetime_millis(&text)?;
+            let delta = if name == "DATE_SUB" { -amount } else { amount };
+            let shifted = codec::add_datetime(millis, delta, &unit_value.as_text())?;
+            Ok(Value::Text(codec::format_millis(shifted, with_time)))
+        }
+        "DATEDIFF" => {
+            require_args(name, args, 2)?;
+            let left = eval(&args[0], ctx, params)?;
+            let right = eval(&args[1], ctx, params)?;
+            if left.is_null() || right.is_null() {
+                return Ok(Value::Null);
+            }
+            let a = codec::parse_datetime_millis(&left.as_text())?.div_euclid(86_400_000);
+            let b = codec::parse_datetime_millis(&right.as_text())?.div_euclid(86_400_000);
+            Ok(Value::Int(a - b))
+        }
+        "TO_DATE" | "DATE_ONLY" => {
+            require_args(name, args, 1)?;
+            let value = eval(&args[0], ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let millis = codec::parse_datetime_millis(&value.as_text())?;
+            Ok(Value::Text(codec::format_millis(millis, false)))
+        }
+        "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" => {
+            require_args(name, args, 1)?;
+            let value = eval(&args[0], ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let millis = codec::parse_datetime_millis(&value.as_text())?;
+            let days = millis.div_euclid(86_400_000);
+            let (year, month, day) = codec::civil_from_days(days);
+            let rest = millis.rem_euclid(86_400_000);
+            let hour = rest / 3_600_000;
+            let minute = (rest % 3_600_000) / 60_000;
+            let second = (rest % 60_000) / 1000;
+            let part = match name {
+                "YEAR" => year,
+                "MONTH" => month as i64,
+                "DAY" => day as i64,
+                "HOUR" => hour,
+                "MINUTE" => minute,
+                _ => second,
+            };
+            Ok(Value::Int(part))
+        }
+        "DATE_FORMAT" => {
+            require_args(name, args, 2)?;
+            let value = eval(&args[0], ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let format = eval(&args[1], ctx, params)?;
+            if format.is_null() {
+                return Ok(Value::Null);
+            }
+            let millis = codec::parse_datetime_millis(&value.as_text())?;
+            Ok(Value::Text(format_datetime_pattern(
+                millis,
+                &format.as_text(),
+            )?))
+        }
         other => Err(DbError::syntax(format!("不支持的函数 {}", other))),
     }
+}
+
+/// `DATE_FORMAT` 的格式串：支持 %Y %m %d %H %M %S %%，其它指示符直接报错
+fn format_datetime_pattern(millis: i64, pattern: &str) -> Result<String> {
+    let text = codec::format_datetime_from_millis(millis);
+    let (year, month, day) = (&text[0..4], &text[5..7], &text[8..10]);
+    let (hour, minute, second) = (&text[11..13], &text[14..16], &text[17..19]);
+
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(year),
+            Some('m') => out.push_str(month),
+            Some('d') => out.push_str(day),
+            Some('H') => out.push_str(hour),
+            Some('M') => out.push_str(minute),
+            Some('S') => out.push_str(second),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                return Err(DbError::syntax(format!(
+                    "DATE_FORMAT 不支持 %{}（可用 %Y %m %d %H %M %S %%）",
+                    other
+                )))
+            }
+            None => return Err(DbError::syntax("DATE_FORMAT 的格式串以 % 结尾")),
+        }
+    }
+    Ok(out)
 }
 
 fn require_args(name: &str, args: &[Expr], count: usize) -> Result<()> {

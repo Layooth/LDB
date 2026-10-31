@@ -716,6 +716,100 @@ pub fn format_date_from_days(days: i64) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
+/// 把 `YYYY-MM-DD[ HH:MM:SS]` 解析成 UTC 毫秒（会先按 DATETIME 规则校验）
+pub fn parse_datetime_millis(input: &str) -> Result<i64> {
+    // normalize_datetime 已经校验过各段范围，返回定宽格式，切片安全
+    let text = normalize_datetime(input)?;
+    let num = |from: usize, to: usize| -> Result<i64> {
+        text.get(from..to)
+            .and_then(|part| part.parse::<i64>().ok())
+            .ok_or_else(|| DbError::type_error(format!("无法解析时间：{}", input)))
+    };
+    let year = num(0, 4)?;
+    let month = num(5, 7)? as u32;
+    let day = num(8, 10)? as u32;
+    let hour = num(11, 13)?;
+    let minute = num(14, 16)?;
+    let second = num(17, 19)?;
+    Ok(days_from_civil(year, month, day) * 86_400_000
+        + hour * 3_600_000
+        + minute * 60_000
+        + second * 1000)
+}
+
+/// 毫秒 → 文本；`with_time=false` 时只给日期部分
+pub fn format_millis(millis: i64, with_time: bool) -> String {
+    let full = format_datetime_from_millis(millis);
+    if with_time {
+        full
+    } else {
+        full[..10].to_string()
+    }
+}
+
+/// 某年某月有多少天（含闰年）
+pub fn days_in_month(year: i64, month: u32) -> u32 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    (days_from_civil(next_year, next_month, 1) - days_from_civil(year, month, 1)) as u32
+}
+
+/// 按单位加减时间。
+///
+/// `month`/`year` 按日历推进，并对「目标月天数不足」做裁剪
+/// （1-31 加一个月 = 2-28/29，而不是溢出到 3 月）。
+pub fn add_datetime(millis: i64, amount: i64, unit: &str) -> Result<i64> {
+    const DAY: i128 = 86_400_000;
+    let unit = unit.trim().to_ascii_lowercase();
+    let amount = amount as i128;
+    let shifted: i128 = match unit.as_str() {
+        "day" | "days" | "d" => millis as i128 + amount * DAY,
+        "week" | "weeks" | "w" => millis as i128 + amount * 7 * DAY,
+        "hour" | "hours" | "h" => millis as i128 + amount * 3_600_000,
+        "minute" | "minutes" | "min" | "mi" => millis as i128 + amount * 60_000,
+        "second" | "seconds" | "sec" | "s" => millis as i128 + amount * 1000,
+        "month" | "months" | "mon" | "mo" => {
+            return add_months(millis, amount.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        }
+        "year" | "years" | "y" => {
+            let months = (amount * 12).clamp(i64::MIN as i128, i64::MAX as i128);
+            return add_months(millis, months as i64);
+        }
+        other => {
+            return Err(DbError::syntax(format!(
+                "不支持的日期单位 \"{}\"：可用 day/week/hour/minute/second/month/year",
+                other
+            )))
+        }
+    };
+    if shifted < i64::MIN as i128 || shifted > i64::MAX as i128 {
+        return Err(DbError::type_error("日期加减结果超出可表示范围"));
+    }
+    Ok(shifted as i64)
+}
+
+fn add_months(millis: i64, months: i64) -> Result<i64> {
+    const DAY: i64 = 86_400_000;
+    let days = millis.div_euclid(DAY);
+    let rest = millis.rem_euclid(DAY);
+    let (year, month, day) = civil_from_days(days);
+
+    let total = year as i128 * 12 + (month as i128 - 1) + months as i128;
+    let new_year = total.div_euclid(12);
+    let new_month = (total.rem_euclid(12) as u32) + 1;
+    if !(1..=9999).contains(&new_year) {
+        return Err(DbError::type_error(
+            "日期加减结果超出可表示范围（公元 1..9999）",
+        ));
+    }
+    let new_year = new_year as i64;
+    let clamped_day = day.min(days_in_month(new_year, new_month));
+    Ok(days_from_civil(new_year, new_month, clamped_day) * DAY + rest)
+}
+
 pub fn format_datetime_from_millis(millis: i64) -> String {
     let secs = millis.div_euclid(1000);
     let days = secs.div_euclid(86400);
@@ -800,6 +894,67 @@ pub fn index_key_of(values: &[Value]) -> Option<String> {
         }
     }
     Some(parts.join("\u{1}"))
+}
+
+#[cfg(test)]
+mod date_math_tests {
+    use super::*;
+
+    fn ms(text: &str) -> i64 {
+        parse_datetime_millis(text).unwrap()
+    }
+
+    fn add(text: &str, amount: i64, unit: &str) -> String {
+        format_datetime_from_millis(add_datetime(ms(text), amount, unit).unwrap())
+    }
+
+    #[test]
+    fn day_and_time_arithmetic() {
+        assert_eq!(add("2026-01-01", 1, "day"), "2026-01-02 00:00:00");
+        assert_eq!(add("2026-01-01", -1, "day"), "2025-12-31 00:00:00");
+        assert_eq!(add("2026-01-01 10:00:00", 7, "hour"), "2026-01-01 17:00:00");
+        assert_eq!(add("2026-01-01 23:59:30", 30, "second"), "2026-01-02 00:00:00");
+        assert_eq!(add("2026-01-01", 2, "week"), "2026-01-15 00:00:00");
+        assert_eq!(add("2026-01-01", 1, "d"), "2026-01-02 00:00:00");
+    }
+
+    #[test]
+    fn month_arithmetic_clamps_to_month_end() {
+        // 1-31 加一个月：2 月没有 31 号，应裁到月末而不是溢出到 3 月
+        assert_eq!(add("2026-01-31", 1, "month"), "2026-02-28 00:00:00");
+        assert_eq!(add("2024-01-31", 1, "month"), "2024-02-29 00:00:00", "闰年");
+        assert_eq!(add("2026-03-31", -1, "month"), "2026-02-28 00:00:00");
+        // 跨年
+        assert_eq!(add("2026-12-15", 1, "month"), "2027-01-15 00:00:00");
+        assert_eq!(add("2026-01-15", -1, "month"), "2025-12-15 00:00:00");
+        // 年份
+        assert_eq!(add("2024-02-29", 1, "year"), "2025-02-28 00:00:00", "闰日裁剪");
+        // 时分秒要保持
+        assert_eq!(add("2026-01-31 08:30:00", 1, "month"), "2026-02-28 08:30:00");
+    }
+
+    #[test]
+    fn month_arithmetic_rejects_out_of_range() {
+        assert!(add_datetime(ms("9999-12-31"), 1, "month").is_err());
+        assert!(add_datetime(ms("0001-01-01"), -1, "month").is_err());
+        assert!(add_datetime(ms("2026-01-01"), 1, "fortnight").is_err());
+    }
+
+    #[test]
+    fn days_in_month_is_correct() {
+        assert_eq!(days_in_month(2026, 1), 31);
+        assert_eq!(days_in_month(2026, 2), 28);
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2026, 12), 31);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_date() {
+        assert!(parse_datetime_millis("2026-02-30").is_err());
+        assert!(parse_datetime_millis("not-a-date").is_err());
+        // 只有日期时按 00:00:00 处理
+        assert_eq!(ms("2026-01-01"), ms("2026-01-01 00:00:00"));
+    }
 }
 
 #[cfg(test)]

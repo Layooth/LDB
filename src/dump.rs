@@ -117,6 +117,10 @@ fn create_table_sql(table: &Table) -> String {
         if !composite_pk && column.primary_key {
             def.push_str(" PRIMARY KEY");
         }
+        if column.auto_increment {
+            // 自增属性必须导出，否则导入后该列退化成普通 INT
+            def.push_str(" AUTO_INCREMENT");
+        }
         if column.not_null && !column.primary_key {
             def.push_str(" NOT NULL");
         }

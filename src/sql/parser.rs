@@ -684,6 +684,7 @@ impl Parser {
         let mut not_null = false;
         let mut unique = false;
         let mut default = None;
+        let mut auto_increment = false;
 
         loop {
             if self.at_keyword("PRIMARY") {
@@ -700,6 +701,9 @@ impl Parser {
             } else if self.at_keyword("DEFAULT") {
                 self.advance();
                 default = Some(self.parse_unary()?);
+            } else if self.at_keyword("AUTO_INCREMENT") || self.at_keyword("AUTOINCREMENT") {
+                self.advance();
+                auto_increment = true;
             } else if self.at_keyword("NULL") {
                 self.advance();
             } else {
@@ -714,6 +718,7 @@ impl Parser {
             not_null,
             unique,
             default,
+            auto_increment,
         })
     }
 

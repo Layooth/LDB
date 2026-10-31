@@ -1276,6 +1276,142 @@ fn schema_wire_includes_decimal_scale() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 自增主键：INSERT 分配值并回报 ids；显式值把游标顶上去；重启后游标不丢
+#[test]
+fn auto_increment_assigns_and_reports_ids() {
+    use littledb::json::Json;
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("autoid");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute(
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT)",
+            &[],
+        )
+        .unwrap();
+
+    // 省略自增列 → 自动分配 1、2
+    let result = session
+        .execute("INSERT INTO t (name) VALUES ('a'),('b')", &[])
+        .unwrap();
+    match &result {
+        QueryResult::Insert { inserted, ids } => {
+            assert_eq!(*inserted, 2);
+            assert_eq!(ids, &vec![1, 2], "应回报分配到的 id");
+        }
+        other => panic!("期望 INSERT，得到 {:?}", other),
+    }
+    // 线路 JSON 带 ids / lastId，客户端不用再 SELECT 一次
+    match result.to_wire_json() {
+        Json::Obj(items) => {
+            let last = items
+                .iter()
+                .find(|(key, _)| key == "lastId")
+                .expect("insert 结果应带 lastId")
+                .1
+                .clone();
+            assert_eq!(last.as_i64(), Some(2));
+        }
+        other => panic!("期望对象，得到 {:?}", other),
+    }
+
+    // 显式给更大的 id → 游标顶到 101
+    session.execute("INSERT INTO t VALUES (100,'x')", &[]).unwrap();
+    match session
+        .execute("INSERT INTO t (name) VALUES ('y')", &[])
+        .unwrap()
+    {
+        QueryResult::Insert { ids, .. } => assert_eq!(ids, vec![101]),
+        other => panic!("期望 INSERT，得到 {:?}", other),
+    }
+    session.close().unwrap();
+
+    // 重启后游标仍在（next_auto_id 随 catalog 持久化）
+    let mut reopened = Session::open(&dir).unwrap();
+    match reopened
+        .execute("INSERT INTO t (name) VALUES ('z')", &[])
+        .unwrap()
+    {
+        QueryResult::Insert { ids, .. } => assert_eq!(ids, vec![102], "next_auto_id 必须持久化"),
+        other => panic!("期望 INSERT，得到 {:?}", other),
+    }
+
+    // 非法声明
+    let err = reopened
+        .execute("CREATE TABLE bad (id TEXT AUTO_INCREMENT)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    let err = reopened
+        .execute("CREATE TABLE bad2 (a INT AUTO_INCREMENT, b INT AUTO_INCREMENT)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+
+    reopened.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ALTER 加自增列（影子表重建逐行分配）+ dump/load 后游标不撞车
+#[test]
+fn auto_increment_survives_alter_and_dump() {
+    use littledb::sql::QueryResult;
+
+    let src = temp_dir("autoalter");
+    let dst = temp_dir("autodump");
+    {
+        let mut session = Session::open(&src).unwrap();
+        session.execute("CREATE TABLE a (name TEXT)", &[]).unwrap();
+        session
+            .execute("INSERT INTO a VALUES ('p'),('q')", &[])
+            .unwrap();
+        session
+            .execute("ALTER TABLE a ADD COLUMN seq INT AUTO_INCREMENT", &[])
+            .unwrap();
+        let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+            match session.execute(sql, &[]).unwrap() {
+                QueryResult::Select { rows, .. } => rows,
+                other => panic!("期望 SELECT，得到 {:?}", other),
+            }
+        };
+        assert_eq!(
+            rows(&mut session, "SELECT seq FROM a ORDER BY seq"),
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+            "重建时按行分配 1、2"
+        );
+        session
+            .execute("INSERT INTO a (name) VALUES ('r')", &[])
+            .unwrap();
+        assert_eq!(
+            rows(&mut session, "SELECT seq FROM a WHERE name = 'r'"),
+            vec![vec![Value::Int(3)]]
+        );
+        session.close().unwrap();
+    }
+
+    let script = {
+        let mut engine = Engine::open(&src).unwrap();
+        let script = littledb::dump::dump_script(&mut engine).unwrap();
+        engine.close().unwrap();
+        script
+    };
+    assert!(script.contains("AUTO_INCREMENT"), "自增属性要导出：\n{}", script);
+
+    let mut loaded = Session::open(&dst).unwrap();
+    littledb::dump::load_script(&mut loaded, &script, 50).unwrap();
+    match loaded
+        .execute("INSERT INTO a (name) VALUES ('s')", &[])
+        .unwrap()
+    {
+        QueryResult::Insert { ids, .. } => {
+            assert_eq!(ids, vec![4], "显式 id 应把游标顶到 4")
+        }
+        other => panic!("期望 INSERT，得到 {:?}", other),
+    }
+    loaded.close().unwrap();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
 /// dump → load 往返：结构（类型/标度/约束/索引）与数据都要一致
 #[test]
 fn dump_and_load_round_trip() {

@@ -43,6 +43,8 @@ pub struct TableDef {
     pub name: String,
     pub columns: Vec<Column>,
     pub indexes: Vec<IndexDef>,
+    /// 下一个自增列要分配的值（随 catalog 持久化）
+    pub next_auto_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +165,9 @@ impl Catalog {
                 if column.ty == crate::codec::ColumnType::Decimal {
                     fields.push(("scale".to_string(), Json::Num(column.scale as f64)));
                 }
+                if column.auto_increment {
+                    fields.push(("autoIncrement".to_string(), Json::Bool(true)));
+                }
                 if let Some(default) = &column.default {
                     fields.push(("default".to_string(), value_to_json(default)));
                 }
@@ -191,6 +196,7 @@ impl Catalog {
                 ("name".to_string(), Json::str(table.name.clone())),
                 ("columns".to_string(), Json::Arr(columns)),
                 ("indexes".to_string(), Json::Arr(indexes)),
+                ("nextAutoId".to_string(), Json::Num(table.next_auto_id as f64)),
                 (
                     "createdAt".to_string(),
                     Json::str(iso_now()),
@@ -275,6 +281,11 @@ fn parse_table(value: &Json) -> Result<TableDef> {
         name,
         columns,
         indexes,
+        next_auto_id: value
+            .get("nextAutoId")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1)
+            .max(1),
     })
 }
 
@@ -321,6 +332,10 @@ fn parse_column(value: &Json) -> Result<Column> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         default,
+        auto_increment: value
+            .get("autoIncrement")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -374,6 +389,7 @@ mod tests {
                         implicit: false,
                     },
                 ],
+                next_auto_id: 1,
             }],
         }
     }

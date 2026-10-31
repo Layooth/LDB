@@ -195,6 +195,8 @@ pub struct ColumnDef {
     pub not_null: bool,
     pub unique: bool,
     pub default: Option<Expr>,
+    /// `AUTO_INCREMENT` / `AUTOINCREMENT`：仅 INT 支持
+    pub auto_increment: bool,
 }
 
 #[derive(Debug, Clone)]

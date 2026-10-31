@@ -114,6 +114,8 @@ pub struct Column {
     pub unique: bool,
     pub primary_key: bool,
     pub default: Option<Value>,
+    /// 自增列（目前仅 INT）：插入时值为 NULL 就分配下一个整数
+    pub auto_increment: bool,
 }
 
 impl Column {
@@ -126,6 +128,7 @@ impl Column {
             unique: false,
             primary_key: false,
             default: None,
+            auto_increment: false,
         }
     }
 

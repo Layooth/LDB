@@ -87,6 +87,8 @@ pub enum QueryResult {
     },
     Insert {
         inserted: usize,
+        /// 自增列分配出的值（表里没有自增列时为空）
+        ids: Vec<i64>,
     },
     Update {
         updated: usize,
@@ -175,7 +177,7 @@ impl QueryResult {
         match self {
             QueryResult::Select { rows, .. } => format!("{} 行", rows.len()),
             QueryResult::Explain { rows, .. } => format!("{} 步", rows.len()),
-            QueryResult::Insert { inserted } => format!("插入 {} 行", inserted),
+            QueryResult::Insert { inserted, .. } => format!("插入 {} 行", inserted),
             QueryResult::Update { updated } => format!("更新 {} 行", updated),
             QueryResult::Delete { deleted } => format!("删除 {} 行", deleted),
             QueryResult::Ddl { message } => message.clone(),
@@ -211,9 +213,21 @@ impl QueryResult {
                 ("rows".to_string(), rows_to_json(rows)),
                 ("rowCount".to_string(), Json::Num(rows.len() as f64)),
             ]),
-            QueryResult::Insert { inserted } => Json::Obj(vec![
+            QueryResult::Insert { inserted, ids } => Json::Obj(vec![
                 ("type".to_string(), Json::str("insert")),
                 ("inserted".to_string(), Json::Num(*inserted as f64)),
+                // 自增列分配出的值；没有自增列时是空数组、lastId 为 null
+                (
+                    "ids".to_string(),
+                    Json::Arr(ids.iter().map(|id| Json::Int(*id)).collect()),
+                ),
+                (
+                    "lastId".to_string(),
+                    match ids.last() {
+                        Some(id) => Json::Int(*id),
+                        None => Json::Null,
+                    },
+                ),
             ]),
             QueryResult::Update { updated } => Json::Obj(vec![
                 ("type".to_string(), Json::str("update")),
@@ -1976,6 +1990,8 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
 
     let empty = RowContext::new(&[], Vec::new());
     let mut inserted = 0usize;
+    // 自增列分配出来的值（没有自增列时为空）
+    let mut ids: Vec<i64> = Vec::new();
 
     for row_exprs in &stmt.values {
         if row_exprs.len() != target.len() {
@@ -1999,11 +2015,14 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
             values[*slot] = codec::coerce(columns[*slot].ty, columns[*slot].scale, &raw)?;
         }
 
-        engine.insert(&stmt.table, values)?;
+        let (_, auto_value) = engine.insert_returning(&stmt.table, values)?;
+        if let Some(id) = auto_value {
+            ids.push(id);
+        }
         inserted += 1;
     }
 
-    Ok(QueryResult::Insert { inserted })
+    Ok(QueryResult::Insert { inserted, ids })
 }
 
 /// UPDATE / DELETE 的行来源：能用索引就只取候选行，否则退回全表扫描。
@@ -2175,6 +2194,7 @@ fn column_from_def(def: &ColumnDef, is_pk: bool, params: &[Value]) -> Result<Col
     column.primary_key = is_pk;
     column.not_null = def.not_null || is_pk;
     column.unique = def.unique;
+    column.auto_increment = def.auto_increment;
 
     if let Some(default_expr) = &def.default {
         if !is_literal_expr(default_expr) {
@@ -2251,6 +2271,9 @@ fn column_to_spec(column: &Column, source: Option<&str>) -> Json {
         if !source.eq_ignore_ascii_case(&column.name) {
             fields.push(("source".to_string(), Json::str(source.to_string())));
         }
+    }
+    if column.auto_increment {
+        fields.push(("autoIncrement".to_string(), Json::Bool(true)));
     }
     if let Some(default) = &column.default {
         fields.push(("default".to_string(), value_to_spec_json(default)));

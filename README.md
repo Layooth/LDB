@@ -140,7 +140,7 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 
 | 类别 | 支持 |
 |---|---|
-| DDL | `CREATE TABLE`（列级 PK/NOT NULL/UNIQUE/DEFAULT、表级 PK、IF NOT EXISTS）、`DROP TABLE`、`CREATE/DROP [UNIQUE] INDEX`、`ALTER TABLE`（`ADD [COLUMN]` / `DROP [COLUMN]` / `RENAME COLUMN a TO b` / `RENAME TO c`） |
+| DDL | `CREATE TABLE`（列级 PK/NOT NULL/UNIQUE/DEFAULT/**AUTO_INCREMENT**、表级 PK、IF NOT EXISTS）、`DROP TABLE`、`CREATE/DROP [UNIQUE] INDEX`、`ALTER TABLE`（`ADD [COLUMN]` / `DROP [COLUMN]` / `RENAME COLUMN a TO b` / `RENAME TO c`） |
 | DML | `INSERT INTO t [(列)] VALUES (...),(...)`、`UPDATE ... SET ... [WHERE]`、`DELETE FROM ... [WHERE]` |
 | 查询 | `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`/`UNION [ALL]`、`INNER/LEFT/CROSS JOIN`（左深树，嵌套循环）、`IN (SELECT ...)`（非关联单列） |
 | 事务 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` |
@@ -175,6 +175,17 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
   "rows":    [[1, "19.99"]],        // DECIMAL 是字符串；INT/REAL/BOOL 是 JSON 数值/布尔
   "rowCount": 1 }
 ```
+
+`insert` 结果会回报自增列分配出的值，省掉再查一次：
+
+```json
+{ "type": "insert", "inserted": 2, "ids": [1, 2], "lastId": 2 }
+```
+
+没有 `AUTO_INCREMENT` 列时 `ids` 为空数组、`lastId` 为 `null`。
+自增列语义：插入时该列为 `NULL`（或列在 `INSERT` 列表里被省略）就分配下一个值；
+显式写入更大的值会把游标顶到 `值+1`，所以手工指定 id、`dump`/`load` 都不会撞车。
+游标（`nextAutoId`）随 catalog 持久化，重启不丢。
 
 `/api/schema` 的列定义同样带 `type` 与 `scale`（DECIMAL 的标度），索引带
 `primary` / `implicit` 标记，供客户端或备份工具原样重建表。

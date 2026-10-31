@@ -703,6 +703,7 @@ mod tests {
                 primary: true,
                 implicit: false,
             }],
+            next_auto_id: 1,
         };
         // 登记到 catalog，否则重开时表文件会被当成孤儿清理掉
         store.catalog.tables.push(def.clone());

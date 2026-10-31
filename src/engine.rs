@@ -229,6 +229,21 @@ impl Engine {
             }
         }
 
+        // 自增列：只支持 INT，且一张表最多一个
+        let auto_columns: Vec<&Column> = columns.iter().filter(|c| c.auto_increment).collect();
+        if auto_columns.len() > 1 {
+            return Err(DbError::syntax("一张表最多只能有一个 AUTO_INCREMENT 列"));
+        }
+        if let Some(column) = auto_columns.first() {
+            if column.ty != ColumnType::Int {
+                return Err(DbError::syntax(format!(
+                    "AUTO_INCREMENT 只支持 INT 列，\"{}\" 是 {}",
+                    column.name,
+                    column.ty.as_str()
+                )));
+            }
+        }
+
         let id = self.store.catalog.next_table_id.max(1);
         self.store.catalog.next_table_id = id + 1;
 
@@ -269,6 +284,7 @@ impl Engine {
             name: trimmed.to_string(),
             columns,
             indexes: index_defs,
+            next_auto_id: 1,
         };
         let table = Table::load(&mut self.store, &def)?;
         self.store.catalog.tables.push(def);
@@ -418,8 +434,78 @@ impl Engine {
     // ------------------------------------------------------------ 行操作
 
     pub fn insert(&mut self, table_name: &str, values: Vec<Value>) -> Result<u32> {
+        Ok(self.insert_returning(table_name, values)?.0)
+    }
+
+    /// 插入一行，返回 `(row_id, 自增列最终值)`。
+    ///
+    /// 自增列的处理：
+    /// - 值为 NULL → 分配 `next_auto_id` 并递增；
+    /// - 显式值 ≥ `next_auto_id` → 游标顶到 `value + 1`
+    ///   （这样 `dump`/`load` 或手工指定 id 之后不会撞车）；
+    /// - 游标变化标记 catalog 脏，随本次提交一起进 WAL，崩溃后可恢复。
+    pub fn insert_returning(
+        &mut self,
+        table_name: &str,
+        mut values: Vec<Value>,
+    ) -> Result<(u32, Option<i64>)> {
         let position = self.table_index(table_name)?;
-        table::insert(&mut self.store, &mut self.tables[position], values)
+        let auto_value = self.assign_auto_increment(position, &mut values)?;
+        let row_id = table::insert(&mut self.store, &mut self.tables[position], values)?;
+        Ok((row_id, auto_value))
+    }
+
+    fn assign_auto_increment(
+        &mut self,
+        position: usize,
+        values: &mut Vec<Value>,
+    ) -> Result<Option<i64>> {
+        let table_id = self.tables[position].id;
+        let slot = match self.tables[position]
+            .columns
+            .iter()
+            .position(|column| column.auto_increment)
+        {
+            Some(slot) => slot,
+            None => return Ok(None),
+        };
+        if slot >= values.len() {
+            return Ok(None);
+        }
+
+        let next = self
+            .store
+            .catalog
+            .tables
+            .iter()
+            .find(|def| def.id == table_id)
+            .map(|def| def.next_auto_id)
+            .unwrap_or(1);
+
+        let assigned = match &values[slot] {
+            // NULL 表示「让数据库分配」
+            Value::Null => {
+                values[slot] = Value::Int(next);
+                next.saturating_add(1)
+            }
+            // 显式给值：只把游标顶上去，不改用户写的值
+            Value::Int(n) if *n >= next => n.saturating_add(1),
+            _ => return Ok(None),
+        };
+        if let Some(def) = self
+            .store
+            .catalog
+            .tables
+            .iter_mut()
+            .find(|def| def.id == table_id)
+        {
+            def.next_auto_id = assigned;
+        }
+        self.store.mark_catalog_dirty()?;
+        match &values[slot] {
+            Value::Int(n) => Ok(Some(*n)),
+            _ => Ok(None),
+        }
     }
 
     pub fn delete(&mut self, table_name: &str, row_id: u32) -> Result<bool> {
@@ -823,6 +909,10 @@ impl Engine {
                 .unwrap_or(false)
                 || primary_key;
             column.unique = spec.get("unique").and_then(|v| v.as_bool()).unwrap_or(false);
+            column.auto_increment = spec
+                .get("autoIncrement")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             if let Some(default) = spec.get("default") {
                 let value = json_to_value(default);

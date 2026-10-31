@@ -136,7 +136,7 @@ impl Server {
             let host = self.options.host.clone();
             thread::spawn(move || {
                 if let Err(err) = crate::http::serve(state, &host, http_port) {
-                    eprintln!("[LittleDB] HTTP 服务启动失败：{}", err);
+                    crate::log::error(&format!("HTTP 服务启动失败：{}", err));
                 }
             });
 
@@ -163,14 +163,14 @@ impl Server {
         let listener = TcpListener::bind(&address)
             .map_err(|err| DbError::internal(format!("无法监听 {}：{}", address, err)))?;
 
-        println!(
-            "[LittleDB] 协议服务 (LDBP/{}) 已监听 tcp://{}",
+        crate::log::info(&format!(
+            "协议服务 (LDBP/{}) 已监听 tcp://{}",
             PROTOCOL_VERSION,
             listener
                 .local_addr()
                 .map(|a| a.to_string())
                 .unwrap_or(address)
-        );
+        ));
 
         for incoming in listener.incoming() {
             match incoming {
@@ -232,11 +232,11 @@ impl Server {
                     if spawn.is_err() {
                         active.fetch_sub(1, Ordering::SeqCst);
                         rejected.fetch_add(1, Ordering::SeqCst);
-                        eprintln!("[LittleDB] 接受连接失败：线程创建失败");
+                        crate::log::error("接受连接失败：线程创建失败");
                     }
                 }
                 Err(err) => {
-                    eprintln!("[LittleDB] 接受连接失败：{}", err);
+                    crate::log::error(&format!("接受连接失败：{}", err));
                 }
             }
         }
@@ -431,9 +431,9 @@ fn handle_message(
                 queries.fetch_add(1, Ordering::SeqCst);
                 if options.slow_ms > 0.0 && elapsed >= options.slow_ms {
                     slow_queries.fetch_add(1, Ordering::SeqCst);
-                    println!("[LittleDB] 慢查询 {:.1}ms: {}", elapsed, one_line(sql));
+                    crate::log::warn(&format!("慢查询 {:.1}ms: {}", elapsed, one_line(sql)));
                 } else if options.verbose {
-                    println!("[LittleDB] {:.1}ms: {}", elapsed, one_line(sql));
+                    crate::log::info(&format!("{:.1}ms: {}", elapsed, one_line(sql)));
                 }
 
                 let payload = Json::Obj(vec![
@@ -548,7 +548,7 @@ fn open_browser(url: &str) {
     {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
-    println!("[LittleDB] 已在浏览器打开 {}", url);
+    crate::log::info(&format!("已在浏览器打开 {}", url));
 }
 
 #[cfg(test)]

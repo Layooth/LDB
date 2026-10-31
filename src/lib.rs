@@ -3,7 +3,9 @@
 
 pub mod auth;
 pub mod catalog;
+pub mod config;
 pub mod dump;
+pub mod log;
 pub mod codec;
 pub mod engine;
 pub mod error;

@@ -167,18 +167,18 @@ pub fn serve(state: HttpState, host: &str, port: u16) -> Result<()> {
     let listener = TcpListener::bind(&address)
         .map_err(|err| DbError::internal(format!("HTTP 无法监听 {}：{}", address, err)))?;
 
-    println!(
-        "[LittleDB] HTTP 服务与 Web 控制台已监听 http://{}",
+    crate::log::info(&format!(
+        "HTTP 服务与 Web 控制台已监听 http://{}",
         listener
             .local_addr()
             .map(|a| a.to_string())
             .unwrap_or(address)
-    );
+    ));
     if !state.web_dir.join("index.html").exists() {
-        println!(
-            "[LittleDB] 警告：未找到 Web 控制台目录（{}），仅 API 可用",
+        crate::log::warn(&format!(
+            "未找到 Web 控制台目录（{}），仅 API 可用",
             state.web_dir.display()
-        );
+        ));
     }
 
     for incoming in listener.incoming() {

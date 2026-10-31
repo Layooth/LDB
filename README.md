@@ -29,6 +29,54 @@ littledb.exe dump .\data -o backup.sql    # 导出为 SQL 脚本（可进版本�
 littledb.exe load .\new-data backup.sql   # 从脚本导入（--batch 200 控制每批事务）
 ```
 
+### 配置、日志与后台运行
+
+**配置**：`littledb.json`（默认找 `<数据目录>/littledb.json`，其次 `./littledb.json`，也可 `--config` 指定）。
+优先级：**命令行 > 环境变量 `LDB_TOKEN` > 配置文件 > 内置默认**。
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 7801,
+  "httpPort": 7802,
+  "token": "换成一串随机字符",
+  "maxConnections": 64,
+  "slowMs": 200,
+  "sync": "full",
+  "corsOrigin": "https://app.example.com",
+  "authFailLimit": 5,
+  "logFile": "littledb.log",
+  "logMaxBytes": 8388608
+}
+```
+
+拼错的键会打一条 `WARN` 而不是静默忽略。
+
+**日志**：`--log-file <文件>`（相对路径按数据目录解析）或配置里的 `logFile`。
+不配就写 stdout（保持原行为）。文件为**追加**写，超过 `--log-max-bytes`（默认 8MB）
+轮转到 `<文件>.1`（只留一份备份）。时间戳是 UTC（带 `Z`），与 `catalog.json` 一致。
+
+```
+2026-10-31 15:05:33Z [INFO] 启动：数据目录 ./data（2 张表 · 1 页 · 4096 字节 · 恢复 0 个事务）
+2026-10-31 15:05:33Z [INFO] 协议服务 (LDBP/1) 已监听 tcp://127.0.0.1:7801
+2026-10-31 15:05:33Z [WARN] 慢查询 312.4ms: SELECT ...
+```
+
+**后台运行**（关掉终端不退出）：
+
+```powershell
+littledb start .\data --port 7801 --http-port 7802   # 分离进程 + pid 文件 + 日志
+littledb status .\data                               # 是否在跑、pid、日志位置与大小
+littledb stop .\data                                 # 结束进程
+```
+
+`start` 会在数据目录写 `littledb.pid` 与 `littledb.log`；`stop` 是**直接终止进程**
+（等价于一次崩溃），已提交事务靠 WAL 在下次启动时重放，数据不丢，但会走一遍恢复流程。
+
+> 这不是 Windows 服务：真正的 SCM 服务宿主需要 `StartServiceCtrlDispatcher`，
+> 要额外 FFI 和管理员权限。开机自启建议用「任务计划程序」在登录时运行
+> `littledb start <目录>`，或用 [NSSM](https://nssm.cc/) 把 `serve` 包成服务。
+
 ### 备份 / 导出
 
 `dump` 产出**自包含 SQL 脚本**：`CREATE TABLE`（含类型、DECIMAL 标度、NOT NULL / UNIQUE /
@@ -291,4 +339,6 @@ await db.transaction(async () => {                                  // 抛错自
 - `EXPLAIN` 的「代价粗估」只按读取行数占比给量级，没有直方图/NDV 统计，不做代价模型。
 - 视图、触发器、外键、分布式、TLS。
 - 只有 JS 客户端（`sdk/littledb.js`）；Python / C# 等需按 HTTP 约定自行封装。
+- 未内置 Windows 服务（SCM）宿主：`start/stop` 是分离进程 + pid 文件；
+  开机自启请用任务计划程序或 NSSM（见「配置、日志与后台运行」）。
 - `Transfer-Encoding: chunked` 请求体不支持（会显式返回 411，不会静默当空 body）。

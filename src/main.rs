@@ -26,6 +26,9 @@ fn print_help() {
     println!("  littledb verify <目录>        输出数据目录概览");
     println!("  littledb dump <目录> [-o 文件] 导出为 SQL 脚本（默认输出到 stdout）");
     println!("  littledb load <目录> <脚本>   导入 SQL 脚本（--batch n 控制每批事务大小）");
+    println!("  littledb start <目录>         后台启动（关终端不退出，日志写数据目录）");
+    println!("  littledb stop <目录>          停止后台实例");
+    println!("  littledb status <目录>        查看后台实例状态与日志位置");
     println!("  littledb help                 显示帮助");
     println!();
     println!("serve 选项:");
@@ -43,6 +46,9 @@ fn print_help() {
     println!("  --slow-ms <毫秒>     超过该耗时打印慢查询");
     println!("  --sync <full|normal> 提交耐久性（默认 full）：normal 在 checkpoint 时才 fsync，");
     println!("                       进程崩溃仍安全，但掉电可能丢失最近的提交");
+    println!("  --config <文件>      配置文件（默认找 <数据目录>/littledb.json 或 ./littledb.json）");
+    println!("  --log-file <文件>    日志写文件（相对路径按数据目录解析；默认 stdout）");
+    println!("  --log-max-bytes <n>  单个日志文件上限（默认 8MB，超出轮转到 .1）");
     println!("  --verbose            输出每条查询耗时");
     println!();
     println!("示例:");
@@ -113,6 +119,27 @@ fn real_main() {
             Some(dir) => run_verify(dir),
             None => {
                 eprintln!("用法: littledb verify <目录>");
+                exit(1);
+            }
+        },
+        "start" => match args.get(2) {
+            Some(dir) => run_start(dir, &args[3..]),
+            None => {
+                eprintln!("用法: littledb start <目录> [serve 选项]");
+                exit(1);
+            }
+        },
+        "stop" => match args.get(2) {
+            Some(dir) => run_stop(dir),
+            None => {
+                eprintln!("用法: littledb stop <目录>");
+                exit(1);
+            }
+        },
+        "status" => match args.get(2) {
+            Some(dir) => run_status(dir),
+            None => {
+                eprintln!("用法: littledb status <目录>");
                 exit(1);
             }
         },
@@ -273,6 +300,41 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
     {
         options.open_browser = false;
     }
+
+    // ---- 配置文件先加载：命令行在下面覆盖，形成「CLI > 配置 > 默认」 ----
+    let config_arg = value_of(extra, "--config");
+    let config = match littledb::config::discover(
+        config_arg.as_deref().map(std::path::Path::new),
+        Path::new(dir),
+    ) {
+        Some(path) => {
+            let loaded = littledb::config::FileConfig::load(&path)?;
+            loaded.apply_to(&mut options);
+            Some((path, loaded))
+        }
+        None => None,
+    };
+
+    // 日志尽早初始化：后面的启动信息、慢查询、连接错误都要进文件
+    let log_file = value_of(extra, "--log-file")
+        .map(std::path::PathBuf::from)
+        .or_else(|| config.as_ref().and_then(|(_, cfg)| cfg.log_path()));
+    let log_max_bytes = value_of(extra, "--log-max-bytes")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| config.as_ref().map(|(_, cfg)| cfg.log_max_bytes()))
+        .unwrap_or(littledb::log::DEFAULT_MAX_BYTES);
+    let mut log_path: Option<std::path::PathBuf> = None;
+    if let Some(path) = log_file {
+        // 相对路径按数据目录解析，避免「从别的目录启动日志跑到别处」
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            Path::new(dir).join(path)
+        };
+        littledb::log::init_file(&resolved, log_max_bytes)?;
+        log_path = Some(resolved);
+    }
+
     let mut i = 0;
     while i < extra.len() {
         match extra[i].as_str() {
@@ -345,6 +407,10 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
                 }
             }
             "--verbose" => options.verbose = true,
+            // 下面三个在前面已经消费过（配置要先于其它参数生效）
+            "--config" | "--log-file" | "--log-max-bytes" => {
+                i += 1;
+            }
             other => {
                 eprintln!("未知参数: {}", other);
                 exit(1);
@@ -369,23 +435,202 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
         exit(1);
     }
 
+    if let Some(path) = &log_path {
+        // 控制台上留一句「日志写到哪」，文件里也有同样内容
+        println!("[LittleDB] 日志文件: {}", path.display());
+    }
+
     let engine = Engine::open(Path::new(dir))?;
     let stats = engine.stats();
     let recovered = engine.store.recovered_txns;
-    println!("[LittleDB] 数据目录: {}", dir);
-    println!(
-        "[LittleDB] {} 张表 · {} 页 · {} 字节 · 恢复 {} 个事务",
-        stats.tables, stats.pages, stats.bytes, recovered
-    );
+    littledb::log::info(&format!(
+        "启动：数据目录 {}（{} 张表 · {} 页 · {} 字节 · 恢复 {} 个事务）",
+        dir, stats.tables, stats.pages, stats.bytes, recovered
+    ));
     if options.token.is_some() {
-        println!("[LittleDB] 已启用 token 认证");
+        littledb::log::info("已启用 token 认证");
     }
     if !options.durable_commits {
-        println!("[LittleDB] 同步模式 normal：提交不 fsync，掉电可能丢失最近的提交");
+        littledb::log::warn("同步模式 normal：提交不 fsync，掉电可能丢失最近的提交");
     }
 
     let server = Server::new(engine, options);
     server.run()
+}
+
+// ---------------------------------------------------------------- 后台运行
+//
+// 目标：关掉终端/窗口后服务继续跑，并且日志落到文件里可查。
+// 实现：把 `serve` 作为**分离进程**再拉起来，pid 写进数据目录。
+// 注意：这不是 Windows 服务（SCM 服务宿主需要 StartServiceCtrlDispatcher，
+// 要额外 FFI + 管理员权限）；开机自启用「任务计划程序」或 NSSM 包一层即可。
+
+fn pid_path(dir: &str) -> std::path::PathBuf {
+    Path::new(dir).join("littledb.pid")
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use std::process::Command;
+    match Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output()
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn process_alive(pid: u32) -> bool {
+    use std::process::Command;
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn terminate(pid: u32) -> Result<()> {
+    use std::process::Command;
+    // 用 output() 而不是 status()：taskkill 会往控制台打 "SUCCESS: ..." 之类的噪音
+    let output = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(littledb::DbError::internal(format!(
+            "taskkill 失败：PID {}（{}）",
+            pid,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate(pid: u32) -> Result<()> {
+    use std::process::Command;
+    let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if process_alive(pid) {
+        let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+    }
+    Ok(())
+}
+
+fn run_start(dir: &str, extra: &[String]) -> Result<()> {
+    let path = pid_path(dir);
+    if let Some(pid) = read_pid(&path) {
+        if process_alive(pid) {
+            println!("已在后台运行（PID {}）。要重启请先：littledb stop {}", pid, dir);
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    let mut args: Vec<String> = vec![
+        "serve".to_string(),
+        dir.to_string(),
+        "--no-open".to_string(),
+    ];
+    args.extend(extra.iter().cloned());
+    // 没指定日志就默认写 <数据目录>/littledb.log——
+    // 分离进程的输出没有终端可去，不落文件就相当于丢了
+    if !extra.iter().any(|arg| arg == "--log-file") {
+        args.push("--log-file".to_string());
+        args.push("littledb.log".to_string());
+    }
+
+    let log_file = Path::new(dir).join("littledb.log");
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)?;
+    let stderr = stdout.try_clone()?;
+
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP：父进程退出后继续跑
+        command.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+
+    let child = command.spawn()?;
+    std::fs::write(&path, child.id().to_string())?;
+    println!("已后台启动（PID {}）", child.id());
+    println!("日志：{}", log_file.display());
+    println!("状态：littledb status {}    停止：littledb stop {}", dir, dir);
+    Ok(())
+}
+
+fn run_stop(dir: &str) -> Result<()> {
+    let path = pid_path(dir);
+    let Some(pid) = read_pid(&path) else {
+        println!("没有找到 {}（可能未用 start 启动）", path.display());
+        return Ok(());
+    };
+    if !process_alive(pid) {
+        let _ = std::fs::remove_file(&path);
+        println!("进程 {} 已退出，已清理 pid 文件", pid);
+        return Ok(());
+    }
+    terminate(pid)?;
+    for _ in 0..50 {
+        if !process_alive(pid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_file(&path);
+    if process_alive(pid) {
+        return Err(littledb::DbError::internal(format!(
+            "PID {} 仍在运行，请手动结束它",
+            pid
+        )));
+    }
+    // 直接终止进程 = 一次崩溃，WAL 会在下次启动时重放已提交的事务
+    println!("已停止（PID {}）；未落盘的提交会在下次启动时按 WAL 恢复", pid);
+    Ok(())
+}
+
+fn run_status(dir: &str) -> Result<()> {
+    let path = pid_path(dir);
+    match read_pid(&path) {
+        Some(pid) if process_alive(pid) => println!("后台状态：运行中（PID {}）", pid),
+        Some(pid) => println!("后台状态：未运行（PID {} 已失效，pid 文件可删）", pid),
+        None => println!("后台状态：未运行（没有 {}）", path.display()),
+    }
+    println!("数据目录：{}", dir);
+    let log_file = Path::new(dir).join("littledb.log");
+    if let Ok(meta) = std::fs::metadata(&log_file) {
+        println!("日志：{}（{} 字节）", log_file.display(), meta.len());
+    } else {
+        println!("日志：{}（尚未生成）", log_file.display());
+    }
+    Ok(())
+}
+
+/// 取 `--flag value` 里的值（启动参数扫描用）
+fn value_of(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|pos| args.get(pos + 1))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// 导出为 SQL 脚本（默认 stdout，便于重定向或接管道）

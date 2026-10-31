@@ -1,0 +1,2998 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LittleDB 控制台</title>
+<link rel="icon" type="image/png" href="icon.png" />
+<style>
+  :root {
+    --bg: #080b12;
+    --bg-soft: #0d121c;
+    --panel: #111827;
+    --panel-2: #0f1622;
+    --border: rgba(148, 163, 184, 0.14);
+    --border-strong: rgba(148, 163, 184, 0.28);
+    --text: #e6edf7;
+    --muted: #8b9ab1;
+    --accent: #4f8cff;
+    --accent-soft: rgba(79, 140, 255, 0.14);
+    --green: #22d3a7;
+    --red: #ff6b6b;
+    --amber: #fbbf24;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 15% -10%, rgba(79,140,255,.16), transparent 60%),
+                radial-gradient(900px 500px at 100% 0%, rgba(34,211,167,.10), transparent 55%),
+                var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+    font-size: 14px;
+    overflow: hidden;
+  }
+  .app { display: grid; grid-template-columns: 264px 1fr; height: 100vh; }
+
+  /* ---------------------------------------------------------- 侧栏 */
+  .sidebar {
+    display: flex; flex-direction: column; min-height: 0;
+    background: rgba(13, 18, 28, .82);
+    border-right: 1px solid var(--border);
+    backdrop-filter: blur(12px);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px; }
+  .brand .logo {
+    width: 34px; height: 34px; border-radius: 10px; flex: none; overflow: hidden;
+    background: linear-gradient(145deg, #4f8cff, #2b6cf6);
+    display: grid; place-items: center;
+    box-shadow: 0 6px 18px rgba(79,140,255,.35);
+  }
+  .brand .logo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .brand h1 { font-size: 15px; margin: 0; letter-spacing: .2px; }
+  .brand span { display: block; font-size: 11px; color: var(--muted); font-weight: 400; }
+  .sidebar-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 14px 8px 18px; font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .tables { list-style: none; margin: 0; padding: 0 10px; overflow-y: auto; flex: 1; min-height: 0; }
+  .tables li {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 10px; border-radius: 9px; cursor: pointer;
+    color: #cbd5e1; border: 1px solid transparent;
+    transition: background .15s, border-color .15s, color .15s;
+    overflow: hidden;
+  }
+  .tables li:hover { background: rgba(148,163,184,.08); color: #fff; }
+  .tables li.active { background: var(--accent-soft); border-color: rgba(79,140,255,.35); color: #fff; }
+  .tables li .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12.5px; }
+  .tables li .ic { flex: none; width: 16px; text-align: center; color: var(--accent); opacity: .85; font-size: 12px; }
+  .tables li.active .ic { opacity: 1; }
+  .tables li .rows {
+    font-size: 10.5px; color: var(--muted); font-family: var(--mono);
+    background: rgba(148,163,184,.10); border-radius: 999px; padding: 1px 7px;
+  }
+  .tables li.active .rows { color: #9ec3ff; background: rgba(79,140,255,.16); }
+  .tables .empty { color: var(--muted); font-size: 12px; padding: 12px 10px; line-height: 1.7; }
+  .sidebar-foot { padding: 12px 18px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+  .sidebar-foot div + div { margin-top: 4px; }
+
+  /* ---------------------------------------------------------- 主区 */
+  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .topbar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: rgba(8, 11, 18, .55);
+  }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(34,211,167,.15); }
+  .dot.off { background: var(--red); box-shadow: 0 0 0 4px rgba(255,107,107,.15); }
+  .pills { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+  .pill {
+    font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px;
+    background: rgba(17,24,39,.6); white-space: nowrap;
+  }
+  .pill b { color: #dbe6f5; font-weight: 500; }
+
+  .editor { padding: 16px 20px 0; }
+  .editor-card {
+    border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
+    background: linear-gradient(180deg, rgba(17,24,39,.92), rgba(15,22,34,.92));
+    box-shadow: 0 18px 48px rgba(0,0,0,.32);
+    transition: border-color .2s, box-shadow .2s;
+  }
+  .editor-card:focus-within {
+    border-color: rgba(79,140,255,.42);
+    box-shadow: 0 18px 48px rgba(0,0,0,.32), 0 0 0 3px rgba(79,140,255,.10);
+  }
+  .editor-head {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px 9px 16px;
+    border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted);
+  }
+  .editor-head .dotset { display: flex; gap: 6px; margin-right: 6px; }
+  .editor-head .dotset i { width: 9px; height: 9px; border-radius: 50%; background: #263244; display: block; }
+  .editor-head .grow { flex: 1; }
+  .editor-head .hint {
+    font-size: 11px; color: #5b6b83; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 46%;
+  }
+  button {
+    font: inherit; font-size: 12.5px; color: #c7d3e4; cursor: pointer;
+    background: rgba(148,163,184,.08); border: 1px solid var(--border);
+    padding: 6px 11px; border-radius: 8px; transition: .15s;
+  }
+  button:hover { background: rgba(148,163,184,.16); color: #fff; }
+  button.primary {
+    background: linear-gradient(180deg, #4f8cff, #3a76f0); border-color: #4f8cff; color: #fff;
+    font-weight: 600; box-shadow: 0 6px 16px rgba(79,140,255,.28);
+  }
+  button.primary:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .55; cursor: default; }
+  kbd {
+    font-family: var(--mono); font-size: 10.5px; opacity: .8;
+    border: 1px solid rgba(255,255,255,.35); border-radius: 4px; padding: 1px 4px; margin-left: 6px;
+  }
+  textarea {
+    width: 100%; border: 0; outline: 0; resize: none;
+    background: transparent; color: #dbeafe;
+    font-family: var(--mono); font-size: 13px; line-height: 1.65;
+    padding: 14px 16px; height: 148px; tab-size: 2;
+  }
+  textarea::placeholder { color: #4a5a72; }
+
+  .editor.collapsed textarea { display: none; }
+  #editor-toggle { padding: 3px 8px; }
+  #editor-toggle .chev { display: inline-block; transition: transform .15s; }
+  .editor.collapsed #editor-toggle .chev { transform: rotate(-90deg); }
+  #history {
+    font: inherit; font-size: 12px; color: #c7d3e4; cursor: pointer; outline: none;
+    background: rgba(148,163,184,.08); border: 1px solid var(--border);
+    padding: 5px 8px; border-radius: 8px; max-width: 200px;
+  }
+  #history:hover { background: rgba(148,163,184,.16); }
+  #history option { background: #131c2b; color: #dbe6f5; }
+
+  .result { flex: 1; min-height: 0; overflow: auto; padding: 16px 20px 24px; }
+  .card {
+    border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    background: rgba(15,22,34,.72); margin-bottom: 14px;
+    animation: fadeUp .2s ease;
+  }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .card-head {
+    display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+    border-bottom: 1px solid var(--border); font-size: 11.5px; color: var(--muted);
+    font-family: var(--mono);
+  }
+  .card-head .tag { color: var(--accent); }
+  .card-head .right { margin-left: auto; display: flex; gap: 10px; }
+  .table-scroll { overflow: auto; max-height: 60vh; }
+  table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12.5px; }
+  thead th {
+    position: sticky; top: 0; z-index: 1;
+    text-align: left; font-weight: 600; color: #9fb3cc;
+    background: #131c2b; border-bottom: 1px solid var(--border-strong);
+    padding: 8px 12px; white-space: nowrap;
+  }
+  tbody td {
+    padding: 7px 12px; border-bottom: 1px solid rgba(148,163,184,.08); color: #d6e2f2;
+    white-space: pre; max-width: 420px; overflow: hidden; text-overflow: ellipsis;
+  }
+  tbody tr:hover td { background: rgba(79,140,255,.06); }
+  tbody tr:last-child td { border-bottom: 0; }
+  thead th.num { text-align: right; }
+  td.num { text-align: right; color: #a8d5ff; }
+  td.null { color: #64748f; font-style: italic; background: rgba(148,163,184,.05); }
+  .msg { padding: 12px 14px; font-family: var(--mono); font-size: 12.5px; display: flex; gap: 10px; align-items: flex-start; }
+  .msg .ico { flex: none; }
+  .msg.ok { color: #b9f4e4; background: rgba(34,211,167,.06); }
+  .msg.err { color: #ffc9c9; background: rgba(255,107,107,.07); }
+  .msg .detail { color: var(--muted); }
+  .empty-hint { color: var(--muted); font-size: 12.5px; padding: 6px 2px 0; line-height: 1.8; }
+  .empty-hint code { color: #a8c4ea; background: rgba(79,140,255,.10); padding: 1px 5px; border-radius: 5px; }
+
+  /* ---------------------------------------------------------- 欢迎面板 */
+  .welcome { margin-top: 9vh; text-align: center; color: var(--muted); animation: fadeUp .3s ease; }
+  .welcome .w-icon {
+    width: 64px; height: 64px; margin: 0 auto 18px; border-radius: 18px;
+    background: linear-gradient(145deg, #4f8cff, #2b6cf6);
+    display: grid; place-items: center;
+    box-shadow: 0 14px 40px rgba(79,140,255,.35);
+  }
+  .welcome .w-icon svg { width: 34px; height: 34px; }
+  .welcome .w-icon img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .welcome h2 { margin: 0 0 8px; font-size: 19px; color: var(--text); font-weight: 600; letter-spacing: .2px; }
+  .welcome p { margin: 0 0 22px; font-size: 13px; line-height: 1.7; }
+  .welcome-actions { display: flex; gap: 10px; justify-content: center; margin-bottom: 28px; flex-wrap: wrap; }
+  .welcome-actions button { padding: 8px 16px; font-size: 13px; }
+  .welcome-tips {
+    display: flex; gap: 20px; justify-content: center; flex-wrap: wrap;
+    font-size: 12px; color: #6b7c95;
+  }
+  .welcome-tips kbd { margin: 0 5px 0 0; opacity: .65; }
+  .pager { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-top: 1px solid var(--border); font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .pager .right { margin-left: auto; display: flex; gap: 6px; }
+  .card-head .card-actions { margin-left: auto; display: flex; gap: 6px; }
+  .card-head button { padding: 3px 9px; font-size: 11px; border-radius: 6px; }
+  .schema-panel {
+    margin-top: 12px; border: 1px solid var(--border); border-radius: 12px;
+    background: rgba(15,22,34,.72); overflow: hidden;
+  }
+  .schema-panel summary {
+    cursor: pointer; padding: 10px 14px; font-size: 12px; color: var(--muted);
+    font-family: var(--mono); list-style: none; user-select: none;
+  }
+  .schema-panel summary::-webkit-details-marker { display: none; }
+  .schema-panel summary::before { content: '▸ '; color: var(--accent); }
+  .schema-panel[open] summary::before { content: '▾ '; }
+  .schema-panel summary:hover { color: #cbd5e1; }
+  /* ---------------------------------------------------------- 自动补全 */
+  .autocomplete {
+    position: fixed; z-index: 60; min-width: 220px; max-width: 380px; max-height: 248px;
+    overflow-y: auto; padding: 5px;
+    background: #131c2b; border: 1px solid var(--border-strong); border-radius: 10px;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, .55);
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  .autocomplete[hidden] { display: none; }
+  .autocomplete li {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 9px; border-radius: 6px; cursor: pointer; color: #cbd5e1;
+  }
+  .autocomplete li.active { background: var(--accent-soft); color: #fff; }
+  .autocomplete li .ic { width: 14px; flex: none; text-align: center; opacity: .7; font-size: 11px; }
+  .autocomplete li .txt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .autocomplete li .txt b { color: var(--accent); font-weight: 600; }
+  .autocomplete li.active .txt b { color: #9ec3ff; }
+  .autocomplete li .kind {
+    margin-left: auto; flex: none; font-size: 9.5px; letter-spacing: .06em;
+    text-transform: uppercase; color: #5b6b83; padding-left: 10px;
+  }
+  .autocomplete li .kind.column { color: #6ee7c6; }
+  .autocomplete li .kind.table { color: #fbbf24; }
+  .autocomplete li .kind.keyword { color: #8b9ab1; }
+  .autocomplete li .kind.function { color: #c084fc; }
+
+  /* ---------------------------------------------------------- 右键菜单 */
+  .ctxmenu {
+    position: fixed; z-index: 80; min-width: 186px; margin: 0; padding: 5px;
+    list-style: none; font-size: 12.5px; font-family: system-ui, sans-serif;
+    background: #131c2b; border: 1px solid var(--border-strong); border-radius: 10px;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, .55);
+  }
+  .ctxmenu[hidden] { display: none; }
+  .ctxmenu li {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 11px; border-radius: 6px; cursor: pointer; color: #cbd5e1;
+  }
+  .ctxmenu li:hover { background: var(--accent-soft); color: #fff; }
+  .ctxmenu li.danger { color: #ff9b9b; }
+  .ctxmenu li.danger:hover { background: rgba(255, 107, 107, .12); }
+  .ctxmenu li.disabled { opacity: .38; cursor: default; }
+  .ctxmenu li.disabled:hover { background: transparent; color: #cbd5e1; }
+  .ctxmenu li.sep { height: 1px; padding: 0; margin: 4px 6px; background: var(--border); cursor: default; }
+  .ctxmenu li.sep:hover { background: var(--border); }
+  .ctxmenu li .k { margin-left: auto; font-size: 10.5px; color: #5b6b83; }
+
+  /* ---------------------------------------------------------- 弹窗 */
+  .modal {
+    position: fixed; inset: 0; z-index: 90; display: grid; place-items: center;
+    background: rgba(3, 6, 12, .62); backdrop-filter: blur(3px);
+  }
+  .modal[hidden] { display: none; }
+  .modal-card {
+    width: min(900px, 94vw); max-height: 86vh; display: flex; flex-direction: column;
+    background: #0f1622; border: 1px solid var(--border-strong); border-radius: 14px;
+    box-shadow: 0 30px 80px rgba(0, 0, 0, .6); overflow: hidden;
+  }
+  .modal-head {
+    display: flex; align-items: center; gap: 10px; padding: 13px 16px;
+    border-bottom: 1px solid var(--border); font-size: 13.5px; font-weight: 600;
+  }
+  .modal-head .x { margin-left: auto; padding: 2px 8px; }
+  .modal-tip {
+    padding: 10px 16px; font-size: 11.5px; line-height: 1.8; color: var(--muted);
+    background: rgba(79, 140, 255, .06); border-bottom: 1px solid var(--border);
+  }
+  .modal-body { padding: 14px 16px; overflow: auto; }
+  #create-name-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  #create-name-row[hidden] { display: none; }
+  #create-name-row .create-name-label { flex: none; font-size: 12px; color: var(--muted); }
+  #create-name-row input {
+    flex: 1; padding: 6px 9px; outline: none;
+    background: rgba(8, 11, 18, .7); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  #create-name-row input:focus { border-color: var(--accent); }
+  .modal-foot {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px; border-top: 1px solid var(--border);
+  }
+  #schema-error { flex: 1; color: #ff9b9b; font-size: 12px; font-family: var(--mono); }
+
+  .schema-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .schema-table th {
+    text-align: left; font-weight: 500; color: var(--muted); font-size: 11px;
+    padding: 6px; border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  .schema-table td { padding: 5px 6px; border-bottom: 1px solid rgba(148, 163, 184, .08); vertical-align: middle; }
+  .schema-table input[type=text], .schema-table select {
+    width: 100%; min-width: 68px; padding: 5px 7px; outline: none;
+    background: rgba(8, 11, 18, .7); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .schema-table input[type=text]:focus, .schema-table select:focus { border-color: var(--accent); }
+  .schema-table input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; }
+  .schema-table .col-del { padding: 2px 8px; font-size: 12px; line-height: 1.3; }
+  .schema-table tr.new td:first-child input { border-color: rgba(34, 211, 167, .45); }
+  .schema-table .map-hint { font-size: 10.5px; color: #fbbf24; display: block; margin-top: 2px; }
+
+  /* ---------------------------------------------------------- 设置 */
+  body.zebra tbody tr:nth-child(even) td { background: rgba(148, 163, 184, .045); }
+  body.zebra tbody tr:hover td { background: rgba(79, 140, 255, .06); }
+  .settings-section { margin-bottom: 20px; }
+  .settings-section:last-child { margin-bottom: 4px; }
+  .settings-section h3 {
+    margin: 0 0 4px; font-size: 11px; font-weight: 600; color: var(--accent);
+    text-transform: uppercase; letter-spacing: .1em;
+  }
+  .settings-row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 8px 0; border-bottom: 1px solid rgba(148, 163, 184, .06);
+  }
+  .settings-row:last-child { border-bottom: 0; }
+  .settings-row .main { flex: 1; font-size: 13px; }
+  .settings-row .hint { font-size: 11px; color: var(--muted); margin-top: 2px; line-height: 1.5; }
+  .settings-row input[type=number], .settings-row select {
+    width: 90px; flex: none; padding: 5px 8px; outline: none;
+    background: rgba(8, 11, 18, .7); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  .settings-row input[type=number]:focus, .settings-row select:focus { border-color: var(--accent); }
+  .settings-row input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; flex: none; }
+  .server-info {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 7px 24px;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .server-info > div { display: flex; justify-content: space-between; gap: 10px; min-width: 0; }
+  .server-info .k { color: var(--muted); flex: none; }
+  .server-info .v { color: #dbe6f5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---------------------------------------------------------- 备份与恢复 */
+  .op-log {
+    margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+    background: rgba(8, 11, 18, .7); border: 1px solid var(--border);
+    font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+    max-height: 220px; overflow: auto; line-height: 1.8; white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .op-log[hidden] { display: none; }
+  .op-log .ok { color: #7ee2c4; }
+  .op-log .err { color: #ff9b9b; }
+  .op-log .warn { color: #fbbf24; }
+  #restore-file {
+    font-size: 11.5px; color: var(--muted); max-width: 220px; cursor: pointer;
+  }
+  #restore-file::file-selector-button {
+    font: inherit; font-size: 12px; color: #c7d3e4; cursor: pointer;
+    background: rgba(148,163,184,.08); border: 1px solid var(--border);
+    padding: 5px 10px; border-radius: 8px; margin-right: 8px;
+  }
+  #restore-file::file-selector-button:hover { background: rgba(148,163,184,.16); color: #fff; }
+
+  /* ---------------------------------------------------------- 本轮交互增强 */
+  .col-grip {
+    position: absolute; right: 0; top: 0; width: 7px; height: 100%;
+    cursor: col-resize; user-select: none;
+  }
+  .col-grip:hover { background: rgba(79,140,255,.25); }
+  td.zoomable { cursor: zoom-in; }
+  .danger-sql {
+    margin: 0; padding: 12px; border-radius: 8px;
+    background: rgba(255, 107, 107, .08); border: 1px solid rgba(255, 107, 107, .25);
+    font-family: var(--mono); font-size: 12.5px; color: #ffc9c9;
+    white-space: pre-wrap; word-break: break-all; max-height: 40vh; overflow: auto;
+  }
+  button.danger-btn {
+    background: linear-gradient(180deg, #ff6b6b, #e5484d); border-color: #ff6b6b; color: #fff;
+    font-weight: 600;
+  }
+  button.danger-btn:hover { filter: brightness(1.08); }
+  .insert-field { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; }
+  .insert-field label {
+    flex: none; width: 34%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--mono); font-size: 12px; color: #9fb3cc;
+  }
+  .insert-field input, .insert-field select {
+    flex: 1; min-width: 0; padding: 6px 9px; outline: none;
+    background: rgba(8, 11, 18, .7); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  .insert-field input:focus, .insert-field select:focus { border-color: var(--accent); }
+  .cell-pre {
+    margin: 0; padding: 12px; border-radius: 8px;
+    background: rgba(8, 11, 18, .7); border: 1px solid var(--border);
+    font-family: var(--mono); font-size: 12.5px; color: #dbeafe;
+    white-space: pre-wrap; word-break: break-all;
+    max-height: 50vh; overflow: auto;
+  }
+  .help-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .help-table td { padding: 7px 6px; border-bottom: 1px solid rgba(148, 163, 184, .08); }
+  .help-table tr:last-child td { border-bottom: 0; }
+  .help-table td:first-child { white-space: nowrap; width: 42%; color: #cbd5e1; }
+  .help-table td:last-child { color: var(--muted); }
+  #filter-input {
+    width: 130px; padding: 3px 8px; outline: none; font: inherit; font-size: 11px;
+    background: rgba(8, 11, 18, .7); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  #filter-input:focus { border-color: var(--accent); width: 170px; }
+  #menu-btn { display: none; }
+
+  /* ---------------------------------------------------------- 浅色主题 */
+  body.light {
+    --bg: #eef1f6;
+    --bg-soft: #ffffff;
+    --panel: #ffffff;
+    --panel-2: #f7f9fc;
+    --border: rgba(15, 23, 42, 0.12);
+    --border-strong: rgba(15, 23, 42, 0.24);
+    --text: #1e293b;
+    --muted: #64748b;
+    --accent: #2b6cf6;
+    --accent-soft: rgba(43, 108, 246, 0.12);
+    --green: #0ea47f;
+    --red: #e5484d;
+    --amber: #d97706;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(79, 140, 255, .10), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(34, 211, 167, .08), transparent 55%),
+      var(--bg);
+  }
+  body.light .sidebar { background: rgba(255, 255, 255, .88); }
+  body.light .topbar { background: rgba(255, 255, 255, .65); }
+  body.light .editor-card, body.light .card, body.light .schema-panel { background: #ffffff; box-shadow: 0 10px 30px rgba(15, 23, 42, .07); }
+  body.light .pill { background: rgba(241, 245, 249, .9); }
+  body.light .pill b { color: #334155; }
+  body.light thead th { background: #f1f5f9; color: #475569; }
+  body.light tbody td { color: #1e293b; }
+  body.light tbody tr:hover td { background: rgba(43, 108, 246, .05); }
+  body.light td.num { color: #1d4ed8; }
+  body.light td.null { color: #94a3b8; background: rgba(100, 116, 139, .06); }
+  body.light .tables li { color: #475569; }
+  body.light .tables li:hover { background: rgba(15, 23, 42, .05); color: #0f172a; }
+  body.light .tables li.active { color: #1d4ed8; }
+  body.light .tables li .rows { background: rgba(15, 23, 42, .06); color: #64748b; }
+  body.light .tables li.active .rows { color: #1d4ed8; background: rgba(43, 108, 246, .12); }
+  body.light textarea { color: #1e3a5f; }
+  body.light textarea::placeholder { color: #94a3b8; }
+  body.light .autocomplete, body.light .ctxmenu, body.light .modal-card { background: #ffffff; }
+  body.light .autocomplete li, body.light .ctxmenu li { color: #475569; }
+  body.light .modal-tip { color: #64748b; background: rgba(43, 108, 246, .05); }
+  body.light .schema-table input[type=text], body.light .schema-table select,
+  body.light .settings-row input[type=number], body.light .settings-row select,
+  body.light #create-name-row input, body.light #history,
+  body.light .insert-field input, body.light .insert-field select, body.light #filter-input {
+    background: #f8fafc; color: #1e293b;
+  }
+  body.light .op-log, body.light .cell-pre, body.light .danger-sql { background: #f8fafc; }
+  body.light .op-log { color: #64748b; }
+  body.light .cell-pre { color: #1e3a5f; }
+  body.light .danger-sql { color: #b91c1c; background: rgba(229, 72, 77, .06); }
+  body.light .server-info .v { color: #1e293b; }
+  body.light .msg.ok { color: #0f766e; background: rgba(13, 148, 136, .07); }
+  body.light .msg.err { color: #b91c1c; background: rgba(229, 72, 77, .07); }
+  body.light .msg .detail { color: #64748b; }
+  body.light .empty-hint code { background: rgba(43, 108, 246, .08); }
+  body.light .welcome h2 { color: #1e293b; }
+  body.light .card-head { color: #64748b; }
+  body.light button { background: rgba(15, 23, 42, .04); color: #334155; }
+  body.light button:hover { background: rgba(15, 23, 42, .09); color: #0f172a; }
+  body.light kbd { border-color: rgba(15, 23, 42, .3); }
+  body.light .toast { background: rgba(255, 255, 255, .97); color: #1e293b; }
+  body.light .editor-head .dotset i { background: #cbd5e1; }
+  body.light .editor-head .hint { color: #94a3b8; }
+  body.light .insert-field label { color: #64748b; }
+  body.light .help-table td:first-child { color: #334155; }
+
+  /* ---------------------------------------------------------- 移动端抽屉 */
+  @media (max-width: 860px) {
+    .app { grid-template-columns: 1fr; }
+    .sidebar {
+      position: fixed; left: 0; top: 0; bottom: 0; width: 264px; z-index: 70;
+      transform: translateX(-100%); transition: transform .2s ease;
+    }
+    body.sidebar-open .sidebar { transform: none; box-shadow: 0 0 60px rgba(0, 0, 0, .5); }
+    #menu-btn { display: inline-block; }
+  }
+
+  /* ---------------------------------------------------------- 表格编辑 */
+  td.editable { cursor: text; }
+  td.editable:hover { box-shadow: inset 0 0 0 1px rgba(79, 140, 255, .45); }
+  td.editing { padding: 0 !important; }
+  td.editing input {
+    width: 100%; border: 0; outline: 1px solid var(--accent); outline-offset: -1px;
+    background: #0b1220; color: #fff; font: inherit; padding: 7px 12px;
+  }
+  tbody tr.selected td { background: rgba(79, 140, 255, .13); }
+  .table-tools { display: flex; gap: 6px; margin-left: auto; }
+
+  .toast {
+    position: fixed; left: 50%; bottom: 32px; transform: translate(-50%, 12px);
+    padding: 9px 16px; border-radius: 999px; font-size: 12.5px; z-index: 100;
+    background: rgba(19, 28, 43, .96); border: 1px solid var(--border-strong);
+    color: #dbe6f5; box-shadow: 0 12px 30px rgba(0, 0, 0, .45);
+    opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: rgba(148,163,184,.22); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(148,163,184,.38); background-clip: padding-box; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">
+        <img src="icon.png" alt="LittleDB" />
+      </div>
+      <div>
+        <h1>LittleDB</h1>
+        <span>自研存储引擎 · SQL · LDBP/1</span>
+      </div>
+    </div>
+    <div class="sidebar-head">
+      <span>数据表</span>
+      <div style="display:flex;gap:6px">
+        <button id="new-table" title="新建表">＋</button>
+        <button id="refresh" title="刷新">↻</button>
+      </div>
+    </div>
+    <ul class="tables" id="tables"><li class="empty">加载中…</li></ul>
+    <div class="sidebar-foot">
+      <div id="foot-dir">数据目录 —</div>
+      <div id="foot-proto">协议 LDBP/1 · 页大小 4096 B</div>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <button id="menu-btn" title="打开表列表">☰ 表</button>
+      <div class="status"><span class="dot" id="dot"></span><span id="status-text">连接中…</span></div>
+      <div class="pills" id="pills">
+        <span class="pill">表 <b id="p-tables">-</b></span>
+        <span class="pill">行 <b id="p-rows">-</b></span>
+        <span class="pill">存储 <b id="p-bytes">-</b></span>
+      </div>
+      <button id="open-backup" title="备份与恢复">⇅ 备份</button>
+      <button id="open-settings" title="设置">⚙ 设置</button>
+    </div>
+
+    <section class="editor">
+      <div class="editor-card">
+        <div class="editor-head">
+          <div class="dotset"><i></i><i></i><i></i></div>
+          <button id="editor-toggle" title="收起 / 展开编辑器"><span class="chev">▾</span></button>
+          <span>SQL 编辑器</span>
+          <span class="hint">选中后 Ctrl+Enter 只执行选中 · Ctrl+空格 补全 · 按 ? 看快捷键</span>
+          <div class="grow"></div>
+          <select id="history" title="最近执行过的 SQL">
+            <option value="">历史</option>
+          </select>
+          <button id="format" title="美化 SQL 排版（有选中内容时只格式化选中部分）">格式化</button>
+          <button id="sample">插入示例</button>
+          <button id="clear">清空</button>
+          <button id="run" class="primary">运行<kbd>Ctrl ↵</kbd></button>
+        </div>
+        <textarea id="sql" spellcheck="false" autocomplete="off" placeholder="输入 SQL，Ctrl+Enter 运行；Ctrl+空格 唤出补全"></textarea>
+      </div>
+    </section>
+
+    <section class="result" id="result">
+      <div class="welcome" id="welcome">
+        <div class="w-icon">
+          <img src="icon.png" alt="LittleDB" />
+        </div>
+        <h2>欢迎使用 LittleDB</h2>
+        <p>自研存储引擎 · 支持 SQL 查询、在线编辑与结构管理</p>
+        <div class="welcome-actions">
+          <button id="w-sample" class="primary">插入示例表</button>
+          <button id="w-open">浏览左侧数据表</button>
+        </div>
+        <div class="welcome-tips">
+          <span><kbd>Ctrl ↵</kbd>运行 SQL</span>
+          <span><kbd>Ctrl 空格</kbd>唤出补全</span>
+          <span>右键表名可导出 CSV / 编辑结构</span>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="backup-modal" class="modal" hidden>
+  <div class="modal-card" style="width:min(640px,94vw)">
+    <div class="modal-head">
+      <span>备份与恢复</span>
+      <button id="backup-close" class="x" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="settings-section">
+        <h3>备份</h3>
+        <div class="settings-row">
+          <div class="main">
+            导出完整快照
+            <div class="hint">把所有表的结构（列、主键、约束）和全部数据打包为一个 JSON 文件下载到本机。大表按 1000 行分批拉取，请耐心等待。</div>
+          </div>
+          <button id="backup-run" class="primary">立即备份</button>
+        </div>
+        <div id="backup-progress" class="op-log" hidden></div>
+      </div>
+
+      <div class="settings-section">
+        <h3>恢复</h3>
+        <div class="settings-row">
+          <div class="main">
+            选择快照文件
+            <div class="hint">选择之前备份的 JSON 文件，恢复前会先解析并展示内容概要</div>
+          </div>
+          <input type="file" id="restore-file" accept=".json,application/json" />
+        </div>
+        <div id="restore-info" class="op-log" hidden></div>
+        <div class="settings-row">
+          <div class="main">
+            覆盖同名表
+            <div class="hint">勾选后，恢复时同名表会先删除再重建（危险操作，请确认已备份）</div>
+          </div>
+          <input type="checkbox" id="restore-overwrite" checked />
+        </div>
+        <div class="settings-row">
+          <div class="main">开始恢复</div>
+          <button id="restore-run" class="primary" disabled>开始恢复</button>
+        </div>
+        <div id="restore-progress" class="op-log" hidden></div>
+      </div>
+
+      <div class="settings-section">
+        <h3>说明</h3>
+        <div class="settings-row" style="display:block">
+          <div class="hint" style="margin:0">
+            · 唯一约束、主键会随建表语句自动重建，无需单独处理索引<br />
+            · 建议在业务低峰期操作；恢复过程中如果中途失败，已完成重建的表会保留，其余表按日志提示处理<br />
+            · 定期下载快照到不同的机器存放，单机存放不算真正的备份
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="settings-modal" class="modal" hidden>
+  <div class="modal-card" style="width:min(600px,94vw)">
+    <div class="modal-head">
+      <span>设置</span>
+      <button id="settings-close" class="x" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="settings-section">
+        <h3>界面</h3>
+        <div class="settings-row">
+          <div class="main">主题<div class="hint">深色 / 浅色，立即生效</div></div>
+          <select id="set-theme">
+            <option value="dark">深色</option>
+            <option value="light">浅色</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>数据浏览</h3>
+        <div class="settings-row">
+          <div class="main">每页行数<div class="hint">点击表名或翻页时每次加载的行数（10–500）</div></div>
+          <input type="number" id="set-page-size" min="10" max="500" step="10" />
+        </div>
+        <div class="settings-row">
+          <div class="main">表格斑马纹<div class="hint">隔行显示浅色底纹，便于横向阅读宽表</div></div>
+          <input type="checkbox" id="set-zebra" />
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>SQL 编辑器</h3>
+        <div class="settings-row">
+          <div class="main">字号<div class="hint">编辑器文字大小（11–22 px）</div></div>
+          <input type="number" id="set-editor-font" min="11" max="22" step="1" />
+        </div>
+        <div class="settings-row">
+          <div class="main">高度<div class="hint">编辑器默认高度（100–600 px，可折叠）</div></div>
+          <input type="number" id="set-editor-height" min="100" max="600" step="10" />
+        </div>
+        <div class="settings-row">
+          <div class="main">Tab 宽度<div class="hint">按 Tab 键插入的空格数</div></div>
+          <select id="set-tab-size">
+            <option value="2">2 空格</option>
+            <option value="4">4 空格</option>
+            <option value="8">8 空格</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <div class="main">自动补全<div class="hint">输入时自动弹出表名/列名/关键字补全</div></div>
+          <input type="checkbox" id="set-autocomplete" />
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>历史记录</h3>
+        <div class="settings-row">
+          <div class="main">保留条数<div class="hint">最多保存多少条执行过的 SQL（10–200）</div></div>
+          <input type="number" id="set-history-max" min="10" max="200" step="10" />
+        </div>
+        <div class="settings-row">
+          <div class="main">清空历史<div class="hint">删除所有已保存的 SQL 历史</div></div>
+          <button id="clear-history">清空</button>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>服务器信息（只读）</h3>
+        <div id="server-info" class="server-info">加载中…</div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button id="settings-reset">恢复默认</button>
+      <span style="flex:1"></span>
+      <button id="settings-done" class="primary">完成</button>
+    </div>
+  </div>
+</div>
+
+<div id="danger-modal" class="modal" hidden>
+  <div class="modal-card" style="width:min(560px,94vw)">
+    <div class="modal-head">
+      <span style="color:var(--red)">⚠ 危险操作确认</span>
+    </div>
+    <div class="modal-tip" style="background:rgba(255,107,107,.07)">
+      以下语句没有 WHERE 条件，将影响整张表的所有数据，请仔细确认。
+    </div>
+    <div class="modal-body">
+      <pre id="danger-sql" class="danger-sql"></pre>
+    </div>
+    <div class="modal-foot">
+      <span style="flex:1"></span>
+      <button id="danger-cancel">取消</button>
+      <button id="danger-ok" class="danger-btn">仍要执行</button>
+    </div>
+  </div>
+</div>
+
+<div id="cell-modal" class="modal" hidden>
+  <div class="modal-card" style="width:min(680px,94vw)">
+    <div class="modal-head">
+      <span id="cell-modal-title">单元格内容</span>
+      <button id="cell-close" class="x" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <pre id="cell-pre" class="cell-pre"></pre>
+    </div>
+    <div class="modal-foot">
+      <button id="cell-copy">复制内容</button>
+      <span style="flex:1"></span>
+      <button id="cell-done" class="primary">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="insert-modal" class="modal" hidden>
+  <div class="modal-card" style="width:min(520px,94vw)">
+    <div class="modal-head">
+      <span id="insert-title">插入行</span>
+      <button id="insert-close" class="x" title="关闭">✕</button>
+    </div>
+    <div class="modal-tip">留空的列将填 NULL；值按列类型自动处理，无需手动加引号。</div>
+    <div class="modal-body">
+      <div id="insert-fields"></div>
+      <div id="insert-error" style="color:var(--red);font-size:12px;margin-top:8px;font-family:var(--mono)"></div>
+    </div>
+    <div class="modal-foot">
+      <span style="flex:1"></span>
+      <button id="insert-cancel">取消</button>
+      <button id="insert-save" class="primary">插入</button>
+    </div>
+  </div>
+</div>
+
+<div id="help-modal" class="modal" hidden>
+  <div class="modal-card" style="width:min(500px,94vw)">
+    <div class="modal-head">
+      <span>快捷键与操作</span>
+      <button id="help-close" class="x" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <table class="help-table">
+        <tbody>
+          <tr><td>Ctrl + Enter</td><td>运行 SQL（选中了文本则只执行选中部分）</td></tr>
+          <tr><td>Ctrl + 空格 / Alt + /</td><td>手动唤起自动补全</td></tr>
+          <tr><td>Tab</td><td>接受补全候选；无补全时插入缩进</td></tr>
+          <tr><td>Esc</td><td>关闭补全、右键菜单、弹窗</td></tr>
+          <tr><td>Delete</td><td>删除表格中选中的行（需主键，慎用）</td></tr>
+          <tr><td>双击单元格</td><td>编辑该单元格的值</td></tr>
+          <tr><td>单击长内容</td><td>查看完整内容（JSON 自动格式化）</td></tr>
+          <tr><td>拖拽列头右缘</td><td>调整列宽</td></tr>
+          <tr><td>?（在编辑器外按问号）</td><td>打开本面板</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="autocomplete" class="autocomplete" hidden></div>
+
+<ul id="ctxmenu" class="ctxmenu" hidden></ul>
+
+<div id="schema-modal" class="modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <span id="schema-title">编辑表结构</span>
+      <button id="schema-close" class="x" title="关闭">✕</button>
+    </div>
+    <div class="modal-tip" id="schema-tip">
+      保存时会重建表并迁移数据（单事务，失败自动回滚）。改列名时保留「原列」映射可避免丢数据；
+      新增列如果没有默认值会填 NULL，此时不能勾选「非空」。行数超过 5 万的表请改用导出/导入重建。
+    </div>
+    <div class="modal-body">
+      <div id="create-name-row" hidden>
+        <label class="create-name-label">表名</label>
+        <input type="text" id="create-name" placeholder="表名，如 users" />
+      </div>
+      <table class="schema-table">
+        <thead>
+          <tr>
+            <th style="width:26%">列名</th>
+            <th style="width:16%">类型</th>
+            <th style="width:8%">主键</th>
+            <th style="width:8%">非空</th>
+            <th style="width:8%">唯一</th>
+            <th style="width:22%">默认值</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="schema-rows"></tbody>
+      </table>
+      <div style="margin-top:10px">
+        <button id="schema-add">+ 添加列</button>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <span id="schema-error"></span>
+      <button id="schema-cancel">取消</button>
+      <button id="schema-save" class="primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="sql-hints.js"></script>
+<script>
+(() => {
+  'use strict';
+
+  const $ = (sel) => document.querySelector(sel);
+  const sqlInput = $('#sql');
+  const resultBox = $('#result');
+  const tablesBox = $('#tables');
+  const welcomePanel = $('#welcome');
+
+  function insertSample() {
+    expandEditor();
+    sqlInput.value = SAMPLE;
+    sqlInput.focus();
+  }
+
+  /** 编辑器处于折叠状态时先展开，保证用户能看到写入的内容 */
+  function expandEditor() {
+    const editorSection = document.querySelector('.editor');
+    if (editorSection) editorSection.classList.remove('collapsed');
+  }
+
+  const SAMPLE = `-- 建表 + 插入 + 查询：每次运行都会重建 demo_users，可重复执行
+DROP TABLE IF EXISTS demo_users;
+CREATE TABLE demo_users (
+  id INT PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT UNIQUE,
+  age INT,
+  active BOOL DEFAULT TRUE
+);
+
+INSERT INTO demo_users (id, name, email, age) VALUES
+  (1, '张三', 'zhangsan@example.com', 28),
+  (2, '李四', 'lisi@example.com', 34),
+  (3, 'Alice', 'alice@example.com', 25);
+
+SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
+
+  const state = {
+    token: null,
+    sessionId: null,
+    tables: [],
+    schema: { tables: [] },
+    page: null,
+    selectedRow: null,
+    lastPage: {},   // 每张表最后浏览到的页
+    offline: false, // 连接状态
+  };
+
+  // ------------------------------------------------------------ 网络
+  // token 只放 sessionStorage：关掉标签页即失效，也不会长期留在磁盘上。
+  // ?token= 只用于「落地一次」，随后立刻从地址栏抹掉（避免进历史记录/截图/日志）。
+  const urlParams = new URLSearchParams(location.search);
+  const urlToken = urlParams.get('token');
+  state.token = urlToken
+    || sessionStorage.getItem('ldb_token')
+    || localStorage.getItem('ldb_token')   // 兼容旧版本留下的值，随后清理
+    || null;
+  if (state.token) {
+    try { sessionStorage.setItem('ldb_token', state.token); } catch (_) { /* 忽略 */ }
+    try { localStorage.removeItem('ldb_token'); } catch (_) { /* 忽略 */ }
+  }
+  if (urlToken) {
+    urlParams.delete('token');
+    const rest = urlParams.toString();
+    history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
+  }
+
+  function headers(extra) {
+    const h = Object.assign({ 'Content-Type': 'application/json' }, extra || {});
+    if (state.token) h.Authorization = 'Bearer ' + state.token;
+    if (state.sessionId) h['X-Session-Id'] = state.sessionId;
+    return h;
+  }
+
+  // token 现在只活在 sessionStorage 里（关标签即失效），所以「重新打开控制台」
+  // 必须能补输令牌：401 时问一次，输对了就重试该请求。
+  let tokenPrompted = false;
+
+  async function api(path, options = {}, retried = false) {
+    const res = await fetch(path, Object.assign({}, options, { headers: headers(options.headers) }));
+    const sid = res.headers.get('X-Session-Id');
+    if (sid) state.sessionId = sid;
+    let data;
+    try {
+      data = await res.json();
+    } catch (e) {
+      throw new Error('服务端返回了非 JSON 响应（HTTP ' + res.status + '）');
+    }
+    if (res.status === 401 && !retried && !tokenPrompted) {
+      tokenPrompted = true;
+      const entered = window.prompt(
+        '这个控制台需要访问令牌（服务端启动时 --token 或 .ldb-token 文件里的那一串）：',
+        ''
+      );
+      if (entered && entered.trim()) {
+        state.token = entered.trim();
+        try { sessionStorage.setItem('ldb_token', state.token); } catch (_) { /* 忽略 */ }
+        return api(path, options, true);
+      }
+      setStatus(false, '未通过认证，刷新页面可重新输入令牌');
+    }
+    if (!data.ok) {
+      const err = new Error(data.error && data.error.message ? data.error.message : '请求失败');
+      err.code = data.error && data.error.code;
+      throw err;
+    }
+    return data.result;
+  }
+
+  const runSql = (sql) => api('/api/sql', { method: 'POST', body: JSON.stringify({ sql }) });
+
+  async function refreshTables() {
+    try {
+      const info = await api('/api/health');
+      const [tablesRes, schemaRes] = await Promise.all([api('/api/tables'), api('/api/schema')]);
+      state.tables = tablesRes;
+      state.schema = schemaRes;
+      renderTables();
+      const stats = info.stats || {};
+      $('#p-tables').textContent = stats.tables ?? '-';
+      $('#p-rows').textContent = stats.rows ?? '-';
+      $('#p-bytes').textContent = formatBytes(stats.bytes || 0);
+      $('#foot-dir').textContent = '数据目录 ' + (stats.dir || '—');
+      setStatus(true, '已连接 · 协议 v1');
+    } catch (err) {
+      setStatus(false, '连接失败：' + err.message);
+    }
+  }
+
+  function setStatus(ok, text) {
+    const dot = $('#dot');
+    dot.classList.toggle('off', !ok);
+    $('#status-text').textContent = text;
+  }
+
+  function formatBytes(n) {
+    if (!n) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    let v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + ' ' + units[i];
+  }
+
+  // ------------------------------------------------------------ 渲染
+  function renderTables() {
+    const list = state.tables && state.tables.tables ? state.tables.tables : [];
+    tablesBox.innerHTML = '';
+    if (!list.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = '还没有表。点击右上角 ＋ 插入示例 SQL 并运行。';
+      tablesBox.appendChild(li);
+      return;
+    }
+    for (const t of list) {
+      const li = document.createElement('li');
+      li.dataset.name = t.name;
+      if (state.page && state.page.table === t.name) li.classList.add('active');
+      const ic = document.createElement('span');
+      ic.className = 'ic';
+      ic.textContent = '▦';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = t.name;
+      const rows = document.createElement('span');
+      rows.className = 'rows';
+      rows.textContent = t.rows;
+      li.appendChild(ic);
+      li.appendChild(name);
+      li.appendChild(rows);
+      li.addEventListener('click', () => openTableRemembered(t.name));
+      li.addEventListener('contextmenu', (e) =>
+        showMenu(e, [
+          { label: '查看数据', action: () => openTableRemembered(t.name) },
+          {
+            label: '复制建表语句',
+            action: () => {
+              const st = (state.schema.tables || []).find((x) => x.name === t.name);
+              if (!st) {
+                toast('表结构尚未加载');
+                return;
+              }
+              copyText(createTableSqlFromSchema(t.name, { columns: st.columns }));
+            },
+          },
+          { label: '编辑结构…', action: () => openSchemaEditor(t.name) },
+          '-',
+          { label: '复制表名', action: () => copyText(t.name) },
+          {
+            label: '生成 SELECT',
+            action: () => {
+              expandEditor();
+              sqlInput.value = `SELECT * FROM "${t.name}" LIMIT 100;`;
+              sqlInput.focus();
+            },
+          },
+          { label: '导出 CSV', action: () => exportTableCsv(t.name) },
+          '-',
+          { label: '删除表', danger: true, action: () => dropTableConfirmed(t.name) },
+        ])
+      );
+      tablesBox.appendChild(li);
+    }
+  }
+
+  function cellContent(td, v) {
+    // 重设 className 会丢掉 editable / zoomable，这里先记下来再补回去
+    const keepEditable = td.classList.contains('editable');
+    const keepZoomable = td.classList.contains('zoomable');
+    if (v === null || v === undefined) {
+      td.className = 'null';
+      td.textContent = 'NULL';
+    } else if (typeof v === 'number') {
+      td.className = 'num';
+      td.textContent = String(v);
+    } else if (typeof v === 'boolean') {
+      td.className = '';
+      td.textContent = v ? 'true' : 'false';
+    } else {
+      td.className = '';
+      td.textContent = String(v);
+    }
+    if (keepEditable) td.classList.add('editable');
+    if (keepZoomable) td.classList.add('zoomable');
+  }
+
+  function insertSqlOf(table, columns, row) {
+    const cols = columns.map((c) => `"${c}"`).join(', ');
+    const vals = row.map(sqlLiteral).join(', ');
+    return `INSERT INTO "${table}" (${cols}) VALUES (${vals});`;
+  }
+
+  /**
+   * 渲染结果表格。
+   * meta = { table, pk } 时启用行操作：双击单元格改值、右键菜单删行/复制。
+   */
+  function makeTable(columns, rows, meta) {
+    const opts = meta || {};
+    const pkIndex = opts.pk
+      ? columns.findIndex((c) => String(c).toLowerCase() === String(opts.pk).toLowerCase())
+      : -1;
+    const editable = !!opts.table && pkIndex >= 0;
+
+    const scroll = document.createElement('div');
+    scroll.className = 'table-scroll';
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const htr = document.createElement('tr');
+    columns.forEach((c, ci) => {
+      const th = document.createElement('th');
+      th.textContent = c;
+      // 整列都是数字（NULL 不算）时，表头跟随数据右对齐
+      const hasNum = rows.some((r) => typeof r[ci] === 'number');
+      const allNum = rows.every((r) => r[ci] === null || r[ci] === undefined || typeof r[ci] === 'number');
+      if (hasNum && allNum) th.classList.add('num');
+      htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+
+    rows.forEach((row, ri) => {
+      const tr = document.createElement('tr');
+      tr.addEventListener('click', () => {
+        for (const el of tbody.querySelectorAll('tr.selected')) el.classList.remove('selected');
+        tr.classList.add('selected');
+        state.selectedRow = editable
+          ? { table: opts.table, pkName: columns[pkIndex], pkValue: row[pkIndex] }
+          : null;
+      });
+
+      tr.addEventListener('contextmenu', (e) => {
+        const cell = e.target.closest('td');
+        const ci = cell ? cell.cellIndex : -1;
+        const items = [];
+        if (ci >= 0) {
+          items.push({ label: `复制「${columns[ci]}」的值`, action: () => copyText(cellText(row[ci])) });
+        }
+        items.push({ label: '复制整行（TSV）', action: () => copyText(row.map(cellText).join('\t')) });
+        if (opts.table) {
+          items.push({ label: '复制为 INSERT', action: () => copyText(insertSqlOf(opts.table, columns, row)) });
+        }
+        if (editable) {
+          items.push('-');
+          items.push({
+            label: '删除此行',
+            danger: true,
+            action: () => deleteRowByPk(opts.table, columns[pkIndex], row[pkIndex]),
+          });
+        }
+        showMenu(e, items);
+      });
+
+      row.forEach((v, ci) => {
+        const td = document.createElement('td');
+        cellContent(td, v);
+        td.title = cellText(v);
+        let pendingViewer = null;
+        if (editable) {
+          td.classList.add('editable');
+          td.title = cellText(v) + '（双击编辑）';
+          td.addEventListener('dblclick', () => {
+            clearTimeout(pendingViewer);
+            startCellEdit(td, {
+              table: opts.table,
+              column: columns[ci],
+              pkName: columns[pkIndex],
+              pkValue: row[pkIndex],
+              row,
+              index: ci,
+            });
+          });
+        }
+        // 长内容单击查看全文（JSON 自动格式化）；可编辑单元格延迟触发避免和双击冲突
+        if (cellText(v).length > 60) {
+          td.classList.add('zoomable');
+          td.addEventListener('click', () => {
+            if (editable) {
+              clearTimeout(pendingViewer);
+              pendingViewer = setTimeout(() => openCellViewer(columns[ci], v), 260);
+            } else {
+              openCellViewer(columns[ci], v);
+            }
+          });
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    makeColumnsResizable(table);
+    return scroll;
+  }
+
+  /** 给表头加拖拽把手，可调整列宽 */
+  function makeColumnsResizable(table) {
+    for (const th of table.querySelectorAll('thead th')) {
+      const grip = document.createElement('span');
+      grip.className = 'col-grip';
+      th.appendChild(grip);
+      grip.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.clientX;
+        const startW = th.offsetWidth;
+        const move = (ev) => {
+          th.style.width = Math.max(40, startW + ev.clientX - startX) + 'px';
+        };
+        const up = () => {
+          document.removeEventListener('mousemove', move);
+          document.removeEventListener('mouseup', up);
+        };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+      });
+    }
+  }
+
+  function card(headParts, bodyEl, footerEl, actions) {
+    const el = document.createElement('div');
+    el.className = 'card';
+    const head = document.createElement('div');
+    head.className = 'card-head';
+    for (const part of headParts) {
+      const span = document.createElement('span');
+      span.textContent = part.text;
+      if (part.className) span.className = part.className;
+      head.appendChild(span);
+    }
+    if (actions && actions.length) {
+      const right = document.createElement('div');
+      right.className = 'card-actions';
+      for (const a of actions) right.appendChild(a);
+      head.appendChild(right);
+    }
+    el.appendChild(head);
+    if (bodyEl) el.appendChild(bodyEl);
+    if (footerEl) el.appendChild(footerEl);
+    return el;
+  }
+
+  function downloadCsv(columns, rows, filename) {
+    const esc = (v) => {
+      if (v === null || v === undefined) return '';
+      const s = typeof v === 'boolean' ? (v ? 'true' : 'false') : String(v);
+      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    const lines = [columns.map(esc).join(',')];
+    for (const row of rows) lines.push(row.map(esc).join(','));
+    // BOM 让 Excel 正确识别 UTF-8
+    const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+
+  function exportButton(columns, rows) {
+    const btn = document.createElement('button');
+    btn.textContent = '导出 CSV';
+    btn.onclick = () => downloadCsv(columns, rows, 'littledb-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.csv');
+    return btn;
+  }
+
+  function messageCard(kind, text, detail) {
+    const el = document.createElement('div');
+    el.className = 'card';
+    const box = document.createElement('div');
+    box.className = 'msg ' + kind;
+    const ico = document.createElement('span');
+    ico.className = 'ico';
+    ico.textContent = kind === 'ok' ? '✔' : '✖';
+    const body = document.createElement('div');
+    body.textContent = text;
+    if (detail) {
+      const d = document.createElement('div');
+      d.className = 'detail';
+      d.textContent = detail;
+      body.appendChild(d);
+    }
+    box.appendChild(ico);
+    box.appendChild(body);
+    el.appendChild(box);
+    return el;
+  }
+
+  function renderResult(result, container) {
+    if (!result) return;
+    if (result.type === 'batch') {
+      for (const r of result.results) renderResult(r, container);
+      return;
+    }
+    const timing = typeof result.elapsedMs === 'number' ? result.elapsedMs.toFixed(2) + ' ms' : '';
+
+    if (result.type === 'select' || result.type === 'explain') {
+      const count = result.rowCount === undefined ? result.rows.length : result.rowCount;
+      const body = result.rows.length
+        ? makeTable(result.columns, result.rows)
+        : Object.assign(document.createElement('div'), { className: 'msg ok', textContent: '（结果集为空）' });
+      const actions = result.type === 'select' ? [exportButton(result.columns, result.rows)] : [];
+      container.appendChild(
+        card(
+          [
+            { text: result.type.toUpperCase(), className: 'tag' },
+            { text: count + ' 行' },
+          ],
+          body,
+          Object.assign(document.createElement('div'), { className: 'pager', textContent: timing }),
+          actions
+        )
+      );
+      return;
+    }
+
+    if (result.type === 'tables') {
+      const rows = result.tables.map((t) => [t.name, t.columns, t.rows, t.pages]);
+      container.appendChild(
+        card(
+          [{ text: 'SHOW TABLES', className: 'tag' }, { text: result.tables.length + ' 张表' }],
+          result.tables.length ? makeTable(['表名', '列数', '行数', '数据页'], rows) : null,
+          Object.assign(document.createElement('div'), { className: 'pager', textContent: timing })
+        )
+      );
+      return;
+    }
+
+    if (result.type === 'describe') {
+      const t = result.table;
+      const cols = t.columns.map((c) => [
+        c.name,
+        c.type,
+        c.primaryKey ? '是' : '',
+        c.notNull ? '是' : '',
+        c.unique ? '是' : '',
+        c.default === null || c.default === undefined ? '' : String(c.default),
+      ]);
+      container.appendChild(
+        card(
+          [{ text: 'DESCRIBE', className: 'tag' }, { text: t.name }, { text: t.rows + ' 行' }],
+          makeTable(['列名', '类型', '主键', '非空', '唯一', '默认值'], cols)
+        )
+      );
+      if (t.indexes.length) {
+        container.appendChild(
+          card(
+            [{ text: 'INDEXES', className: 'tag' }, { text: String(t.indexes.length) }],
+            makeTable(['索引名', '列', '唯一'], t.indexes.map((i) => [i.name, i.columns.join(', '), i.unique ? '是' : '']))
+          )
+        );
+      }
+      return;
+    }
+
+    if (result.type === 'insert') {
+      container.appendChild(messageCard('ok', '插入 ' + result.inserted + ' 行', timing));
+      return;
+    }
+    if (result.type === 'update') {
+      container.appendChild(messageCard('ok', '更新 ' + result.updated + ' 行', timing));
+      return;
+    }
+    if (result.type === 'delete') {
+      container.appendChild(messageCard('ok', '删除 ' + result.deleted + ' 行', timing));
+      return;
+    }
+    if (result.type === 'ddl' || result.type === 'transaction') {
+      container.appendChild(messageCard('ok', result.message, timing));
+      return;
+    }
+    container.appendChild(messageCard('ok', JSON.stringify(result), ''));
+  }
+
+  // ------------------------------------------------------------ 自动补全
+  // 词表、上下文分析与候选生成都在 sql-hints.js（纯函数，可单独测试），
+  // 这里只负责渲染下拉框、计算光标位置和键盘交互。
+  const drop = $('#autocomplete');
+  const ac = { items: [], index: 0, start: 0, word: '', open: false };
+
+  function renderDrop(word) {
+    drop.innerHTML = '';
+    ac.items.forEach((item, i) => {
+      const li = document.createElement('li');
+      if (i === ac.index) li.className = 'active';
+
+      const ic = document.createElement('span');
+      ic.className = 'ic';
+      ic.textContent = item.kind === 'table' ? '▤' : item.kind === 'column' ? '▸' : item.kind === 'function' ? 'ƒ' : '⌘';
+
+      const txt = document.createElement('span');
+      txt.className = 'txt';
+      const label = item.label;
+      if (word && label.toLowerCase().startsWith(word.toLowerCase())) {
+        const b = document.createElement('b');
+        b.textContent = label.slice(0, word.length);
+        txt.appendChild(b);
+        txt.appendChild(document.createTextNode(label.slice(word.length)));
+      } else {
+        txt.textContent = label;
+      }
+
+      const kind = document.createElement('span');
+      kind.className = 'kind ' + item.kind;
+      kind.textContent = item.kind;
+
+      li.appendChild(ic);
+      li.appendChild(txt);
+      li.appendChild(kind);
+      li.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        applyItem(i);
+      });
+      drop.appendChild(li);
+    });
+  }
+
+  /** 用镜像 div 复刻 textarea 的排版，算出光标像素位置 */
+  function caretPixelPosition(el, pos) {
+    const style = window.getComputedStyle(el);
+    const mirror = document.createElement('div');
+    mirror.setAttribute('aria-hidden', 'true');
+    mirror.style.position = 'absolute';
+    mirror.style.top = '-9999px';
+    mirror.style.left = '0';
+    mirror.style.visibility = 'hidden';
+    mirror.style.whiteSpace = 'pre-wrap';
+    mirror.style.overflowWrap = 'break-word';
+    mirror.style.width = el.clientWidth + 'px';
+    mirror.style.boxSizing = 'border-box';
+    mirror.style.fontFamily = style.fontFamily;
+    mirror.style.fontSize = style.fontSize;
+    mirror.style.fontWeight = style.fontWeight;
+    mirror.style.letterSpacing = style.letterSpacing;
+    mirror.style.lineHeight = style.lineHeight;
+    mirror.style.padding = style.padding;
+    mirror.style.tabSize = String(settings.tabSize);
+    mirror.textContent = el.value.slice(0, pos);
+    const marker = document.createElement('span');
+    marker.textContent = el.value.slice(pos, pos + 1) || '.';
+    mirror.appendChild(marker);
+    document.body.appendChild(mirror);
+    const top = marker.offsetTop - el.scrollTop;
+    const left = marker.offsetLeft - el.scrollLeft;
+    document.body.removeChild(mirror);
+    return { top, left };
+  }
+
+  function positionDrop() {
+    const rect = sqlInput.getBoundingClientRect();
+    const style = window.getComputedStyle(sqlInput);
+    const line = parseFloat(style.lineHeight) || 20;
+    const caret = caretPixelPosition(sqlInput, ac.start + ac.word.length);
+
+    const width = drop.offsetWidth || 240;
+    const height = drop.offsetHeight || 240;
+    let x = rect.left + caret.left;
+    let y = rect.top + caret.top + line + 2;
+
+    if (x + width > window.innerWidth - 8) x = Math.max(8, window.innerWidth - width - 8);
+    if (y + height > window.innerHeight - 8) y = Math.max(8, rect.top + caret.top - height - 6);
+
+    drop.style.left = Math.round(x) + 'px';
+    drop.style.top = Math.round(y) + 'px';
+  }
+
+  function hideDrop() {
+    ac.open = false;
+    ac.items = [];
+    drop.hidden = true;
+  }
+
+  function computeSuggest(force) {
+    if (sqlInput.selectionStart !== sqlInput.selectionEnd) return hideDrop();
+    if (!settings.autocomplete) return hideDrop();
+    const res = window.LdbHints.suggest(
+      sqlInput.value,
+      sqlInput.selectionStart,
+      (state.schema && state.schema.tables) || [],
+      force
+    );
+    if (!res) return hideDrop();
+
+    ac.items = res.items;
+    ac.start = res.start;
+    ac.word = res.word;
+    ac.index = 0;
+    renderDrop(res.word);
+    drop.hidden = false;
+    ac.open = true;
+    positionDrop();
+  }
+
+  function applyItem(i) {
+    const item = ac.items[i];
+    if (!item) return;
+    const value = sqlInput.value;
+    const before = value.slice(0, ac.start);
+    const after = value.slice(ac.start + ac.word.length);
+    sqlInput.value = before + item.insert + after;
+    let caret = before.length + item.insert.length + item.caretOffset;
+    sqlInput.selectionStart = sqlInput.selectionEnd = caret;
+    hideDrop();
+    sqlInput.focus();
+  }
+
+  function moveActive(delta) {
+    if (!ac.open || ac.items.length === 0) return;
+    ac.index = (ac.index + delta + ac.items.length) % ac.items.length;
+    const items = drop.children;
+    for (let i = 0; i < items.length; i++) items[i].classList.toggle('active', i === ac.index);
+    const active = items[ac.index];
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+  }
+
+  // ------------------------------------------------------------ 通用小工具
+  let toastTimer = null;
+  function toast(message) {
+    let el = document.getElementById('toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'toast';
+      el.className = 'toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = message;
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+  }
+
+  async function copyText(text) {
+    const value = String(text);
+    try {
+      await navigator.clipboard.writeText(value);
+      toast('已复制');
+    } catch (_) {
+      const ta = document.createElement('textarea');
+      ta.value = value;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+        toast('已复制');
+      } catch (e2) {
+        toast('复制失败，请手动选择');
+      }
+      document.body.removeChild(ta);
+    }
+  }
+
+  function cellText(v) {
+    if (v === null || v === undefined) return '';
+    return typeof v === 'boolean' ? (v ? 'true' : 'false') : String(v);
+  }
+
+  function sqlLiteral(v) {
+    if (v === null || v === undefined) return 'NULL';
+    if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+    if (typeof v === 'number') return String(v);
+    return "'" + String(v).replace(/'/g, "''") + "'";
+  }
+
+  // ------------------------------------------------------------ 右键菜单
+  const ctxmenu = $('#ctxmenu');
+
+  function hideMenu() {
+    ctxmenu.hidden = true;
+    ctxmenu.innerHTML = '';
+  }
+
+  function showMenu(event, items) {
+    event.preventDefault();
+    event.stopPropagation();
+    ctxmenu.innerHTML = '';
+    for (const item of items) {
+      const li = document.createElement('li');
+      if (item === '-') {
+        li.className = 'sep';
+        ctxmenu.appendChild(li);
+        continue;
+      }
+      li.textContent = item.label;
+      if (item.danger) li.classList.add('danger');
+      if (item.disabled) {
+        li.classList.add('disabled');
+      } else {
+        li.addEventListener('click', () => {
+          hideMenu();
+          item.action();
+        });
+      }
+      ctxmenu.appendChild(li);
+    }
+    ctxmenu.hidden = false;
+    const rect = ctxmenu.getBoundingClientRect();
+    let x = event.clientX;
+    let y = event.clientY;
+    if (x + rect.width > window.innerWidth - 6) x = Math.max(6, window.innerWidth - rect.width - 6);
+    if (y + rect.height > window.innerHeight - 6) y = Math.max(6, window.innerHeight - rect.height - 6);
+    ctxmenu.style.left = x + 'px';
+    ctxmenu.style.top = y + 'px';
+  }
+
+  document.addEventListener('click', () => hideMenu());
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      hideMenu();
+      for (const id of ['cell-modal', 'danger-modal', 'help-modal', 'insert-modal']) {
+        const el = document.getElementById(id);
+        if (el) el.hidden = true;
+      }
+      return;
+    }
+    // 编辑器外按问号打开快捷键面板
+    if (e.key === '?') {
+      const tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
+        e.preventDefault();
+        $('#help-modal').hidden = false;
+      }
+    }
+    // 选中表格行后按 Delete 删除该行（需要主键）
+    if (e.key === 'Delete' && state.selectedRow) {
+      const tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const target = state.selectedRow;
+      state.selectedRow = null;
+      e.preventDefault();
+      deleteRowByPk(target.table, target.pkName, target.pkValue);
+    }
+  });
+  window.addEventListener('resize', () => hideMenu());
+  document.addEventListener('scroll', () => hideMenu(), true);
+
+  // ------------------------------------------------------------ 表结构编辑
+  let schemaEditing = null;
+  let schemaCreating = false;
+  const EDIT_TIP = '保存时会重建表并迁移数据（单事务，失败自动回滚）。改列名时保留「原列」映射可避免丢数据；' +
+    '新增列如果没有默认值会填 NULL，此时不能勾选「非空」。行数超过 5 万的表请改用导出/导入重建。';
+  const CREATE_TIP = '填写表名和列定义，保存后会执行 CREATE TABLE 创建表。主键列自动非空；' +
+    '需要默认值的列直接填字面量：数字直接填，文本自动加引号，BOOL 填 TRUE/FALSE，留空表示无默认值。';
+
+  function schemaError(message) {
+    $('#schema-error').textContent = message || '';
+    return false;
+  }
+
+  function checkbox(checked) {
+    const el = document.createElement('input');
+    el.type = 'checkbox';
+    el.checked = !!checked;
+    return el;
+  }
+
+  function addSchemaRow(col, source) {
+    const tr = document.createElement('tr');
+    if (!col) tr.classList.add('new');
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'col-name';
+    nameInput.value = col ? col.name : '';
+    nameInput.placeholder = '列名';
+    nameInput.dataset.source = source || '';
+
+    const typeSel = document.createElement('select');
+    for (const t of ['INT', 'REAL', 'TEXT', 'BOOL', 'DATE', 'DATETIME', 'JSON']) {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = t;
+      if (col && col.type === t) opt.selected = true;
+      typeSel.appendChild(opt);
+    }
+
+    const pk = checkbox(col && col.primaryKey);
+    const notNull = checkbox(col && col.notNull);
+    const unique = checkbox(col && col.unique);
+    pk.addEventListener('change', () => {
+      if (pk.checked) notNull.checked = true;
+    });
+
+    const def = document.createElement('input');
+    def.type = 'text';
+    def.className = 'col-default';
+    def.placeholder = '默认值（可空）';
+    def.value = col && col.default !== null && col.default !== undefined ? String(col.default) : '';
+
+    const del = document.createElement('button');
+    del.className = 'col-del';
+    del.textContent = '✕';
+    del.title = '删除此列';
+    del.addEventListener('click', () => tr.remove());
+
+    const nameCell = document.createElement('td');
+    nameCell.appendChild(nameInput);
+
+    const hint = document.createElement('span');
+    hint.className = 'map-hint';
+    nameCell.appendChild(hint);
+    const refreshHint = () => {
+      const src = nameInput.dataset.source;
+      if (src && src.toLowerCase() !== nameInput.value.trim().toLowerCase()) {
+        hint.textContent = `↑ 数据来自原列「${src}」`;
+      } else {
+        hint.textContent = '';
+      }
+    };
+    nameInput.addEventListener('input', refreshHint);
+    refreshHint();
+
+    const wrap = (el) => {
+      const td = document.createElement('td');
+      td.appendChild(el);
+      return td;
+    };
+
+    tr.appendChild(nameCell);
+    tr.appendChild(wrap(typeSel));
+    tr.appendChild(wrap(pk));
+    tr.appendChild(wrap(notNull));
+    tr.appendChild(wrap(unique));
+    tr.appendChild(wrap(def));
+    tr.appendChild(wrap(del));
+    $('#schema-rows').appendChild(tr);
+  }
+
+  function openSchemaEditor(name) {
+    const table = (state.schema.tables || []).find((t) => t.name === name);
+    if (!table) {
+      toast('表结构尚未加载，稍后重试');
+      return;
+    }
+    schemaEditing = name;
+    schemaCreating = false;
+    $('#schema-title').textContent = `编辑表结构 · ${name}（${table.rows} 行）`;
+    $('#schema-tip').textContent = EDIT_TIP;
+    $('#create-name-row').hidden = true;
+    $('#schema-error').textContent = '';
+    $('#schema-rows').innerHTML = '';
+    for (const col of table.columns) addSchemaRow(col, col.name);
+    $('#schema-modal').hidden = false;
+  }
+
+  function suggestTableName() {
+    const names = new Set((state.schema.tables || []).map((t) => t.name.toLowerCase()));
+    if (!names.has('new_table')) return 'new_table';
+    let i = 2;
+    while (names.has('new_table' + i)) i++;
+    return 'new_table' + i;
+  }
+
+  function openCreateTable() {
+    schemaCreating = true;
+    schemaEditing = null;
+    $('#schema-title').textContent = '新建表';
+    $('#schema-tip').textContent = CREATE_TIP;
+    $('#create-name-row').hidden = false;
+    $('#create-name').value = suggestTableName();
+    $('#schema-error').textContent = '';
+    $('#schema-rows').innerHTML = '';
+    // 预置一个自增风格的主键列，可自由修改或删除
+    addSchemaRow({ name: 'id', type: 'INT', primaryKey: true, notNull: true }, '');
+    $('#schema-modal').hidden = false;
+    $('#create-name').focus();
+    $('#create-name').select();
+  }
+
+  function closeSchemaEditor() {
+    $('#schema-modal').hidden = true;
+    $('#create-name-row').hidden = true;
+    schemaEditing = null;
+    schemaCreating = false;
+  }
+
+  /** 按列类型把默认值格式化成 SQL 字面量，非法值直接抛错 */
+  function defaultLiteral(type, raw) {
+    const v = String(raw).trim();
+    if (type === 'INT' || type === 'REAL') {
+      if (!/^-?\d+(\.\d+)?$/.test(v)) throw new Error(`默认值「${v}」不是合法数字`);
+      return v;
+    }
+    if (type === 'BOOL') {
+      const b = v.toLowerCase();
+      if (b === 'true' || b === '1') return 'TRUE';
+      if (b === 'false' || b === '0') return 'FALSE';
+      throw new Error('BOOL 类型的默认值请填 TRUE 或 FALSE');
+    }
+    return sqlLiteral(v);
+  }
+
+  async function saveSchema() {
+    if (!schemaEditing && !schemaCreating) return;
+    const createName = schemaCreating ? $('#create-name').value.trim() : '';
+    if (schemaCreating) {
+      if (!createName) return schemaError('请输入表名');
+      if (/[";`]/.test(createName)) return schemaError('表名不能包含 " ; ` 字符');
+      const dup = (state.schema.tables || []).some((t) => t.name.toLowerCase() === createName.toLowerCase());
+      if (dup) return schemaError(`表「${createName}」已存在`);
+    }
+    const rows = Array.from($('#schema-rows').children);
+    if (rows.length === 0) {
+      schemaError('至少要保留一列');
+      return;
+    }
+
+    const columns = [];
+    const seen = new Set();
+    for (const tr of rows) {
+      const name = tr.querySelector('.col-name').value.trim();
+      if (!name) {
+        schemaError('列名不能为空');
+        return;
+      }
+      if (seen.has(name.toLowerCase())) {
+        schemaError(`列名重复：${name}`);
+        return;
+      }
+      seen.add(name.toLowerCase());
+
+      const boxes = tr.querySelectorAll('input[type=checkbox]');
+      const isPk = boxes[0].checked;
+      columns.push({
+        name,
+        type: tr.querySelector('select').value,
+        primaryKey: isPk,
+        notNull: boxes[1].checked || isPk,
+        unique: boxes[2].checked,
+        default: tr.querySelector('.col-default').value.trim() || null,
+        source: tr.querySelector('.col-name').dataset.source || name,
+      });
+    }
+
+    $('#schema-save').disabled = true;
+    $('#schema-error').textContent = '';
+    try {
+      if (schemaCreating) {
+        const defs = columns.map((c) => {
+          let d = `"${c.name}" ${c.type}`;
+          if (c.primaryKey) d += ' PRIMARY KEY';
+          if (c.notNull) d += ' NOT NULL';
+          if (c.unique) d += ' UNIQUE';
+          if (c.default !== null) d += ' DEFAULT ' + defaultLiteral(c.type, c.default);
+          return d;
+        });
+        await runSql(`CREATE TABLE "${createName}" (\n  ${defs.join(',\n  ')}\n);`);
+        closeSchemaEditor();
+        toast(`已创建表 ${createName}`);
+        await refreshTableList();
+        await openTable(createName, 0);
+        refreshStats();
+      } else {
+        const result = await api(`/api/tables/${encodeURIComponent(schemaEditing)}/alter`, {
+          method: 'POST',
+          body: JSON.stringify({ columns }),
+        });
+        const name = schemaEditing;
+        closeSchemaEditor();
+        toast(`结构已更新，迁移 ${result.rows} 行`);
+        await refreshTableList();
+        await openTable(name, 0);
+        refreshStats();
+      }
+    } catch (err) {
+      schemaError(err.message);
+    } finally {
+      $('#schema-save').disabled = false;
+    }
+  }
+
+  // ------------------------------------------------------------ 数据行编辑
+  async function runSqlSilent(sql, params) {
+    return api('/api/sql', { method: 'POST', body: JSON.stringify({ sql, params }) });
+  }
+
+  async function exportTableCsv(name) {
+    try {
+      const data = await api('/api/tables/' + encodeURIComponent(name) + '?limit=5000');
+      if (!data.rows.length) {
+        toast('表里没有数据');
+        return;
+      }
+      downloadCsv(data.columns, data.rows, `${name}-${new Date().toISOString().slice(0, 10)}.csv`);
+      toast(`已导出 ${data.rows.length} 行`);
+    } catch (err) {
+      toast('导出失败：' + err.message);
+    }
+  }
+
+  async function dropTableConfirmed(name) {
+    if (!window.confirm(`确定删除表 "${name}"？此操作不可撤销。`)) return;
+    try {
+      await api('/api/tables/' + encodeURIComponent(name), { method: 'DELETE' });
+      toast(`已删除表 ${name}`);
+      if (state.page && state.page.table === name) {
+        state.page = null;
+        resultBox.innerHTML = '';
+      }
+      await refreshTableList();
+      refreshStats();
+    } catch (err) {
+      toast('删除失败：' + err.message);
+    }
+  }
+
+  async function deleteRowByPk(table, pkName, pkValue) {
+    if (!window.confirm(`确定删除主键 ${pkName} = ${cellText(pkValue)} 的行？`)) return;
+    try {
+      await runSqlSilent(`DELETE FROM "${table}" WHERE "${pkName}" = ?`, [pkValue]);
+      toast('已删除 1 行');
+      await openTable(table, state.page ? state.page.offset : 0);
+      refreshTableList();
+      refreshStats();
+    } catch (err) {
+      toast('删除失败：' + err.message);
+    }
+  }
+
+  function startCellEdit(td, ctx) {
+    if (td.classList.contains('editing')) return;
+    const { table, column, pkName, pkValue, row, index } = ctx;
+    const original = row[index];
+    const originalText = cellText(original);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = originalText;
+    input.placeholder = '留空表示 NULL';
+    td.classList.add('editing');
+    td.textContent = '';
+    td.appendChild(input);
+    input.focus();
+    input.select();
+
+    let settled = false;
+    const restore = () => {
+      td.classList.remove('editing');
+      cellContent(td, original);
+    };
+
+    const finish = async (commit) => {
+      if (settled) return;
+      settled = true;
+      const raw = input.value;
+      if (!commit || raw === originalText) {
+        restore();
+        return;
+      }
+      const value = raw === '' ? null : raw;
+      td.classList.remove('editing');
+      td.textContent = raw === '' ? 'NULL' : raw;
+      try {
+        await runSqlSilent(`UPDATE "${table}" SET "${column}" = ? WHERE "${pkName}" = ?`, [value, pkValue]);
+        row[index] = value;
+        cellContent(td, value);
+        toast('已保存');
+      } catch (err) {
+        restore();
+        toast('保存失败：' + err.message);
+      }
+    };
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        finish(true);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(false);
+      }
+      e.stopPropagation();
+    });
+    input.addEventListener('blur', () => finish(true));
+  }
+
+  // ------------------------------------------------------------ 交互
+  let running = false;
+
+  /**
+   * 按分号把 SQL 拆成单条语句（后端不支持一次执行多条）。
+   * 跳过字符串/双引号标识符内的分号，剔除 -- 行注释与块注释。
+   */
+  function splitSqlStatements(sql) {
+    const stmts = [];
+    let cur = '';
+    let inSingle = false;
+    let inDouble = false;
+    for (let i = 0; i < sql.length; i++) {
+      const ch = sql[i];
+      const next = sql[i + 1];
+      if (!inSingle && !inDouble && ch === '-' && next === '-') {
+        while (i < sql.length && sql[i] !== '\n') i++;
+        cur += '\n';
+        continue;
+      }
+      if (!inSingle && !inDouble && ch === '/' && next === '*') {
+        i += 2;
+        while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i++;
+        i++;
+        cur += ' ';
+        continue;
+      }
+      if (!inDouble && ch === "'") inSingle = !inSingle;
+      else if (!inSingle && ch === '"') inDouble = !inDouble;
+      cur += ch;
+      if (ch === ';' && !inSingle && !inDouble) {
+        if (cur.trim()) stmts.push(cur.trim());
+        cur = '';
+      }
+    }
+    if (cur.trim()) stmts.push(cur.trim());
+    return stmts;
+  }
+
+  /**
+   * 检测无 WHERE 的 UPDATE / DELETE（整表受影响的高危语句）。
+   * 先剔掉字符串与注释再判断，避免字符串里的关键字误报。
+   */
+  function isDangerousStmt(stmt) {
+    const s = stmt
+      .replace(/'(?:[^']|'')*'/g, "''")
+      .replace(/"(?:[^"]|"")*"/g, '""')
+      .replace(/--[^\n]*/g, ' ')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ');
+    if (/^\s*UPDATE\s+\S+/i.test(s) && !/\bWHERE\b/i.test(s)) return true;
+    if (/^\s*DELETE\s+FROM\s+\S+/i.test(s) && !/\bWHERE\b/i.test(s)) return true;
+    return false;
+  }
+
+  async function execute() {
+    if (running) return;
+    hideDrop();
+    // 选中了文本则只执行选中的部分
+    const selected = sqlInput.value.slice(sqlInput.selectionStart, sqlInput.selectionEnd).trim();
+    const sql = selected || sqlInput.value.trim();
+    if (!sql) return;
+    const statements = splitSqlStatements(sql);
+    const dangerous = statements.filter(isDangerousStmt);
+    if (dangerous.length) {
+      pendingDangerous = statements;
+      $('#danger-sql').textContent = dangerous.join('\n\n');
+      $('#danger-modal').hidden = false;
+      return;
+    }
+    await runStatements(statements);
+  }
+
+  let pendingDangerous = null;
+
+  async function runStatements(statements) {
+    running = true;
+    $('#run').disabled = true;
+    resultBox.innerHTML = '';
+    try {
+      // 逐条执行（后端每次只接受一条语句），出错即停，已执行的结果保留显示
+      for (const stmt of statements) {
+        const result = await runSql(stmt);
+        renderResult(result, resultBox);
+      }
+      state.page = null;
+      renderTables();
+      refreshStats();
+      pushHistory(statements.join('\n'));
+      // 回读表结构变化（DDL 后刷新侧栏）
+      if (statements.some((s) => /CREATE|DROP/i.test(s))) refreshTableList();
+    } catch (err) {
+      resultBox.appendChild(messageCard('err', err.message, err.code ? '错误码 ' + err.code : ''));
+      setStatus(true, '已连接 · 协议 v1');
+    } finally {
+      running = false;
+      $('#run').disabled = false;
+      sqlInput.focus();
+    }
+  }
+
+  async function refreshStats() {
+    try {
+      const info = await api('/api/health');
+      const stats = info.stats || {};
+      $('#p-tables').textContent = stats.tables ?? '-';
+      $('#p-rows').textContent = stats.rows ?? '-';
+      $('#p-bytes').textContent = formatBytes(stats.bytes || 0);
+    } catch (_) { /* 忽略 */ }
+  }
+
+  async function refreshTableList() {
+    try {
+      const [tablesRes, schemaRes] = await Promise.all([api('/api/tables'), api('/api/schema')]);
+      state.tables = tablesRes;
+      state.schema = schemaRes;
+      renderTables();
+    } catch (_) { /* 忽略 */ }
+  }
+
+  /** 打开表并恢复该表上次浏览的页码 */
+  function openTableRemembered(name) {
+    return openTable(name, (state.lastPage && state.lastPage[name]) || 0);
+  }
+
+  async function openTable(name, offset) {
+    const limit = settings.pageSize;
+    try {
+      const data = await api('/api/tables/' + encodeURIComponent(name) + '?limit=' + limit + '&offset=' + offset);
+      state.page = { table: name, offset, limit };
+      state.lastPage[name] = offset;
+      document.body.classList.remove('sidebar-open'); // 移动端选表后收起抽屉
+      renderTables();
+      resultBox.innerHTML = '';
+      const pkCol = data.schema && data.schema.columns ? data.schema.columns.find((c) => c.primaryKey) : null;
+      const meta = pkCol ? { table: name, pk: pkCol.name } : null;
+      const body = data.rows.length
+        ? makeTable(data.columns, data.rows, meta)
+        : Object.assign(document.createElement('div'), { className: 'msg ok', textContent: '（该表暂无数据）' });
+
+      const pager = document.createElement('div');
+      pager.className = 'pager';
+      const info = document.createElement('span');
+      info.textContent = data.total + ' 行 · 显示 ' + (offset + 1) + '–' + (offset + data.rows.length);
+      const right = document.createElement('div');
+      right.className = 'right';
+      const prev = document.createElement('button');
+      prev.textContent = '‹ 上一页';
+      prev.disabled = offset <= 0;
+      prev.onclick = () => openTable(name, Math.max(0, offset - limit));
+      const next = document.createElement('button');
+      next.textContent = '下一页 ›';
+      next.disabled = offset + limit >= data.total;
+      next.onclick = () => openTable(name, offset + limit);
+      right.appendChild(prev);
+      right.appendChild(next);
+      pager.appendChild(info);
+      pager.appendChild(right);
+
+      const editBtn = document.createElement('button');
+      editBtn.textContent = '编辑结构';
+      editBtn.addEventListener('click', () => openSchemaEditor(name));
+      const reloadBtn = document.createElement('button');
+      reloadBtn.textContent = '刷新';
+      reloadBtn.addEventListener('click', () => openTable(name, offset));
+
+      // 可视化插入一行
+      const insertRowBtn = document.createElement('button');
+      insertRowBtn.textContent = '+ 插入行';
+      if (data.schema) insertRowBtn.addEventListener('click', () => openInsertRow(name, data.schema));
+
+      // 当页筛选：只对当前已加载的行做本地过滤
+      const filterInput = document.createElement('input');
+      filterInput.id = 'filter-input';
+      filterInput.type = 'text';
+      filterInput.placeholder = '当页筛选…';
+      const baseInfo = info.textContent;
+      filterInput.addEventListener('input', () => {
+        const q = filterInput.value.trim().toLowerCase();
+        const tbody = body.querySelector('tbody');
+        if (!tbody) return;
+        let shown = 0;
+        for (const tr of tbody.children) {
+          const hit = !q || tr.textContent.toLowerCase().includes(q);
+          tr.style.display = hit ? '' : 'none';
+          if (hit) shown++;
+        }
+        info.textContent = q ? `筛选 ${shown}/${data.rows.length} 行 · ${baseInfo}` : baseInfo;
+      });
+
+      resultBox.appendChild(
+        card([{ text: 'TABLE', className: 'tag' }, { text: name }], body, pager, [filterInput, insertRowBtn, editBtn, reloadBtn])
+      );
+
+      if (!pkCol) {
+        const warn = document.createElement('div');
+        warn.className = 'empty-hint';
+        warn.textContent = '该表没有主键，行数据不可在界面里编辑（双击无效），但仍可用 SQL 修改。';
+        resultBox.appendChild(warn);
+      }
+
+      if (data.schema) {
+        const details = document.createElement('details');
+        details.className = 'schema-panel';
+        const summary = document.createElement('summary');
+        summary.textContent = `表结构 · ${data.schema.columns.length} 列 · ${data.schema.indexes.length} 个索引`;
+        details.appendChild(summary);
+        details.appendChild(
+          makeTable(
+            ['列名', '类型', '主键', '非空', '唯一', '默认值'],
+            data.schema.columns.map((c) => [
+              c.name,
+              c.type,
+              c.primaryKey ? '是' : '',
+              c.notNull ? '是' : '',
+              c.unique ? '是' : '',
+              c.default === null || c.default === undefined ? '' : String(c.default),
+            ])
+          )
+        );
+        if (data.schema.indexes.length > 0) {
+          const idxWrap = document.createElement('div');
+          idxWrap.style.marginTop = '10px';
+          idxWrap.appendChild(
+            makeTable(
+              ['索引名', '列', '唯一'],
+              data.schema.indexes.map((i) => [i.name, i.columns.join(', '), i.unique ? '是' : ''])
+            )
+          );
+          details.appendChild(idxWrap);
+        }
+        resultBox.appendChild(details);
+      }
+    } catch (err) {
+      resultBox.innerHTML = '';
+      resultBox.appendChild(messageCard('err', err.message, ''));
+    }
+  }
+
+  // ------------------------------------------------------------ 事件绑定
+  $('#schema-add').addEventListener('click', () => addSchemaRow(null, ''));
+  $('#schema-save').addEventListener('click', saveSchema);
+  $('#schema-cancel').addEventListener('click', closeSchemaEditor);
+  $('#schema-close').addEventListener('click', closeSchemaEditor);
+  $('#schema-modal').addEventListener('mousedown', (e) => {
+    if (e.target.id === 'schema-modal') closeSchemaEditor();
+  });
+  $('#schema-modal').addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      saveSchema();
+    }
+  });
+
+  $('#run').addEventListener('click', execute);
+
+  // ------------------------------------------------------------ SQL 历史
+  const historySel = $('#history');
+  let historyItems = [];
+  try {
+    historyItems = JSON.parse(localStorage.getItem('ldb_history') || '[]');
+    if (!Array.isArray(historyItems)) historyItems = [];
+  } catch (_) { historyItems = []; }
+
+  function renderHistory() {
+    historySel.innerHTML = '<option value="">历史</option>';
+    for (const s of historyItems) {
+      const opt = document.createElement('option');
+      opt.value = s;
+      const firstLine = s.split('\n').find((l) => l.trim() && !l.trim().startsWith('--')) || s;
+      opt.textContent = firstLine.trim().slice(0, 60) + (firstLine.trim().length > 60 ? '…' : '');
+      historySel.appendChild(opt);
+    }
+  }
+
+  function pushHistory(sql) {
+    historyItems = historyItems.filter((s) => s !== sql);
+    historyItems.unshift(sql);
+    if (historyItems.length > settings.historyMax) historyItems.length = settings.historyMax;
+    try { localStorage.setItem('ldb_history', JSON.stringify(historyItems)); } catch (_) { /* 忽略 */ }
+    renderHistory();
+  }
+
+  renderHistory();
+  historySel.addEventListener('change', () => {
+    const v = historySel.value;
+    if (!v) return;
+    expandEditor();
+    sqlInput.value = v;
+    historySel.selectedIndex = 0;
+    sqlInput.focus();
+  });
+
+  // ------------------------------------------------------------ 编辑器折叠
+  const editorSection = document.querySelector('.editor');
+  $('#editor-toggle').addEventListener('click', () => editorSection.classList.toggle('collapsed'));
+
+  $('#clear').addEventListener('click', () => {
+    sqlInput.value = '';
+    resultBox.innerHTML = '';
+    resultBox.appendChild(welcomePanel);
+    sqlInput.focus();
+  });
+  $('#sample').addEventListener('click', insertSample);
+  $('#refresh').addEventListener('click', refreshTables);
+  $('#new-table').addEventListener('click', openCreateTable);
+  $('#w-sample').addEventListener('click', () => {
+    insertSample();
+    execute();
+  });
+  $('#w-open').addEventListener('click', () => {
+    const list = state.tables && state.tables.tables ? state.tables.tables : [];
+    if (list.length) openTableRemembered(list[0].name);
+    else toast('还没有表，先插入示例或运行 CREATE TABLE');
+  });
+  $('#menu-btn').addEventListener('click', () => {
+    document.body.classList.toggle('sidebar-open');
+  });
+
+  sqlInput.addEventListener('keydown', (e) => {
+    // 补全面板打开时优先接管方向键 / Tab / Enter / Esc
+    if (ac.open) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        moveActive(1);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveActive(-1);
+        return;
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        applyItem(ac.index);
+        return;
+      }
+      if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        e.preventDefault();
+        applyItem(ac.index);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideDrop();
+        return;
+      }
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      execute();
+      return;
+    }
+    if ((e.ctrlKey && (e.key === ' ' || e.code === 'Space')) || (e.altKey && e.key === '/')) {
+      e.preventDefault();
+      computeSuggest(true);
+      return;
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const start = sqlInput.selectionStart;
+      const end = sqlInput.selectionEnd;
+      const spaces = ' '.repeat(settings.tabSize);
+      sqlInput.value = sqlInput.value.slice(0, start) + spaces + sqlInput.value.slice(end);
+      sqlInput.selectionStart = sqlInput.selectionEnd = start + settings.tabSize;
+      hideDrop();
+    }
+  });
+
+  sqlInput.addEventListener('input', () => computeSuggest(false));
+  sqlInput.addEventListener('click', () => hideDrop());
+  sqlInput.addEventListener('blur', () => setTimeout(hideDrop, 100));
+  sqlInput.addEventListener('scroll', () => hideDrop());
+  window.addEventListener('resize', () => hideDrop());
+
+  // ------------------------------------------------------------ 设置
+  const DEFAULT_SETTINGS = {
+    pageSize: 50,        // 每页行数
+    zebra: false,        // 斑马纹
+    theme: 'dark',       // 主题
+    editorFont: 13,      // 编辑器字号 px
+    editorHeight: 148,   // 编辑器高度 px
+    tabSize: 2,          // Tab 空格数
+    autocomplete: true,  // 自动补全
+    historyMax: 50,      // 历史保留条数
+  };
+  let settings = loadSettings();
+
+  function loadSettings() {
+    try {
+      return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem('ldb_settings') || '{}'));
+    } catch (_) {
+      return Object.assign({}, DEFAULT_SETTINGS);
+    }
+  }
+
+  function saveSettings() {
+    try { localStorage.setItem('ldb_settings', JSON.stringify(settings)); } catch (_) { /* 忽略 */ }
+    applySettings();
+  }
+
+  function applySettings() {
+    sqlInput.style.fontSize = settings.editorFont + 'px';
+    sqlInput.style.height = settings.editorHeight + 'px';
+    sqlInput.style.tabSize = settings.tabSize;
+    document.body.classList.toggle('zebra', !!settings.zebra);
+    document.body.classList.toggle('light', settings.theme === 'light');
+    if (historyItems.length > settings.historyMax) {
+      historyItems.length = settings.historyMax;
+      try { localStorage.setItem('ldb_history', JSON.stringify(historyItems)); } catch (_) { /* 忽略 */ }
+      renderHistory();
+    }
+  }
+
+  function clampNum(v, min, max, def) {
+    v = parseInt(v, 10);
+    if (isNaN(v)) return def;
+    return Math.min(max, Math.max(min, v));
+  }
+
+  const settingsModal = $('#settings-modal');
+
+  function fillServerInfo() {
+    const box = $('#server-info');
+    api('/api/health').then((info) => {
+      const s = info.stats || {};
+      const up = info.uptime || 0;
+      const fmtUp = up >= 3600
+        ? Math.floor(up / 3600) + ' 时 ' + Math.floor((up % 3600) / 60) + ' 分'
+        : up >= 60 ? Math.floor(up / 60) + ' 分 ' + (up % 60) + ' 秒' : up + ' 秒';
+      const items = [
+        ['状态', info.status],
+        ['服务', info.server],
+        ['协议版本', 'LDBP/' + info.protocol],
+        ['运行时长', fmtUp],
+        ['数据目录', s.dir || '—'],
+        ['页大小', (s.pageSize || 0) + ' B'],
+        ['数据表', s.tables ?? '—'],
+        ['总行数', s.rows ?? '—'],
+        ['存储占用', formatBytes(s.bytes || 0)],
+        ['WAL 大小', formatBytes(s.walBytes || 0) + ' / ' + formatBytes(s.walLimit || 0)],
+        ['累计查询', info.queries ?? '—'],
+        ['当前连接', info.connections ?? '—'],
+      ];
+      box.innerHTML = '';
+      for (const [k, v] of items) {
+        const cell = document.createElement('div');
+        const kk = document.createElement('span');
+        kk.className = 'k';
+        kk.textContent = k;
+        const vv = document.createElement('span');
+        vv.className = 'v';
+        vv.textContent = String(v);
+        vv.title = String(v);
+        cell.appendChild(kk);
+        cell.appendChild(vv);
+        box.appendChild(cell);
+      }
+    }).catch((err) => {
+      box.textContent = '无法获取服务器信息：' + err.message;
+    });
+  }
+
+  function openSettings() {
+    $('#set-page-size').value = settings.pageSize;
+    $('#set-theme').value = settings.theme;
+    $('#set-zebra').checked = !!settings.zebra;
+    $('#set-editor-font').value = settings.editorFont;
+    $('#set-editor-height').value = settings.editorHeight;
+    $('#set-tab-size').value = String(settings.tabSize);
+    $('#set-autocomplete').checked = !!settings.autocomplete;
+    $('#set-history-max').value = settings.historyMax;
+    fillServerInfo();
+    settingsModal.hidden = false;
+  }
+
+  $('#open-settings').addEventListener('click', openSettings);
+  $('#settings-close').addEventListener('click', () => { settingsModal.hidden = true; });
+  $('#settings-done').addEventListener('click', () => { settingsModal.hidden = true; });
+  $('#settings-reset').addEventListener('click', () => {
+    settings = Object.assign({}, DEFAULT_SETTINGS);
+    saveSettings();
+    openSettings();
+    toast('已恢复默认设置');
+  });
+  settingsModal.addEventListener('mousedown', (e) => {
+    if (e.target === settingsModal) settingsModal.hidden = true;
+  });
+
+  $('#set-page-size').addEventListener('change', (e) => {
+    settings.pageSize = clampNum(e.target.value, 10, 500, 50);
+    e.target.value = settings.pageSize;
+    saveSettings();
+  });
+  $('#set-zebra').addEventListener('change', (e) => {
+    settings.zebra = e.target.checked;
+    saveSettings();
+  });
+  $('#set-theme').addEventListener('change', (e) => {
+    settings.theme = e.target.value === 'light' ? 'light' : 'dark';
+    saveSettings();
+  });
+  $('#set-editor-font').addEventListener('change', (e) => {
+    settings.editorFont = clampNum(e.target.value, 11, 22, 13);
+    e.target.value = settings.editorFont;
+    saveSettings();
+  });
+  $('#set-editor-height').addEventListener('change', (e) => {
+    settings.editorHeight = clampNum(e.target.value, 100, 600, 148);
+    e.target.value = settings.editorHeight;
+    saveSettings();
+  });
+  $('#set-tab-size').addEventListener('change', (e) => {
+    settings.tabSize = clampNum(e.target.value, 2, 8, 2);
+    saveSettings();
+  });
+  $('#set-autocomplete').addEventListener('change', (e) => {
+    settings.autocomplete = e.target.checked;
+    saveSettings();
+  });
+  $('#set-history-max').addEventListener('change', (e) => {
+    settings.historyMax = clampNum(e.target.value, 10, 200, 50);
+    e.target.value = settings.historyMax;
+    saveSettings();
+  });
+  $('#clear-history').addEventListener('click', () => {
+    historyItems = [];
+    try { localStorage.removeItem('ldb_history'); } catch (_) { /* 忽略 */ }
+    renderHistory();
+    toast('历史记录已清空');
+  });
+
+  // ------------------------------------------------------------ 备份与恢复
+  const backupModal = $('#backup-modal');
+  let restoreData = null;
+
+  $('#open-backup').addEventListener('click', () => { backupModal.hidden = false; });
+  $('#backup-close').addEventListener('click', () => { backupModal.hidden = true; });
+  backupModal.addEventListener('mousedown', (e) => {
+    if (e.target === backupModal) backupModal.hidden = true;
+  });
+
+  function logLine(box, text, cls) {
+    box.hidden = false;
+    const div = document.createElement('div');
+    if (cls) div.className = cls;
+    div.textContent = text;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  /** 按 1000 行分页拉取一张表的全部数据 */
+  async function fetchAllRows(name) {
+    const rows = [];
+    const pageSize = 1000;
+    let offset = 0;
+    for (;;) {
+      const d = await api('/api/tables/' + encodeURIComponent(name) + '?limit=' + pageSize + '&offset=' + offset);
+      rows.push(...d.rows);
+      if (!d.rows.length || rows.length >= d.total) break;
+      offset += d.rows.length;
+    }
+    return rows;
+  }
+
+  $('#backup-run').addEventListener('click', async () => {
+    const btn = $('#backup-run');
+    const box = $('#backup-progress');
+    btn.disabled = true;
+    box.innerHTML = '';
+    try {
+      await refreshTableList();
+      const tables = state.schema.tables || [];
+      if (!tables.length) {
+        toast('没有可备份的表');
+        return;
+      }
+      const snap = {
+        format: 'littledb-backup',
+        version: 1,
+        created: new Date().toISOString(),
+        totalRows: 0,
+        tables: [],
+      };
+      for (const t of tables) {
+        logLine(box, `正在备份 ${t.name}（${t.rows} 行）…`);
+        const rows = await fetchAllRows(t.name);
+        snap.tables.push({
+          name: t.name,
+          schema: { columns: t.columns, indexes: t.indexes || [] },
+          rows,
+        });
+        snap.totalRows += rows.length;
+        logLine(box, `✔ ${t.name}：${rows.length} 行`, 'ok');
+      }
+      const blob = new Blob([JSON.stringify(snap)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'littledb-backup-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      logLine(box, `备份完成：${tables.length} 张表，共 ${snap.totalRows} 行，文件已开始下载`, 'ok');
+    } catch (err) {
+      logLine(box, '备份失败：' + err.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  /** 由快照里的列定义生成 CREATE TABLE 语句 */
+  function createTableSqlFromSchema(name, schema) {
+    const defs = (schema.columns || []).map((c) => {
+      // DECIMAL 必须带标度，否则重建后回到默认标度（精度丢失/写入报错）
+      const typeText = c.type === 'DECIMAL' && c.scale !== undefined && c.scale !== null
+        ? `DECIMAL(38,${Number(c.scale)})`
+        : c.type;
+      let d = `"${c.name}" ${typeText}`;
+      if (c.primaryKey) d += ' PRIMARY KEY';
+      if (c.notNull) d += ' NOT NULL';
+      if (c.unique) d += ' UNIQUE';
+      if (c.default !== null && c.default !== undefined) d += ' DEFAULT ' + defaultLiteral(c.type, String(c.default));
+      return d;
+    });
+    return `CREATE TABLE "${name}" (\n  ${defs.join(',\n  ')}\n);`;
+  }
+
+  $('#restore-file').addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    restoreData = null;
+    $('#restore-run').disabled = true;
+    const box = $('#restore-info');
+    box.innerHTML = '';
+    if (!file) {
+      box.hidden = true;
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (data.format !== 'littledb-backup' || !Array.isArray(data.tables)) {
+          throw new Error('不是有效的 LittleDB 快照文件');
+        }
+        restoreData = data;
+        logLine(box, `快照时间：${data.created || '未知'}`);
+        for (const t of data.tables) logLine(box, `${t.name}：${(t.rows || []).length} 行`);
+        logLine(box, `解析成功：共 ${data.tables.length} 张表，可以开始恢复`, 'ok');
+        $('#restore-run').disabled = false;
+      } catch (err) {
+        logLine(box, '读取失败：' + err.message, 'err');
+      }
+    };
+    reader.onerror = () => logLine(box, '读取文件失败', 'err');
+    reader.readAsText(file);
+  });
+
+  $('#restore-run').addEventListener('click', async () => {
+    if (!restoreData) return;
+    const overwrite = $('#restore-overwrite').checked;
+    const totalRows = restoreData.tables.reduce((s, t) => s + (t.rows || []).length, 0);
+    if (!window.confirm(
+      `确定恢复 ${restoreData.tables.length} 张表（共 ${totalRows} 行）？\n` +
+      (overwrite ? '注意：同名表会先删除再重建！' : '同名表将被跳过。')
+    )) return;
+    const btn = $('#restore-run');
+    const box = $('#restore-progress');
+    btn.disabled = true;
+    box.innerHTML = '';
+    let failed = 0;
+    // 覆盖模式下先把将被覆盖的表抓一份快照，恢复完成后自动下载
+    const preBackup = { format: 'littledb-backup', version: 1, created: new Date().toISOString(), totalRows: 0, tables: [] };
+    try {
+      await refreshTableList();
+      for (const t of restoreData.tables) {
+        try {
+          const exists = (state.schema.tables || []).some((x) => x.name.toLowerCase() === t.name.toLowerCase());
+          if (exists && !overwrite) {
+            logLine(box, `↷ 跳过 ${t.name}（同名表已存在）`, 'warn');
+            continue;
+          }
+          if (exists) {
+            const cur = (state.schema.tables || []).find((x) => x.name.toLowerCase() === t.name.toLowerCase());
+            try {
+              const rows = await fetchAllRows(cur.name);
+              preBackup.tables.push({ name: cur.name, schema: { columns: cur.columns, indexes: cur.indexes || [] }, rows });
+              preBackup.totalRows += rows.length;
+              logLine(box, `已暂存 ${cur.name} 覆盖前的 ${rows.length} 行数据`);
+            } catch (perr) {
+              logLine(box, `⚠ ${cur.name} 覆盖前数据暂存失败：${perr.message}`, 'warn');
+            }
+            await runSql(`DROP TABLE "${t.name}";`);
+            logLine(box, `已删除旧表 ${t.name}`);
+          }
+          await runSql(createTableSqlFromSchema(t.name, t.schema));
+          // 备份里带着索引定义，恢复时必须重放：旧实现只建表不建索引，
+          // 恢复后普通索引（以及 CREATE UNIQUE INDEX 建的唯一约束）会静默消失。
+          // 主键(__pk__)与列级 UNIQUE(uq_*) 由列定义自动生成，跳过。
+          let restoredIndexes = 0;
+          for (const ix of (t.schema.indexes || [])) {
+            if (!ix || !ix.name || ix.primary || ix.implicit) { continue; }
+            if (!Array.isArray(ix.columns) || ix.columns.length === 0) { continue; }
+            const ixCols = ix.columns.map((c) => `"${c}"`).join(', ');
+            await runSqlSilent(
+              `CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS "${ix.name}" ON "${t.name}" (${ixCols});`
+            );
+            restoredIndexes++;
+          }
+          if (restoredIndexes) {
+            logLine(box, `已重建 ${restoredIndexes} 个索引（${t.name}）`);
+          }
+          const cols = (t.schema.columns || []).map((c) => `"${c.name}"`);
+          const rows = t.rows || [];
+          const BATCH = 100;
+          for (let i = 0; i < rows.length; i += BATCH) {
+            const chunk = rows.slice(i, i + BATCH);
+            const valuesSql = chunk.map(() => '(' + cols.map(() => '?').join(',') + ')').join(',');
+            const params = [];
+            for (const r of chunk) for (const v of r) params.push(v === undefined ? null : v);
+            await runSqlSilent(`INSERT INTO "${t.name}" (${cols.join(', ')}) VALUES ${valuesSql};`, params);
+          }
+          logLine(box, `✔ ${t.name}：已恢复 ${rows.length} 行`, 'ok');
+        } catch (err) {
+          failed++;
+          logLine(box, `✖ ${t.name}：${err.message}`, 'err');
+        }
+      }
+      await refreshTableList();
+      refreshStats();
+      if (preBackup.tables.length) {
+        const blob = new Blob([JSON.stringify(preBackup)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'littledb-pre-restore-backup-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        logLine(box, `已导出覆盖前快照（${preBackup.tables.length} 张表，${preBackup.totalRows} 行）`, 'ok');
+      }
+      logLine(box, failed ? `恢复结束，${failed} 张表失败，详见上方日志` : `恢复完成：${restoreData.tables.length} 张表，共 ${totalRows} 行`, failed ? 'err' : 'ok');
+      toast(failed ? '恢复完成，但有失败项，请查看日志' : '恢复完成');
+    } catch (err) {
+      logLine(box, '恢复中断：' + err.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ------------------------------------------------------------ SQL 格式化
+  function formatSql(sql) {
+    const strings = [];
+    // 字符串字面量先摘出来，避免内容里的关键字被误处理
+    let s = sql.replace(/'(?:[^']|'')*'/g, (m) => '\x01' + (strings.push(m) - 1) + '\x01');
+    s = s.replace(/\s+/g, ' ').trim();
+    // 逗号只在括号外换行缩进（不破坏函数参数）
+    let out = '';
+    let depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === '(') depth++;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      if (ch === ',' && depth === 0) {
+        out += ',\n  ';
+        continue;
+      }
+      out += ch;
+    }
+    s = out;
+    // 多行 VALUES 一行一条
+    s = s.replace(/\),\s*\(/g, '),\n(');
+    // 主要子句换行
+    s = s.replace(/\b(FROM|WHERE|SET|VALUES|GROUP BY|ORDER BY|HAVING|LIMIT|OFFSET|UNION ALL|UNION|LEFT JOIN|RIGHT JOIN|INNER JOIN|CROSS JOIN|OUTER JOIN|FULL JOIN|JOIN)\b/gi, (m) => '\n' + m.toUpperCase());
+    // 连接词缩进
+    s = s.replace(/\b(AND|OR|ON)\b/gi, (m) => '\n  ' + m.toUpperCase());
+    s = s.replace(/\n{2,}/g, '\n');
+    // 还原字符串
+    s = s.replace(/\x01(\d+)\x01/g, (m, i) => strings[+i]);
+    return s;
+  }
+
+  $('#format').addEventListener('click', () => {
+    const sel = sqlInput.value.slice(sqlInput.selectionStart, sqlInput.selectionEnd);
+    const target = sel.trim() ? sel : sqlInput.value;
+    if (!target.trim()) return;
+    const formatted = formatSql(target);
+    if (sel.trim()) {
+      const start = sqlInput.selectionStart;
+      sqlInput.value = sqlInput.value.slice(0, start) + formatted + sqlInput.value.slice(sqlInput.selectionEnd);
+      sqlInput.selectionStart = start;
+      sqlInput.selectionEnd = start + formatted.length;
+    } else {
+      sqlInput.value = formatted;
+    }
+    expandEditor();
+    saveDraftNow();
+    sqlInput.focus();
+  });
+
+  // ------------------------------------------------------------ 编辑器草稿自动保存
+  let draftTimer = null;
+  function saveDraftNow() {
+    try { localStorage.setItem('ldb_draft', sqlInput.value); } catch (_) { /* 忽略 */ }
+  }
+  sqlInput.addEventListener('input', () => {
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(saveDraftNow, 400);
+  });
+  $('#clear').addEventListener('click', saveDraftNow);
+
+  // ------------------------------------------------------------ 单元格内容查看器
+  const cellModal = $('#cell-modal');
+
+  function openCellViewer(colName, v) {
+    $('#cell-modal-title').textContent = '列：' + colName;
+    let text = cellText(v);
+    if (typeof v === 'string') {
+      const t = v.trim();
+      if (t.startsWith('{') || t.startsWith('[')) {
+        try { text = JSON.stringify(JSON.parse(t), null, 2); } catch (_) { /* 不是 JSON 就原样显示 */ }
+      }
+    }
+    $('#cell-pre').textContent = text;
+    cellModal.hidden = false;
+  }
+
+  $('#cell-close').addEventListener('click', () => { cellModal.hidden = true; });
+  $('#cell-done').addEventListener('click', () => { cellModal.hidden = true; });
+  $('#cell-copy').addEventListener('click', () => copyText($('#cell-pre').textContent));
+  cellModal.addEventListener('mousedown', (e) => {
+    if (e.target === cellModal) cellModal.hidden = true;
+  });
+
+  // ------------------------------------------------------------ 可视化插入行
+  const insertModal = $('#insert-modal');
+  let insertCtx = null;
+
+  function openInsertRow(name, schema) {
+    insertCtx = { name, schema };
+    $('#insert-title').textContent = `插入行 · ${name}`;
+    $('#insert-error').textContent = '';
+    const fields = $('#insert-fields');
+    fields.innerHTML = '';
+    for (const c of schema.columns) {
+      const row = document.createElement('div');
+      row.className = 'insert-field';
+      const label = document.createElement('label');
+      label.textContent = c.name + (c.primaryKey ? ' 🔑' : c.notNull ? ' *' : '');
+      label.title = `${c.type}${c.primaryKey ? ' · 主键' : ''}${c.notNull ? ' · 非空' : ''}${c.unique ? ' · 唯一' : ''}`;
+      let input;
+      if (c.type === 'BOOL') {
+        input = document.createElement('select');
+        for (const [v, text] of [['', '（NULL）'], ['TRUE', 'TRUE'], ['FALSE', 'FALSE']]) {
+          const opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = text;
+          input.appendChild(opt);
+        }
+      } else {
+        input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = c.type + (c.notNull ? '（必填）' : '（可空）');
+      }
+      input.dataset.col = c.name;
+      row.appendChild(label);
+      row.appendChild(input);
+      fields.appendChild(row);
+    }
+    insertModal.hidden = false;
+    const first = fields.querySelector('input, select');
+    if (first) first.focus();
+  }
+
+  function closeInsertModal() {
+    insertModal.hidden = true;
+    insertCtx = null;
+  }
+
+  $('#insert-close').addEventListener('click', closeInsertModal);
+  $('#insert-cancel').addEventListener('click', closeInsertModal);
+  insertModal.addEventListener('mousedown', (e) => {
+    if (e.target === insertModal) closeInsertModal();
+  });
+
+  $('#insert-save').addEventListener('click', async () => {
+    if (!insertCtx) return;
+    const { name, schema } = insertCtx;
+    const errBox = $('#insert-error');
+    errBox.textContent = '';
+    const cols = [];
+    const params = [];
+    for (const c of schema.columns) {
+      const input = $('#insert-fields').querySelector(`[data-col="${c.name}"]`);
+      if (!input) continue;
+      const raw = input.value.trim();
+      if (raw === '') {
+        if (c.notNull && !c.primaryKey && (c.default === null || c.default === undefined)) {
+          errBox.textContent = `列「${c.name}」为非空且无默认值，必须填写`;
+          return;
+        }
+        continue; // 留空且允许 NULL：直接不写该列，走表默认值
+      }
+      if (c.type === 'INT' || c.type === 'REAL') {
+        if (isNaN(Number(raw))) {
+          errBox.textContent = `列「${c.name}」需要数字`;
+          return;
+        }
+        params.push(Number(raw));
+      } else if (c.type === 'BOOL') {
+        params.push(raw.toUpperCase() === 'TRUE');
+      } else {
+        params.push(raw);
+      }
+      cols.push(c.name);
+    }
+    if (!cols.length) {
+      errBox.textContent = '至少要填写一列的值';
+      return;
+    }
+    try {
+      await runSqlSilent(
+        `INSERT INTO "${name}" (${cols.map((c) => `"${c}"`).join(', ')}) VALUES (${cols.map(() => '?').join(', ')});`,
+        params
+      );
+      closeInsertModal();
+      toast('已插入 1 行');
+      await openTable(name, state.page ? state.page.offset : 0);
+      refreshTableList();
+      refreshStats();
+    } catch (err) {
+      errBox.textContent = err.message;
+    }
+  });
+
+  // ------------------------------------------------------------ 危险语句确认
+  const dangerModal = $('#danger-modal');
+
+  $('#danger-ok').addEventListener('click', () => {
+    dangerModal.hidden = true;
+    const stmts = pendingDangerous;
+    pendingDangerous = null;
+    if (stmts) runStatements(stmts);
+  });
+  $('#danger-cancel').addEventListener('click', () => {
+    dangerModal.hidden = true;
+    pendingDangerous = null;
+  });
+  dangerModal.addEventListener('mousedown', (e) => {
+    if (e.target === dangerModal) {
+      dangerModal.hidden = true;
+      pendingDangerous = null;
+    }
+  });
+
+  // ------------------------------------------------------------ 快捷键帮助
+  const helpModal = $('#help-modal');
+  $('#help-close').addEventListener('click', () => { helpModal.hidden = true; });
+  helpModal.addEventListener('mousedown', (e) => {
+    if (e.target === helpModal) helpModal.hidden = true;
+  });
+
+  // ------------------------------------------------------------ 连接监控与自动重连
+  async function checkConnection() {
+    try {
+      await api('/api/health');
+      if (state.offline) {
+        state.offline = false;
+        setStatus(true, '已连接 · 协议 v1');
+        toast('连接已恢复');
+        refreshTables();
+      }
+    } catch (err) {
+      if (!state.offline) {
+        state.offline = true;
+        setStatus(false, '连接断开，每 10 秒自动重试…');
+      }
+    }
+  }
+
+  // 启动
+  try {
+    const draft = localStorage.getItem('ldb_draft');
+    if (draft && !sqlInput.value) sqlInput.value = draft;
+  } catch (_) { /* 忽略 */ }
+  applySettings();
+  refreshTables();
+  setInterval(refreshStats, 15000);
+  setInterval(checkConnection, 10000);
+})();
+</script>
+</body>
+</html>

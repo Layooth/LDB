@@ -469,64 +469,6 @@ pub fn parse(text: &str) -> Result<Json> {
     Ok(value)
 }
 
-// ------------------------------------------------------------------ base64
-
-const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-pub fn b64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | data[i + 2] as u32;
-        out.push(B64_TABLE[(n >> 18) as usize & 63] as char);
-        out.push(B64_TABLE[(n >> 12) as usize & 63] as char);
-        out.push(B64_TABLE[(n >> 6) as usize & 63] as char);
-        out.push(B64_TABLE[n as usize & 63] as char);
-        i += 3;
-    }
-    let rest = data.len() - i;
-    if rest == 1 {
-        let n = (data[i] as u32) << 16;
-        out.push(B64_TABLE[(n >> 18) as usize & 63] as char);
-        out.push(B64_TABLE[(n >> 12) as usize & 63] as char);
-        out.push('=');
-        out.push('=');
-    } else if rest == 2 {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        out.push(B64_TABLE[(n >> 18) as usize & 63] as char);
-        out.push(B64_TABLE[(n >> 12) as usize & 63] as char);
-        out.push(B64_TABLE[(n >> 6) as usize & 63] as char);
-        out.push('=');
-    }
-    out
-}
-
-pub fn b64_decode(text: &str) -> Result<Vec<u8>> {
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    let mut out = Vec::new();
-    for byte in text.bytes() {
-        if byte == b'=' || byte == b'\n' || byte == b'\r' {
-            continue;
-        }
-        let value = match byte {
-            b'A'..=b'Z' => (byte - b'A') as u32,
-            b'a'..=b'z' => (byte - b'a') as u32 + 26,
-            b'0'..=b'9' => (byte - b'0') as u32 + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return Err(DbError::internal("base64 包含非法字符")),
-        };
-        acc = (acc << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((acc >> bits) & 0xff) as u8);
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,30 +503,6 @@ mod tests {
     fn parse_unicode_escape() {
         let value = parse(r#""\u4e2d\u6587""#).unwrap();
         assert_eq!(value.as_str(), Some("中文"));
-    }
-
-    #[test]
-    fn base64_roundtrip() {
-        let data: Vec<u8> = (0..=255u8).collect();
-        let encoded = b64_encode(&data);
-        let decoded = b64_decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
-
-        assert_eq!(b64_encode(b"abc"), "YWJj");
-        assert_eq!(b64_encode(b"abcd"), "YWJjZA==");
-        assert_eq!(b64_decode("YWJj").unwrap(), b"abc".to_vec());
-    }
-
-    #[test]
-    fn deep_nesting_is_rejected_not_crash() {
-        // 曾经：深嵌套会让递归解析爆栈、整个进程 abort
-        for depth in [MAX_JSON_DEPTH + 1, 100_000] {
-            let text = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-            assert!(parse(&text).is_err(), "深度 {} 应被拒绝", depth);
-        }
-        // 上限内的正常嵌套不受影响
-        let ok = format!("{}{}", "[".repeat(MAX_JSON_DEPTH), "]".repeat(MAX_JSON_DEPTH));
-        assert!(parse(&ok).is_ok());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //!   version                 版本
 //!   sql <目录> <SQL>        执行一条 SQL 并输出结果
 //!   demo <目录>             建演示库并验证读写
-//!   verify <目录>           打开已有数据目录并输出概览（可验证与 Node 版格式兼容）
+//!   verify <目录>           打开已有数据目录并输出概览
 
 use std::path::Path;
 use std::process::exit;

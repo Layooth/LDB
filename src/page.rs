@@ -78,7 +78,7 @@ pub fn is_deleted(page: &Page, slot: u16) -> bool {
     page[pos + 4] & FLAG_DELETED != 0
 }
 
-/// 插入一条记录，返回 slot 号；空间不足返回 None（与 Node 版语义一致）
+/// 插入一条记录，返回 slot 号；空间不足返回 None
 pub fn insert_record(page: &mut Page, rec: &[u8]) -> Option<u16> {
     let count = slot_count(page);
     let offset = free_offset(page) as usize;

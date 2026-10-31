@@ -1,6 +1,6 @@
 //! 表行操作与内存索引。
 //!
-//! 行号编码：`row_id = (page_no << 16) | slot`，与 Node 版一致。
+//! 行号编码：`row_id = (page_no << 16) | slot`。
 //! 索引全部在内存，启动时通过扫描数据页重建。
 
 use std::collections::{HashMap, HashSet};

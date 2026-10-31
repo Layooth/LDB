@@ -1,7 +1,6 @@
 //! LDBP/1 TCP 服务端。
 //!
-//! 每个连接一个线程，共享同一个 `Engine`（Mutex 串行化），
-//! 语义等价于 Node 版的「全局单写锁」。
+//! 每个连接一个线程，共享同一个 `Engine`（RwLock 读写分离）。
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};

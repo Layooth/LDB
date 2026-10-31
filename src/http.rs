@@ -1,6 +1,6 @@
 //! HTTP API + Web 控制台静态文件服务。
 //!
-//! 路由与响应结构对齐 Node 版 `src/server/http.js`：
+//! HTTP 路由与响应结构：
 //!   GET  /api/health
 //!   GET  /api/tables
 //!   GET  /api/schema
@@ -462,7 +462,7 @@ fn route(state: &HttpState, request: &Request) -> (u16, Json, Vec<(String, Strin
         },
         ("POST", ["api", "sql"]) => match run_sql(state, request) {
             Ok((result_json, elapsed, sid)) => {
-                // 与 Node 版一致：elapsedMs 在顶层，与 ok / result 同级
+                // elapsedMs 在顶层，与 ok / result 同级
                 let mut extra = Vec::new();
                 if let Some(id) = sid {
                     extra.push(("X-Session-Id".to_string(), id));

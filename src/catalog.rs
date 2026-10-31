@@ -1,4 +1,4 @@
-//! catalog.json 的读写，字段名与 Node 版完全一致。
+//! catalog.json 的读写（表结构与索引的元数据落盘）。
 //!
 //! ```json
 //! {
@@ -179,7 +179,7 @@ impl Catalog {
 
             let mut indexes = Vec::with_capacity(table.indexes.len());
             for index in &table.indexes {
-                // 与 Node 版一致：catalog 只保存显式索引，
+                // catalog 只保存显式索引，
                 // 主键（__pk__）和列级 UNIQUE（uq_*）由列定义推导，不落库
                 if index.primary || index.implicit {
                     continue;
@@ -325,7 +325,7 @@ fn now_millis() -> i64 {
     }
 }
 
-/// 生成与 Node 版 `new Date().toISOString()` 形状一致的时间串
+/// 生成 ISO 形状的时间串（YYYY-MM-DDTHH:MM:SS.mmmZ）
 fn iso_now() -> String {
     let text = format_datetime_from_millis(now_millis());
     // "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SS.000Z"

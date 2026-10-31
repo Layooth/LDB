@@ -155,7 +155,7 @@ impl QueryResult {
     }
 
     /// 转成 LDBP/1 协议里的 result 字段。
-    /// 字段名与 Node 版逐一对齐，否则现有客户端解析不了。
+    /// 字段名即线协议契约，客户端按此解析。
     pub fn to_wire_json(&self) -> Json {
         match self {
             QueryResult::Select { columns, rows } => Json::Obj(vec![

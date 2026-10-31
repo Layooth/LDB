@@ -1,4 +1,4 @@
-//! 递归下降语法分析。支持的语法范围与 Node 版一致：单表 SELECT / INSERT /
+//! 递归下降语法分析。支持：SELECT / INSERT /
 //! UPDATE / DELETE、CREATE/DROP TABLE、CREATE/DROP INDEX、事务控制与元命令。
 
 use crate::error::{DbError, Result};

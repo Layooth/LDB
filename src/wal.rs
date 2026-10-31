@@ -1,6 +1,4 @@
-//! 预写日志。
-//!
-//! ## 当前格式（LDBW2，二进制）
+//! 预写日志（LDBW2 二进制格式）。
 //!
 //! ```text
 //! 文件头: "LDBW2" + u8 版本(2) + 3 字节保留          （8 字节）
@@ -11,10 +9,6 @@
 //! ```
 //! 所有整数小端，与页/行编码一致。恢复时按 commit 分组重放，
 //! 尾部残缺记录（崩溃时写了一半）直接丢弃。
-//!
-//! ## 兼容性
-//!
-//! 恢复同时兼容旧版 JSON Lines 格式（历史遗留目录），新写入一律二进制。
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -22,7 +16,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::Result;
-use crate::json;
 
 const MAGIC: &[u8; 5] = b"LDBW2";
 const VERSION: u8 = 2;
@@ -65,8 +58,6 @@ impl WalRecord {
 pub struct Wal {
     file: File,
     pub bytes: u64,
-    /// 打开时是 JSON 旧格式（恢复前不能按二进制扫描）
-    legacy: bool,
 }
 
 impl Wal {
@@ -77,11 +68,7 @@ impl Wal {
             .create(true)
             .open(path)?;
         let len = file.metadata()?.len();
-        let mut wal = Wal {
-            file,
-            bytes: len,
-            legacy: false,
-        };
+        let mut wal = Wal { file, bytes: len };
 
         if len == 0 {
             wal.write_header()?;
@@ -90,13 +77,12 @@ impl Wal {
         let mut probe = [0u8; 5];
         wal.file.seek(SeekFrom::Start(0))?;
         wal.file.read_exact(&mut probe)?;
-        if &probe == MAGIC {
-            Ok(wal)
-        } else {
-            // 旧版 JSON Lines：恢复流程会读完并 truncate，届时转成二进制
-            wal.legacy = true;
-            Ok(wal)
+        if &probe != MAGIC {
+            return Err(crate::error::DbError::internal(
+                "WAL 文件头不合法（不是 LDBW2 格式），请用 verify 检查数据目录",
+            ));
         }
+        Ok(wal)
     }
 
     fn write_header(&mut self) -> Result<()> {
@@ -106,7 +92,6 @@ impl Wal {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&header)?;
         self.bytes = HEADER_LEN as u64;
-        self.legacy = false;
         Ok(())
     }
 
@@ -126,7 +111,7 @@ impl Wal {
         Ok(())
     }
 
-    /// 清空日志并重写二进制头。durable=false 时不 fsync
+    /// 清空日志并重写文件头。durable=false 时不 fsync
     /// （截断丢失只会导致重放一次，幂等无害）
     pub fn truncate(&mut self, durable: bool) -> Result<()> {
         self.file.set_len(0)?;
@@ -144,20 +129,14 @@ impl Wal {
         Ok(buf)
     }
 
-    /// 重放已提交事务，返回 (事务数, 记录数)
-    ///
-    /// 兼容两种文件格式：LDBW2 二进制与旧版 JSON Lines。
+    /// 重放已提交事务，返回 (事务数, 记录数)。
     /// 只有带 commit 记录的事务会被 apply；尾部残缺内容直接丢弃。
     pub fn recover<F>(&mut self, mut apply: F) -> Result<(usize, usize)>
     where
         F: FnMut(&WalRecord) -> Result<()>,
     {
-        let (txns, applied) = if self.legacy {
-            self.recover_legacy(&mut apply)?
-        } else {
-            self.recover_binary(&mut apply)?
-        };
-        // 恢复完成后统一截断成干净的二进制日志
+        let (txns, applied) = self.recover_binary(&mut apply)?;
+        // 恢复完成后统一截断成干净的日志
         self.truncate(true)?;
         Ok((txns, applied))
     }
@@ -190,71 +169,6 @@ impl Wal {
 
             if let WalRecord::Commit { txn } = record {
                 if let Some(list) = pending.remove(&txn) {
-                    for item in &list {
-                        apply(item)?;
-                        applied += 1;
-                    }
-                    txns += 1;
-                }
-            } else {
-                pending.entry(txn).or_insert_with(Vec::new).push(record);
-            }
-        }
-        Ok((txns, applied))
-    }
-
-    fn recover_legacy<F>(&mut self, apply: &mut F) -> Result<(usize, usize)>
-    where
-        F: FnMut(&WalRecord) -> Result<()>,
-    {
-        let mut text = String::new();
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.read_to_string(&mut text)?;
-        if text.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let mut pending: HashMap<i64, Vec<WalRecord>> = HashMap::new();
-        let mut txns = 0usize;
-        let mut applied = 0usize;
-
-        for line in text.split('\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let record = match json::parse(line) {
-                Ok(value) => value,
-                // 尾部半条日志（崩溃时写了一半），丢弃后续全部
-                Err(_) => break,
-            };
-            let kind = record.get("k").and_then(|v| v.as_str()).unwrap_or("");
-            let txn = record.get("t").and_then(|v| v.as_i64()).unwrap_or(-1);
-            let record = match kind {
-                "commit" => WalRecord::Commit { txn: txn as u32 },
-                "page" => {
-                    let table_id = record.get("tb").and_then(|v| v.as_i64()).unwrap_or(-1) as u32;
-                    let page_no = record.get("p").and_then(|v| v.as_i64()).unwrap_or(-1) as u32;
-                    let data = record.get("d").and_then(|v| v.as_str()).unwrap_or("");
-                    let bytes = json::b64_decode(data)?;
-                    WalRecord::Page {
-                        txn: txn as u32,
-                        table_id,
-                        page_no,
-                        data: bytes,
-                    }
-                }
-                "catalog" => {
-                    let data = record.get("d").and_then(|v| v.as_str()).unwrap_or("");
-                    WalRecord::Catalog {
-                        txn: txn as u32,
-                        json: data.to_string(),
-                    }
-                }
-                _ => continue,
-            };
-
-            if let WalRecord::Commit { txn } = record {
-                if let Some(list) = pending.remove(&(txn as i64)) {
                     for item in &list {
                         apply(item)?;
                         applied += 1;
@@ -400,7 +314,6 @@ mod tests {
             ]
         );
         assert_eq!(wal.bytes, HEADER_LEN as u64, "恢复后应只剩文件头");
-        assert!(!wal.legacy);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -438,38 +351,11 @@ mod tests {
     }
 
     #[test]
-    fn recovers_legacy_json_wal() {
-        let path = temp_path("legacy");
+    fn bad_magic_is_rejected() {
+        let path = temp_path("badmagic");
         let _ = std::fs::remove_file(&path);
-
-        // 模拟 Node 版 1.0 写出的 JSON Lines WAL（无 LDBW2 头）
-        let page_b64 = json::b64_encode(b"DDDD");
-        std::fs::write(
-            &path,
-            format!(
-                "{{\"k\":\"page\",\"t\":4,\"tb\":7,\"p\":3,\"d\":\"{}\"}}\n{{\"k\":\"commit\",\"t\":4}}\n",
-                page_b64
-            ),
-        )
-        .unwrap();
-
-        let mut wal = Wal::open(&path).unwrap();
-        assert!(wal.legacy);
-        let mut applied = Vec::new();
-        let (txns, records) = wal
-            .recover(|record| {
-                applied.push(record.clone());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(txns, 1);
-        assert_eq!(records, 1);
-        assert_eq!(applied[0], page_record(4, b"DDDD"));
-        // 恢复后已转成二进制格式
-        assert!(!wal.legacy);
-        let head = wal.read_all_bytes().unwrap();
-        assert_eq!(&head[..5], MAGIC);
-
+        std::fs::write(&path, b"{\"k\":\"page\"}").unwrap();
+        assert!(Wal::open(&path).is_err(), "非 LDBW2 文件应被拒绝");
         let _ = std::fs::remove_file(&path);
     }
 }

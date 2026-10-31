@@ -1,4 +1,4 @@
-//! SQL 词法分析。关键字集合与 Node 版保持一致。
+//! SQL 词法分析。
 
 use crate::error::{DbError, Result};
 
@@ -44,7 +44,7 @@ fn is_keyword(word: &str) -> bool {
     KEYWORDS.iter().any(|k| *k == word)
 }
 
-/// 与 Node 版一致：ASCII 字母 + 下划线 + CJK 统一表意文字（U+4E00–U+9FA5）
+/// 标识符：ASCII 字母 + 下划线 + CJK 统一表意文字（U+4E00–U+9FA5）
 fn is_cjk(ch: char) -> bool {
     let code = ch as u32;
     (0x4e00..=0x9fa5).contains(&code)

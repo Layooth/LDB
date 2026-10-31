@@ -1,6 +1,6 @@
 //! 存储层：表文件、页缓存、事务与 WAL 提交。
 //!
-//! 提交语义与 Node 版一致：
+//! 提交协议：
 //!   1. 把脏页镜像 + catalog 写进 WAL（一次 fsync）
 //!   2. 已提交的页进入 `pending`，checkpoint 时才批量落盘
 //!   3. WAL 超过阈值自动 checkpoint

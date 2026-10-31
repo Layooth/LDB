@@ -1003,6 +1003,9 @@ fn describe_table(table: &crate::table::Table) -> Json {
             Json::Obj(vec![
                 ("name".to_string(), Json::str(c.name.clone())),
                 ("type".to_string(), Json::str(c.ty.as_str())),
+                // DECIMAL 的标度必须单独暴露：只给 "DECIMAL" 的话，
+                // 控制台按 schema 重建表时会退回默认标度，备份恢复会丢精度
+                ("scale".to_string(), Json::Num(c.scale as f64)),
                 ("notNull".to_string(), Json::Bool(c.not_null)),
                 ("primaryKey".to_string(), Json::Bool(c.primary_key)),
                 ("unique".to_string(), Json::Bool(c.unique)),

@@ -1165,6 +1165,226 @@ fn range_index_scan() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 线路 JSON 必须带每列类型：客户端（SDK/控制台）不必再反查 schema
+#[test]
+fn select_wire_json_has_column_types() {
+    use littledb::json::Json;
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("wiretypes");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute(
+            "CREATE TABLE w (id INT PRIMARY KEY, name TEXT, price DECIMAL(10,2), ok BOOL)",
+            &[],
+        )
+        .unwrap();
+    session
+        .execute("INSERT INTO w VALUES (1,'a','1.50',TRUE)", &[])
+        .unwrap();
+
+    fn types_of(result: QueryResult) -> Vec<String> {
+        match result.to_wire_json() {
+            Json::Obj(items) => {
+                let entry = items
+                    .iter()
+                    .find(|(key, _)| key == "types")
+                    .expect("select 结果必须带 types 字段");
+                match &entry.1 {
+                    Json::Arr(values) => values
+                        .iter()
+                        .map(|v| v.as_str().unwrap_or("").to_string())
+                        .collect(),
+                    other => panic!("types 应为数组，实际 {:?}", other),
+                }
+            }
+            other => panic!("线路结果应为对象，实际 {:?}", other),
+        }
+    }
+
+    assert_eq!(
+        types_of(session.execute("SELECT * FROM w", &[]).unwrap()),
+        vec!["INT", "TEXT", "DECIMAL", "BOOL"],
+        "SELECT * 应按源表列给类型"
+    );
+    assert_eq!(
+        types_of(
+            session
+                .execute("SELECT COUNT(*) AS n, MAX(price) FROM w", &[])
+                .unwrap()
+        ),
+        vec!["INT", "UNKNOWN"],
+        "聚合：COUNT 是 INT，MAX 推不出给 UNKNOWN 而不是瞎猜"
+    );
+    assert_eq!(
+        types_of(
+            session
+                .execute(
+                    "SELECT CAST('1' AS INT) AS a, price * 2 AS b FROM w",
+                    &[]
+                )
+                .unwrap()
+        ),
+        vec!["INT", "DECIMAL"],
+        "CAST 用目标类型，DECIMAL 算术保持 DECIMAL"
+    );
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// /api/schema 必须暴露 DECIMAL 标度：否则按 schema 重建表会退回默认标度，
+/// 备份恢复时 decimal 值会被截断或报错
+#[test]
+fn schema_wire_includes_decimal_scale() {
+    let dir = temp_dir("schemascale");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        engine
+            .write(|e| -> Result<()> {
+                let mut price = Column::new("price", ColumnType::Decimal);
+                price.scale = 2;
+                e.create_table(
+                    "m",
+                    vec![Column::new("id", ColumnType::Int), price],
+                    false,
+                )
+            })
+            .unwrap();
+        engine.close().unwrap();
+    }
+
+    let port = start_http(&dir);
+    let resp = http_roundtrip(
+        port,
+        "GET /api/schema HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    let parsed = littledb::json::parse(body).expect("schema 应是合法 JSON");
+    let text = parsed.to_string().replace(' ', "");
+    assert!(
+        text.contains("\"type\":\"DECIMAL\""),
+        "应声明 DECIMAL：{}",
+        &text[..text.len().min(300)]
+    );
+    assert!(
+        text.contains("\"scale\":2"),
+        "应带上标度 2：{}",
+        &text[..text.len().min(300)]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// dump → load 往返：结构（类型/标度/约束/索引）与数据都要一致
+#[test]
+fn dump_and_load_round_trip() {
+    use littledb::sql::QueryResult;
+
+    let src = temp_dir("dumpsrc");
+    let dst = temp_dir("dumpdst");
+
+    // ---- 源库：故意包含难序列化的值（引号 / 分号 / 换行）与各种约束
+    {
+        let mut session = Session::open(&src).unwrap();
+        session
+            .execute(
+                "CREATE TABLE t (\n\
+                   id INT PRIMARY KEY,\n\
+                   name TEXT,\n\
+                   price DECIMAL(10,2),\n\
+                   ratio REAL,\n\
+                   ok BOOL,\n\
+                   note TEXT DEFAULT 'n/a'\n\
+                 )",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute("CREATE TABLE u (a INT, b INT, PRIMARY KEY (a, b))", &[])
+            .unwrap();
+        session
+            .execute("CREATE UNIQUE INDEX uq_name ON t(name)", &[])
+            .unwrap();
+        session
+            .execute("CREATE INDEX ix_price ON t(price)", &[])
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO t VALUES (?,?,?,?,?,?)",
+                &[
+                    Value::Int(1),
+                    Value::Text("it's;ok\nnewline".to_string()),
+                    Value::Decimal { v: 150, scale: 2 },
+                    Value::Real(0.5),
+                    Value::Bool(true),
+                    Value::Text("z".to_string()),
+                ],
+            )
+            .unwrap();
+        session
+            .execute("INSERT INTO u VALUES (1,2),(1,3)", &[])
+            .unwrap();
+        session.close().unwrap();
+    }
+
+    // ---- 导出
+    let script = {
+        let mut engine = Engine::open(&src).unwrap();
+        let script = littledb::dump::dump_script(&mut engine).unwrap();
+        engine.close().unwrap();
+        script
+    };
+    assert!(script.contains("DECIMAL(38,2)"), "DECIMAL 必须带标度：\n{}", script);
+    assert!(script.contains("CREATE UNIQUE INDEX"), "唯一索引要导出");
+    assert!(script.contains("PRIMARY KEY (\"a\", \"b\")"), "复合主键要用表级写法");
+
+    // ---- 导入到空目录
+    let mut loaded = Session::open(&dst).unwrap();
+    let stats = littledb::dump::load_script(&mut loaded, &script, 50).unwrap();
+    // 2 张表 + 2 个索引 + 2 条 INSERT
+    assert_eq!(stats.statements, 6, "语句数");
+
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 数据逐列一致（含引号/分号/换行的文本、DECIMAL 标度、REAL、BOOL）
+    assert_eq!(
+        rows(&mut loaded, "SELECT id, name, price, ratio, ok, note FROM t"),
+        vec![vec![
+            Value::Int(1),
+            Value::Text("it's;ok\nnewline".to_string()),
+            Value::Decimal { v: 150, scale: 2 },
+            Value::Real(0.5),
+            Value::Bool(true),
+            Value::Text("z".to_string()),
+        ]]
+    );
+
+    // 索引与复合主键都要重建
+    let columns: Vec<String> = match loaded.execute("DESCRIBE t", &[]).unwrap() {
+        QueryResult::Describe { indexes, .. } => {
+            indexes.iter().map(|i| i.name.clone()).collect()
+        }
+        other => panic!("期望 DESCRIBE，得到 {:?}", other),
+    };
+    assert!(columns.iter().any(|n| n == "uq_name"), "{:?}", columns);
+    assert!(columns.iter().any(|n| n == "ix_price"), "{:?}", columns);
+
+    let dup = loaded
+        .execute("INSERT INTO u VALUES (1,2)", &[])
+        .unwrap_err();
+    assert_eq!(dup.code, "CONSTRAINT_VIOLATION", "复合主键约束应恢复：{}", dup.message);
+
+    loaded.close().unwrap();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
 // ---------------------------------------------------------------- HTTP 层
 
 /// 起一个真实 HTTP 服务实例（随机端口），用于协议级用例

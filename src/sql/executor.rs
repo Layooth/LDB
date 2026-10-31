@@ -80,6 +80,9 @@ pub struct IndexInfo {
 pub enum QueryResult {
     Select {
         columns: Vec<String>,
+        /// 每列的类型名（INT/REAL/TEXT/BOOL/DATE/DATETIME/JSON/DECIMAL/UNKNOWN）。
+        /// 由查询计划推定，客户端不必再反查 schema；推不出的列是 "UNKNOWN"。
+        types: Vec<String>,
         rows: Vec<Vec<Value>>,
     },
     Insert {
@@ -119,7 +122,7 @@ impl QueryResult {
     /// 转成二维表格用于展示；非结果集返回 None
     pub fn to_grid(&self) -> Option<(Vec<String>, Vec<Vec<Value>>)> {
         match self {
-            QueryResult::Select { columns, rows } => Some((columns.clone(), rows.clone())),
+            QueryResult::Select { columns, rows, .. } => Some((columns.clone(), rows.clone())),
             QueryResult::Batch { .. } => None,
             QueryResult::Explain { columns, rows } => Some((columns.clone(), rows.clone())),
             QueryResult::Tables { tables } => {
@@ -189,11 +192,21 @@ impl QueryResult {
     /// 字段名即线协议契约，客户端按此解析。
     pub fn to_wire_json(&self) -> Json {
         match self {
-            QueryResult::Select { columns, rows } => Json::Obj(vec![
+            QueryResult::Select {
+                columns,
+                types,
+                rows,
+            } => Json::Obj(vec![
                 ("type".to_string(), Json::str("select")),
                 (
                     "columns".to_string(),
                     Json::Arr(columns.iter().map(|c| Json::str(c.clone())).collect()),
+                ),
+                // 与 columns 一一对应；客户端据此决定如何解析值
+                // （尤其 DECIMAL 是字符串还是数字、DATE 是文本）
+                (
+                    "types".to_string(),
+                    Json::Arr(types.iter().map(|t| Json::str(t.clone())).collect()),
                 ),
                 ("rows".to_string(), rows_to_json(rows)),
                 ("rowCount".to_string(), Json::Num(rows.len() as f64)),
@@ -842,7 +855,9 @@ fn resolve_subqueries(
             let inner = resolve_subqueries(engine, expr, params, committed_only, owner)?;
             let result = exec_select(engine, query, params, committed_only, owner)?;
             let values = match result {
-                QueryResult::Select { columns, rows } => {
+                QueryResult::Select {
+                    columns, rows, ..
+                } => {
                     if columns.len() != 1 {
                         return Err(DbError::syntax(format!(
                             "IN 子查询只能返回一列，实际 {} 列",
@@ -941,7 +956,7 @@ fn select_base(
     params: &[Value],
     committed_only: bool,
     owner: Option<u64>,
-) -> Result<(Vec<String>, Vec<(Vec<Value>, Vec<Value>)>)> {
+) -> Result<(Vec<String>, Vec<String>, Vec<(Vec<Value>, Vec<Value>)>)> {
     // ---------------------------------------------------------------- 行来源
     // 先解析 WHERE 里的子查询（索引候选与行过滤都用转换后的条件）
     let where_clause = match &stmt.where_clause {
@@ -1141,7 +1156,98 @@ fn select_base(
         dedup_pairs(&mut output);
     }
 
-    Ok((out_columns, output))
+    // 输出列类型：从投影表达式 + 源表列推定（供线路 JSON 的 types 字段）
+    let out_types: Vec<String> = projections
+        .iter()
+        .map(|expr| infer_expr_type(expr, &plans))
+        .collect();
+
+    Ok((out_columns, out_types, output))
+}
+
+/// 推定一个表达式的结果类型名。
+///
+/// 这是**尽力而为**的声明级推断（不是运行期观测）：能从源表列、字面量、
+/// CAST 目标或函数名确定的就给准确值，否则给 "UNKNOWN"——
+/// 客户端看到 UNKNOWN 时应回退到 /api/schema 或按值判断。
+fn infer_expr_type(expr: &Expr, plans: &[TablePlan]) -> String {
+    match expr {
+        Expr::Column { table, name } => {
+            let want_alias = table.as_ref().map(|t| t.to_lowercase());
+            for plan in plans {
+                if let Some(alias) = &want_alias {
+                    if &plan.alias != alias {
+                        continue;
+                    }
+                }
+                if let Some(column) = plan
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                {
+                    return column.ty.as_str().to_string();
+                }
+            }
+            "UNKNOWN".to_string()
+        }
+        Expr::Literal(literal) => match literal {
+            Literal::Null => "NULL".to_string(),
+            Literal::Bool(_) => "BOOL".to_string(),
+            Literal::Int(_) => "INT".to_string(),
+            Literal::Real(_) => "REAL".to_string(),
+            Literal::Decimal { .. } => "DECIMAL".to_string(),
+            Literal::Text(_) => "TEXT".to_string(),
+        },
+        Expr::Unary { operand, .. } => infer_expr_type(operand, plans),
+        Expr::Cast { ty, .. } => ty.as_str().to_string(),
+        Expr::Binary { op, left, right } => match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or => "BOOL".to_string(),
+            _ => {
+                // 算术：REAL/DECIMAL 优先，其次 INT，最后跟随左操作数
+                let left_ty = infer_expr_type(left, plans);
+                let right_ty = infer_expr_type(right, plans);
+                for candidate in ["REAL", "DECIMAL"] {
+                    if left_ty == candidate || right_ty == candidate {
+                        return candidate.to_string();
+                    }
+                }
+                if left_ty == "INT" || right_ty == "INT" {
+                    "INT".to_string()
+                } else {
+                    left_ty
+                }
+            }
+        },
+        Expr::IsNull { .. } | Expr::InList { .. } | Expr::InSubquery { .. } | Expr::Like { .. }
+        | Expr::Between { .. } => "BOOL".to_string(),
+        Expr::Function { name, args, .. } => {
+            let upper = name.to_uppercase();
+            match upper.as_str() {
+                "COUNT" | "LENGTH" => "INT".to_string(),
+                "AVG" => "REAL".to_string(),
+                "UPPER" | "LOWER" | "NOW" | "CURRENT_TIMESTAMP" | "CURDATE" | "CURRENT_DATE"
+                | "TODAY" => "TEXT".to_string(),
+                "COALESCE" => args
+                    .first()
+                    .map(|arg| infer_expr_type(arg, plans))
+                    .unwrap_or_else(|| "UNKNOWN".to_string()),
+                "ABS" | "ROUND" => args
+                    .first()
+                    .map(|arg| infer_expr_type(arg, plans))
+                    .unwrap_or_else(|| "UNKNOWN".to_string()),
+                // SUM/MIN/MAX 取决于输入列，留 UNKNOWN 比猜错好
+                _ => "UNKNOWN".to_string(),
+            }
+        }
+        Expr::Param(_) => "UNKNOWN".to_string(),
+    }
 }
 
 fn dedup_pairs(pairs: &mut Vec<(Vec<Value>, Vec<Value>)>) {
@@ -1191,16 +1297,24 @@ pub(crate) fn exec_select(
     committed_only: bool,
     owner: Option<u64>,
 ) -> Result<QueryResult> {
-    let (columns, mut pairs) = select_base(engine, stmt, params, committed_only, owner)?;
+    let (columns, mut types, mut pairs) =
+        select_base(engine, stmt, params, committed_only, owner)?;
 
     if let Some((kind, right)) = &stmt.union {
-        let (rcolumns, mut rpairs) = select_base(engine, right, params, committed_only, owner)?;
+        let (rcolumns, rtypes, mut rpairs) =
+            select_base(engine, right, params, committed_only, owner)?;
         if rcolumns.len() != columns.len() {
             return Err(DbError::syntax(format!(
                 "UNION 两侧列数不一致：左侧 {} 列，右侧 {} 列",
                 columns.len(),
                 rcolumns.len()
             )));
+        }
+        // UNION 的输出类型：左侧推不出来时用右侧补
+        for (slot, rtype) in rtypes.iter().enumerate() {
+            if types[slot] == "UNKNOWN" {
+                types[slot] = rtype.clone();
+            }
         }
         // 右侧若写了 LIMIT/OFFSET，先作用于右侧结果
         apply_offset_limit(&mut rpairs, &right.offset, &right.limit, params)?;
@@ -1237,7 +1351,11 @@ pub(crate) fn exec_select(
         apply_offset_limit(&mut pairs, &stmt.offset, &stmt.limit, params)?;
 
         let rows = pairs.into_iter().map(|(values, _)| values).collect();
-        return Ok(QueryResult::Select { columns, rows });
+        return Ok(QueryResult::Select {
+            columns,
+            types,
+            rows,
+        });
     }
 
     // 单条 SELECT：组内排序键排序 + LIMIT/OFFSET
@@ -1262,7 +1380,11 @@ pub(crate) fn exec_select(
     apply_offset_limit(&mut pairs, &stmt.offset, &stmt.limit, params)?;
 
     let rows = pairs.into_iter().map(|(values, _)| values).collect();
-    Ok(QueryResult::Select { columns, rows })
+    Ok(QueryResult::Select {
+        columns,
+        types,
+        rows,
+    })
 }
 
 // ------------------------------------------------------------------ JOIN

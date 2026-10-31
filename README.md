@@ -25,6 +25,32 @@ littledb.exe serve .\data --token secret  # 启用 Bearer 认证
 littledb.exe sql .\data "SELECT * FROM t LIMIT 5"
 littledb.exe verify .\data                # 输出数据目录概览（表/列/索引/行数/恢复情况）
 littledb.exe demo .\tmp-demo              # 建演示库并验证读写
+littledb.exe dump .\data -o backup.sql    # 导出为 SQL 脚本（可进版本控制/能改）
+littledb.exe load .\new-data backup.sql   # 从脚本导入（--batch 200 控制每批事务）
+```
+
+### 备份 / 导出
+
+`dump` 产出**自包含 SQL 脚本**：`CREATE TABLE`（含类型、DECIMAL 标度、NOT NULL / UNIQUE /
+DEFAULT / 主键，复合主键用表级写法）、显式 `CREATE INDEX`、以及每 100 行一条的 `INSERT`。
+`load` 按 `--batch`（默认 200 条语句）分批包事务导入，任一批失败即回滚并报出错语句。
+
+```sql
+CREATE TABLE "players" (
+  "id" INT PRIMARY KEY,
+  "name" TEXT NOT NULL UNIQUE,
+  "score" INT,
+  "joined" DATETIME
+);
+INSERT INTO "players" ("id","name","score","joined") VALUES (1,'player1',100,'2026-10-30 08:00:00'),…;
+```
+
+为什么要走 SQL 而不是拷目录：运行中直接拷 `data/` 不安全（页缓存 + WAL 可能不一致）；
+SQL 脚本既能当备份、又能进版本控制、还能跨版本导入。DECIMAL 以**字符串**字面量保存
+（`'1.50'`），不会经过浮点。
+
+> 控制台的「备份 / 恢复」也已修复两处保真问题：恢复时会重放显式索引（旧版只建表，
+> 索引静默消失），并按 `/api/schema` 的 `scale` 字段重建 `DECIMAL(p,s)`（旧版会退回默认标度）。
 ```
 
 `serve` 选项：`--host`、`-p/--port`、`--http-port`、`--no-http`、`--no-open`、
@@ -139,6 +165,19 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | `{"type":"hello","token":"..."}` | 认证（未配置 `--token` 时直接通过）。回 `{"event":"ready"}` |
 | `{"type":"ping"}` | 保活 |
 | `{"type":"query","id":1,"sql":"...","params":[...]}` | 执行 SQL，回 `{"id":1,"ok":true,"result":{...},"elapsedMs":..}` |
+
+`select` 结果的字段（与 HTTP 的 `/api/sql` 完全一致，客户端按此解析）：
+
+```json
+{ "type": "select",
+  "columns": ["id", "price"],       // 列名
+  "types":   ["INT", "DECIMAL"],    // 每列类型，与 columns 一一对应；推不出为 "UNKNOWN"
+  "rows":    [[1, "19.99"]],        // DECIMAL 是字符串；INT/REAL/BOOL 是 JSON 数值/布尔
+  "rowCount": 1 }
+```
+
+`/api/schema` 的列定义同样带 `type` 与 `scale`（DECIMAL 的标度），索引带
+`primary` / `implicit` 标记，供客户端或备份工具原样重建表。
 | `{"type":"close"}` | 关闭连接 |
 
 连接建立时服务端先发一帧 `{"event":"welcome"}`。单帧上限 16MB，空闲 5 分钟断开。

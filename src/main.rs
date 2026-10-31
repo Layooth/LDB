@@ -24,6 +24,8 @@ fn print_help() {
     println!("  littledb sql <目录> <SQL>     执行 SQL");
     println!("  littledb demo <目录>          生成演示库并验证读写");
     println!("  littledb verify <目录>        输出数据目录概览");
+    println!("  littledb dump <目录> [-o 文件] 导出为 SQL 脚本（默认输出到 stdout）");
+    println!("  littledb load <目录> <脚本>   导入 SQL 脚本（--batch n 控制每批事务大小）");
     println!("  littledb help                 显示帮助");
     println!();
     println!("serve 选项:");
@@ -111,6 +113,34 @@ fn real_main() {
             Some(dir) => run_verify(dir),
             None => {
                 eprintln!("用法: littledb verify <目录>");
+                exit(1);
+            }
+        },
+        "dump" => match args.get(2) {
+            Some(dir) => {
+                let output = args
+                    .iter()
+                    .position(|arg| arg == "-o" || arg == "--out")
+                    .and_then(|pos| args.get(pos + 1).cloned());
+                run_dump(dir, output.as_deref())
+            }
+            None => {
+                eprintln!("用法: littledb dump <目录> [-o 输出文件]");
+                exit(1);
+            }
+        },
+        "load" => match (args.get(2), args.get(3)) {
+            (Some(dir), Some(file)) => {
+                let batch = args
+                    .iter()
+                    .position(|arg| arg == "--batch")
+                    .and_then(|pos| args.get(pos + 1))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(200);
+                run_load(dir, file, batch)
+            }
+            _ => {
+                eprintln!("用法: littledb load <目录> <脚本文件> [--batch 200]");
                 exit(1);
             }
         },
@@ -356,6 +386,35 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
 
     let server = Server::new(engine, options);
     server.run()
+}
+
+/// 导出为 SQL 脚本（默认 stdout，便于重定向或接管道）
+fn run_dump(dir: &str, output: Option<&str>) -> Result<()> {
+    let mut engine = Engine::open(Path::new(dir))?;
+    let script = littledb::dump::dump_script(&mut engine)?;
+    let tables = script.matches("CREATE TABLE").count();
+    engine.close()?;
+    match output {
+        Some(path) => {
+            std::fs::write(path, script.as_bytes())?;
+            println!("已导出 {} 张表 → {}", tables, path);
+        }
+        None => print!("{}", script),
+    }
+    Ok(())
+}
+
+/// 导入 SQL 脚本：每 --batch 条语句一个事务
+fn run_load(dir: &str, file: &str, batch: usize) -> Result<()> {
+    let script = std::fs::read_to_string(file)?;
+    let mut session = Session::open(Path::new(dir))?;
+    let stats = littledb::dump::load_script(&mut session, &script, batch)?;
+    session.close()?;
+    println!(
+        "已导入 {} 条语句（{} 批，每批 {} 条）← {}",
+        stats.statements, stats.batches, batch, file
+    );
+    Ok(())
 }
 
 fn run_demo(dir: &str) -> Result<()> {

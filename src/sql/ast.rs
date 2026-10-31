@@ -83,12 +83,52 @@ pub struct SelectItem {
     pub expr: Expr,
     pub alias: Option<String>,
     pub star: bool,
+    /// `t.*` 里的表限定；`*` 和 `t.*` 都置 star = true
+    pub star_table: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Cross,
+}
+
+/// FROM 子句：单表或 JOIN 树（左深）
 #[derive(Debug, Clone)]
-pub struct FromItem {
-    pub table: String,
-    pub alias: Option<String>,
+pub enum TableSource {
+    Table { name: String, alias: Option<String> },
+    Join {
+        left: Box<TableSource>,
+        right: Box<TableSource>,
+        kind: JoinKind,
+        on: Option<Expr>,
+    },
+}
+
+impl TableSource {
+    /// 供 EXPLAIN / 错误信息展示
+    pub fn describe(&self) -> String {
+        match self {
+            TableSource::Table { name, .. } => name.clone(),
+            TableSource::Join { left, right, kind, .. } => {
+                let word = match kind {
+                    JoinKind::Inner => "JOIN",
+                    JoinKind::Left => "LEFT JOIN",
+                    JoinKind::Cross => "CROSS JOIN",
+                };
+                format!("{} {} {}", left.describe(), word, right.describe())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnionKind {
+    /// UNION：结果去重
+    Distinct,
+    /// UNION ALL：保留全部
+    All,
 }
 
 #[derive(Debug, Clone)]
@@ -101,13 +141,15 @@ pub struct OrderItem {
 pub struct SelectStmt {
     pub distinct: bool,
     pub items: Vec<SelectItem>,
-    pub from: Option<FromItem>,
+    pub from: Option<TableSource>,
     pub where_clause: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+    /// UNION / UNION ALL：右侧 SELECT。右侧不允许再写 ORDER BY
+    pub union: Option<(UnionKind, Box<SelectStmt>)>,
 }
 
 #[derive(Debug, Clone)]

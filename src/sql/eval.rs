@@ -12,7 +12,14 @@ use super::AGGREGATES;
 #[derive(Debug, Clone)]
 pub struct RowContext {
     pub values: Vec<Value>,
+    /// 裸列名 -> value（单表行；JOIN 行里同名列只保留首个并记入 ambiguous）
     fields: HashMap<String, Value>,
+    /// JOIN 行：限定名 "alias.column" -> value
+    qualified: HashMap<String, Value>,
+    /// 同名列出现在多张表里：裸名有歧义，必须写 表.列
+    ambiguous: std::collections::HashSet<String>,
+    /// 本行涉及的表别名（小写）
+    aliases: Vec<String>,
 }
 
 impl RowContext {
@@ -23,11 +30,72 @@ impl RowContext {
                 fields.insert(column.name.to_lowercase(), values[i].clone());
             }
         }
-        RowContext { values, fields }
+        RowContext {
+            values,
+            fields,
+            qualified: HashMap::new(),
+            ambiguous: std::collections::HashSet::new(),
+            aliases: Vec::new(),
+        }
     }
 
-    pub fn field(&self, name: &str) -> Option<&Value> {
-        self.fields.get(&name.to_lowercase())
+    /// JOIN 组合行：sources = [(别名, 列定义, 在 values 中的起始下标)]
+    pub fn from_tables(sources: &[(&str, &[Column], usize)], values: Vec<Value>) -> RowContext {
+        let mut fields: HashMap<String, Value> = HashMap::new();
+        let mut qualified: HashMap<String, Value> = HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        let mut aliases = Vec::with_capacity(sources.len());
+        for (alias, columns, offset) in sources {
+            let alias_lc = alias.to_lowercase();
+            aliases.push(alias_lc.clone());
+            for (i, column) in columns.iter().enumerate() {
+                let value = values
+                    .get(*offset + i)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let col_lc = column.name.to_lowercase();
+                qualified.insert(format!("{}.{}", alias_lc, col_lc), value.clone());
+                if fields.insert(col_lc.clone(), value).is_some() {
+                    ambiguous.insert(col_lc);
+                }
+            }
+        }
+        RowContext {
+            values,
+            fields,
+            qualified,
+            ambiguous,
+            aliases,
+        }
+    }
+
+    /// qualifier：`u.name` 里的 `u`；单表行传 None
+    pub fn field(&self, qualifier: Option<&str>, name: &str) -> Result<&Value> {
+        let name_lc = name.to_lowercase();
+        if let Some(qualifier) = qualifier {
+            let q_lc = qualifier.to_lowercase();
+            if !self.aliases.iter().any(|a| *a == q_lc) {
+                return Err(DbError::not_found(format!(
+                    "表或别名 \"{}\" 不在本次查询中",
+                    qualifier
+                )));
+            }
+            return self
+                .qualified
+                .get(&format!("{}.{}", q_lc, name_lc))
+                .ok_or_else(|| {
+                    DbError::not_found(format!("列 \"{}.{}\" 不存在", qualifier, name))
+                });
+        }
+        if self.ambiguous.contains(&name_lc) {
+            return Err(DbError::syntax(format!(
+                "列名 \"{}\" 在多张表中存在歧义，请用 \"表.列\" 限定",
+                name
+            )));
+        }
+        self.fields
+            .get(&name_lc)
+            .ok_or_else(|| DbError::not_found(format!("列 \"{}\" 不存在", name)))
     }
 }
 
@@ -93,10 +161,7 @@ pub fn eval(expr: &Expr, ctx: &RowContext, params: &[Value]) -> Result<Value> {
             .cloned()
             .ok_or_else(|| DbError::syntax(format!("缺少第 {} 个参数", index + 1))),
 
-        Expr::Column { name, .. } => ctx
-            .field(name)
-            .cloned()
-            .ok_or_else(|| DbError::not_found(format!("列 \"{}\" 不存在", name))),
+        Expr::Column { name, table } => ctx.field(table.as_deref(), name).cloned(),
 
         Expr::Unary { op, operand } => {
             let value = eval(operand, ctx, params)?;

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use littledb::sql::Session;
 use littledb::{Column, ColumnType, Engine, Result, Value};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -356,5 +357,105 @@ fn many_rows_cross_pages() {
 
     assert_eq!(engine.scan("players").unwrap().len(), 250);
     engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// JOIN / UNION 端到端语义
+#[test]
+fn joins_and_unions() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("joins");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)", &[])
+        .unwrap();
+    session
+        .execute("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, item TEXT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO users VALUES (1,'alice'), (2,'bob'), (3,'carol')",
+            &[],
+        )
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO orders VALUES (10,1,'book'), (11,1,'pen'), (12,2,'cup')",
+            &[],
+        )
+        .unwrap();
+
+    macro_rules! rows {
+        ($sql:expr $(,)?) => {
+            match session.execute($sql, &[]).unwrap() {
+                QueryResult::Select { rows, .. } => rows,
+                other => panic!("期望 SELECT，得到 {:?}", other),
+            }
+        };
+    }
+    macro_rules! must_err {
+        ($sql:expr $(,)?) => {
+            assert!(session.execute($sql, &[]).is_err(), "应当报错: {}", $sql)
+        };
+    }
+
+    // INNER JOIN：等值连接 + 限定列名
+    let got = rows!("SELECT u.name, o.item FROM users u JOIN orders o ON u.id = o.user_id ORDER BY u.name, o.item");
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Text("alice".into()), Value::Text("book".into())],
+            vec![Value::Text("alice".into()), Value::Text("pen".into())],
+            vec![Value::Text("bob".into()), Value::Text("cup".into())],
+        ]
+    );
+
+    // LEFT JOIN：无匹配的左行补 NULL
+    let got = rows!("SELECT u.name, o.item FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.name, o.item");
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Text("alice".into()), Value::Text("book".into())],
+            vec![Value::Text("alice".into()), Value::Text("pen".into())],
+            vec![Value::Text("bob".into()), Value::Text("cup".into())],
+            vec![Value::Text("carol".into()), Value::Null],
+        ]
+    );
+
+    // 逗号连接 = CROSS JOIN：3 × 3 = 9 行
+    let got = rows!("SELECT COUNT(*) FROM users, orders");
+    assert_eq!(got, vec![vec![Value::Int(9)]]);
+
+    // JOIN + WHERE + 聚合
+    let got = rows!(
+        "SELECT u.name, COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id \
+         GROUP BY u.name ORDER BY u.name",
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Text("alice".into()), Value::Int(2)],
+            vec![Value::Text("bob".into()), Value::Int(1)],
+        ]
+    );
+
+    // 歧义裸列名必须报错并提示限定
+    must_err!("SELECT id FROM users u JOIN orders o ON u.id = o.user_id");
+
+    // UNION 去重 / UNION ALL 保留
+    let got = rows!("SELECT user_id FROM orders UNION SELECT id FROM users ORDER BY id");
+    assert_eq!(got, vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]);
+    let got = rows!("SELECT user_id FROM orders UNION ALL SELECT id FROM users");
+    assert_eq!(got.len(), 6);
+    must_err!("SELECT id, name FROM users UNION SELECT id FROM users");
+
+    // JOIN 走索引路径（user_id 上建索引后结果一致）
+    session.execute("CREATE INDEX idx_o_user ON orders(user_id)", &[]).unwrap();
+    let got = rows!("SELECT u.name, o.item FROM users u JOIN orders o ON u.id = o.user_id ORDER BY u.name, o.item");
+    assert_eq!(got.len(), 3);
+    let got = rows!("SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.item IS NULL");
+    assert_eq!(got, vec![vec![Value::Text("carol".into())]]);
+
+    session.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -608,48 +608,86 @@ fn run_with_engine(
 // ------------------------------------------------------------------ SELECT
 
 /// SELECT 执行管线。pub(crate) 供 eval 模块的线路精确性测试复用
-pub(crate) fn exec_select(
+/// 单个 FROM 叶子的执行计划
+#[derive(Debug, Clone)]
+struct TablePlan {
+    /// 小写别名（无别名时为表名），限定名匹配用
+    alias: String,
+    /// 展示名（错误信息用）
+    #[allow(dead_code)]
+    display: String,
+    /// 真实表名（engine 访问用）
+    table_name: String,
+    columns: Vec<Column>,
+    /// 本表列在组合行中的起始下标
+    offset: usize,
+}
+
+/// 无索引辅助的 JOIN 组合行数上限，超过直接报错而不是挂死
+const MAX_JOIN_PAIRS: usize = 2_000_000;
+
+/// SELECT 管线：输出列 + (投影值, 排序键) 对，尚未做 ORDER BY / LIMIT / UNION
+fn select_base(
     engine: &mut Engine,
     stmt: &SelectStmt,
     params: &[Value],
     committed_only: bool,
-) -> Result<QueryResult> {
-    let mut table_columns: Vec<Column> = Vec::new();
-    let mut rows: Vec<RowContext> = Vec::new();
+) -> Result<(Vec<String>, Vec<(Vec<Value>, Vec<Value>)>)> {
+    // ---------------------------------------------------------------- 行来源
+    let mut plans: Vec<TablePlan> = Vec::new();
+    let mut raw_rows: Vec<Vec<Value>> = Vec::new();
 
-    if let Some(from) = &stmt.from {
-        {
-            let table = engine.table(&from.table)?;
-            table_columns = table.columns.clone();
-        }
-
-        if committed_only {
-            for (_, values) in engine.scan_committed(&from.table)? {
-                rows.push(RowContext::new(&table_columns, values));
-            }
-        } else {
-            let candidates =
-                index_candidates(&*engine, &from.table, stmt.where_clause.as_ref(), params)?;
-            match candidates {
-                Some(ids) => {
-                    for id in ids {
-                        if let Some(values) = engine.get(&from.table, id)? {
-                            rows.push(RowContext::new(&table_columns, values));
+    if let Some(source) = &stmt.from {
+        match source {
+            // 单表 + 本会话可见未提交数据：等值条件可走内存索引
+            TableSource::Table { name, alias } if !committed_only => {
+                let table = engine.table(name)?;
+                let display = alias.clone().unwrap_or_else(|| table.name.clone());
+                plans.push(TablePlan {
+                    alias: display.to_lowercase(),
+                    display,
+                    table_name: table.name.clone(),
+                    columns: table.columns.clone(),
+                    offset: 0,
+                });
+                let candidates =
+                    index_candidates(&*engine, name, stmt.where_clause.as_ref(), params)?;
+                match candidates {
+                    Some(ids) => {
+                        for id in ids {
+                            if let Some(values) = engine.get(name, id)? {
+                                raw_rows.push(values);
+                            }
+                        }
+                    }
+                    None => {
+                        for (_, values) in engine.scan(name)? {
+                            raw_rows.push(values);
                         }
                     }
                 }
-                None => {
-                    for (_, values) in engine.scan(&from.table)? {
-                        rows.push(RowContext::new(&table_columns, values));
-                    }
-                }
+            }
+            // JOIN 树，或 committed_only 的单表（绕开含未提交键的索引）
+            source => {
+                let (p, rows) = join_frame(engine, source, committed_only, params)?;
+                plans = p;
+                raw_rows = rows;
             }
         }
     } else {
-        rows.push(RowContext::new(&[], Vec::new()));
+        raw_rows.push(Vec::new());
     }
 
-    // WHERE
+    let sources: Vec<(&str, &[Column], usize)> = plans
+        .iter()
+        .map(|p| (p.alias.as_str(), p.columns.as_slice(), p.offset))
+        .collect();
+    let mut rows: Vec<RowContext> = raw_rows
+        .into_iter()
+        .map(|values| RowContext::from_tables(&sources, values))
+        .collect();
+
+    // ---------------------------------------------------------------- WHERE
     if let Some(where_clause) = &stmt.where_clause {
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows {
@@ -661,17 +699,35 @@ pub(crate) fn exec_select(
         rows = kept;
     }
 
-    // 投影列
+    // ---------------------------------------------------------------- 投影列
     let mut out_columns: Vec<String> = Vec::new();
     let mut projections: Vec<Expr> = Vec::new();
     for item in &stmt.items {
         if item.star {
-            for column in &table_columns {
-                out_columns.push(column.name.clone());
-                projections.push(Expr::Column {
-                    table: None,
-                    name: column.name.clone(),
-                });
+            // `*` 展开全部表；`t.*` 只展开限定表
+            let targets: Vec<&TablePlan> = match &item.star_table {
+                Some(t) => {
+                    let t_lc = t.to_lowercase();
+                    let found: Vec<&TablePlan> =
+                        plans.iter().filter(|p| p.alias == t_lc).collect();
+                    if found.is_empty() {
+                        return Err(DbError::not_found(format!(
+                            "表或别名 \"{}\" 不在本次查询中",
+                            t
+                        )));
+                    }
+                    found
+                }
+                None => plans.iter().collect(),
+            };
+            for plan in targets {
+                for column in &plan.columns {
+                    out_columns.push(column.name.clone());
+                    projections.push(Expr::Column {
+                        table: Some(plan.alias.clone()),
+                        name: column.name.clone(),
+                    });
+                }
             }
         } else {
             out_columns.push(match &item.alias {
@@ -690,7 +746,7 @@ pub(crate) fn exec_select(
             .unwrap_or(false)
         || stmt.order_by.iter().any(|o| contains_aggregate(&o.expr));
 
-    // 分组
+    // ---------------------------------------------------------------- 分组
     let groups: Vec<Vec<RowContext>> = if !stmt.group_by.is_empty() {
         group_rows(rows, &stmt.group_by, params)?
     } else if has_aggregate {
@@ -703,7 +759,7 @@ pub(crate) fn exec_select(
         rows.into_iter().map(|row| vec![row]).collect()
     };
 
-    // 投影 + HAVING + 排序键
+    // -------------------------------------------- 投影 + HAVING + 排序键
     let mut output: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     for group in &groups {
         if let Some(having) = &stmt.having {
@@ -723,27 +779,115 @@ pub(crate) fn exec_select(
         output.push((values, sort_keys));
     }
 
-    // DISTINCT
+    // ---------------------------------------------------------------- DISTINCT
     if stmt.distinct {
-        let mut seen: HashSet<String> = HashSet::new();
-        output.retain(|(values, _)| {
-            let key = values
-                .iter()
-                .map(|v| codec::index_key(v).unwrap_or_else(|| "null".to_string()))
-                .collect::<Vec<String>>()
-                .join("\u{1}");
-            seen.insert(key)
-        });
+        dedup_pairs(&mut output);
     }
 
-    // ORDER BY
+    Ok((out_columns, output))
+}
+
+fn dedup_pairs(pairs: &mut Vec<(Vec<Value>, Vec<Value>)>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    pairs.retain(|(values, _)| {
+        let key = values
+            .iter()
+            .map(|v| codec::index_key(v).unwrap_or_else(|| "null".to_string()))
+            .collect::<Vec<String>>()
+            .join("\u{1}");
+        seen.insert(key)
+    });
+}
+
+fn apply_offset_limit(
+    pairs: &mut Vec<(Vec<Value>, Vec<Value>)>,
+    offset_expr: &Option<Expr>,
+    limit_expr: &Option<Expr>,
+    params: &[Value],
+) -> Result<()> {
+    let empty = RowContext::new(&[], Vec::new());
+    let offset = match offset_expr {
+        Some(expr) => to_usize(&eval(expr, &empty, params)?)?,
+        None => 0,
+    };
+    let limit = match limit_expr {
+        Some(expr) => Some(to_usize(&eval(expr, &empty, params)?)?),
+        None => None,
+    };
+    *pairs = pairs
+        .iter()
+        .skip(offset)
+        .take(limit.unwrap_or(usize::MAX))
+        .cloned()
+        .collect();
+    Ok(())
+}
+
+/// SELECT 执行入口：处理 UNION 与最终 ORDER BY / LIMIT
+pub(crate) fn exec_select(
+    engine: &mut Engine,
+    stmt: &SelectStmt,
+    params: &[Value],
+    committed_only: bool,
+) -> Result<QueryResult> {
+    let (columns, mut pairs) = select_base(engine, stmt, params, committed_only)?;
+
+    if let Some((kind, right)) = &stmt.union {
+        let (rcolumns, mut rpairs) = select_base(engine, right, params, committed_only)?;
+        if rcolumns.len() != columns.len() {
+            return Err(DbError::syntax(format!(
+                "UNION 两侧列数不一致：左侧 {} 列，右侧 {} 列",
+                columns.len(),
+                rcolumns.len()
+            )));
+        }
+        // 右侧若写了 LIMIT/OFFSET，先作用于右侧结果
+        apply_offset_limit(&mut rpairs, &right.offset, &right.limit, params)?;
+        pairs.extend(rpairs);
+
+        if *kind == UnionKind::Distinct {
+            dedup_pairs(&mut pairs);
+        }
+
+        // ORDER BY 写在整条语句最后：对合并后的输出列求值
+        if !stmt.order_by.is_empty() {
+            let out_cols: Vec<Column> = columns
+                .iter()
+                .map(|name| Column::new(name.clone(), ColumnType::Text))
+                .collect();
+            pairs.sort_by(|a, b| {
+                let av = RowContext::new(&out_cols, a.0.clone());
+                let bv = RowContext::new(&out_cols, b.0.clone());
+                for order in &stmt.order_by {
+                    let left_value = eval(&order.expr, &av, params).unwrap_or(Value::Null);
+                    let right_value = eval(&order.expr, &bv, params).unwrap_or(Value::Null);
+                    let mut ordering = codec::compare(&left_value, &right_value)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if order.desc {
+                        ordering = ordering.reverse();
+                    }
+                    if ordering != std::cmp::Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        apply_offset_limit(&mut pairs, &stmt.offset, &stmt.limit, params)?;
+
+        let rows = pairs.into_iter().map(|(values, _)| values).collect();
+        return Ok(QueryResult::Select { columns, rows });
+    }
+
+    // 单条 SELECT：组内排序键排序 + LIMIT/OFFSET
     if !stmt.order_by.is_empty() {
         let dirs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
-        output.sort_by(|a, b| {
+        pairs.sort_by(|a, b| {
             for (i, desc) in dirs.iter().enumerate() {
                 let left = a.1.get(i).cloned().unwrap_or(Value::Null);
                 let right = b.1.get(i).cloned().unwrap_or(Value::Null);
-                let mut ordering = codec::compare(&left, &right).unwrap_or(std::cmp::Ordering::Equal);
+                let mut ordering =
+                    codec::compare(&left, &right).unwrap_or(std::cmp::Ordering::Equal);
                 if *desc {
                     ordering = ordering.reverse();
                 }
@@ -754,29 +898,239 @@ pub(crate) fn exec_select(
             std::cmp::Ordering::Equal
         });
     }
+    apply_offset_limit(&mut pairs, &stmt.offset, &stmt.limit, params)?;
 
-    // LIMIT / OFFSET
-    let empty = RowContext::new(&[], Vec::new());
-    let offset = match &stmt.offset {
-        Some(expr) => to_usize(&eval(expr, &empty, params)?)?,
-        None => 0,
+    let rows = pairs.into_iter().map(|(values, _)| values).collect();
+    Ok(QueryResult::Select { columns, rows })
+}
+
+// ------------------------------------------------------------------ JOIN
+
+/// 递归生成 JOIN 树的行：叶子全扫，连接处优先走「跨表等值 + 右表索引」
+fn join_frame(
+    engine: &mut Engine,
+    source: &TableSource,
+    committed_only: bool,
+    params: &[Value],
+) -> Result<(Vec<TablePlan>, Vec<Vec<Value>>)> {
+    match source {
+        TableSource::Table { name, alias } => {
+            let table = engine.table(name)?;
+            let display = alias.clone().unwrap_or_else(|| table.name.clone());
+            let plan = TablePlan {
+                alias: display.to_lowercase(),
+                display,
+                table_name: table.name.clone(),
+                columns: table.columns.clone(),
+                offset: 0,
+            };
+            let pairs = if committed_only {
+                engine.scan_committed(name)?
+            } else {
+                engine.scan(name)?
+            };
+            Ok((vec![plan], pairs.into_iter().map(|(_, v)| v).collect()))
+        }
+        TableSource::Join {
+            left,
+            right,
+            kind,
+            on,
+        } => {
+            let (lplans, lrows) = join_frame(engine, left, committed_only, params)?;
+            let (rplans, rrows) = join_frame(engine, right, committed_only, params)?;
+            let left_width: usize = lplans.iter().map(|p| p.columns.len()).sum();
+            let total_width = left_width + rplans.iter().map(|p| p.columns.len()).sum::<usize>();
+
+            // 索引辅助要求会话可见未提交数据（committed_only 时索引含未提交键）
+            let assist = if committed_only {
+                None
+            } else {
+                find_join_assist(engine, on.as_ref(), &lplans, &rplans)?
+            };
+
+            let mut combined_plans = lplans.clone();
+            for mut plan in rplans {
+                plan.offset += left_width;
+                combined_plans.push(plan);
+            }
+            let sources: Vec<(&str, &[Column], usize)> = combined_plans
+                .iter()
+                .map(|p| (p.alias.as_str(), p.columns.as_slice(), p.offset))
+                .collect();
+
+            let mut out: Vec<Vec<Value>> = Vec::new();
+            match assist {
+                Some(assist) => {
+                    for lrow in &lrows {
+                        let key = lrow[assist.left_pos].clone();
+                        let mut matched = false;
+                        if !key.is_null() {
+                            if let Some(ids) = engine
+                                .find_by_equality(&assist.table_name, &assist.column_name, &key)?
+                            {
+                                for id in ids {
+                                    if let Some(rvals) = engine.get(&assist.table_name, id)? {
+                                        let combined = concat_rows(lrow, &rvals);
+                                        // ON 可能还带其它条件，候选行统一再过滤
+                                        if let Some(on_expr) = on {
+                                            let ctx =
+                                                RowContext::from_tables(&sources, combined.clone());
+                                            if !matches(&eval(on_expr, &ctx, params)?) {
+                                                continue;
+                                            }
+                                        }
+                                        out.push(combined);
+                                        matched = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !matched && *kind == JoinKind::Left {
+                            out.push(extend_null(lrow, total_width));
+                        }
+                    }
+                }
+                None => {
+                    if lrows.len().saturating_mul(rrows.len()) > MAX_JOIN_PAIRS {
+                        return Err(DbError::type_error(format!(
+                            "JOIN 组合规模过大（{} × {} = {} 行对），请在连接列上建索引或减小结果集",
+                            lrows.len(),
+                            rrows.len(),
+                            lrows.len().saturating_mul(rrows.len())
+                        )));
+                    }
+                    for lrow in &lrows {
+                        let mut matched = false;
+                        for rrow in &rrows {
+                            let combined = concat_rows(lrow, rrow);
+                            let pass = match on {
+                                Some(on_expr) => {
+                                    let ctx = RowContext::from_tables(&sources, combined.clone());
+                                    matches(&eval(on_expr, &ctx, params)?)
+                                }
+                                None => true,
+                            };
+                            if pass {
+                                out.push(combined);
+                                matched = true;
+                            }
+                        }
+                        if !matched && *kind == JoinKind::Left {
+                            out.push(extend_null(lrow, total_width));
+                        }
+                    }
+                }
+            }
+            Ok((combined_plans, out))
+        }
+    }
+}
+
+struct JoinAssist {
+    /// 左侧组合行中连接键的下标
+    left_pos: usize,
+    /// 右侧表名 / 连接列名
+    table_name: String,
+    column_name: String,
+}
+
+/// 在 ON 里找「左帧.列 = 右帧.列」且右表有对应单列索引的等值条件
+fn find_join_assist(
+    engine: &Engine,
+    on: Option<&Expr>,
+    lplans: &[TablePlan],
+    rplans: &[TablePlan],
+) -> Result<Option<JoinAssist>> {
+    let on = match on {
+        Some(e) => e,
+        None => return Ok(None),
     };
-    let limit = match &stmt.limit {
-        Some(expr) => Some(to_usize(&eval(expr, &empty, params)?)?),
-        None => None,
-    };
+    // 右侧必须是单表叶子：索引辅助按 row_id 回表取行
+    if rplans.len() != 1 {
+        return Ok(None);
+    }
+    let right = &rplans[0];
 
-    let rows_out: Vec<Vec<Value>> = output
-        .into_iter()
-        .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
-        .map(|(values, _)| values)
-        .collect();
+    let mut stack: Vec<&Expr> = vec![on];
+    while let Some(current) = stack.pop() {
+        match current {
+            Expr::Binary {
+                op: BinOp::And,
+                left: l_expr,
+                right: r_expr,
+            } => {
+                stack.push(l_expr.as_ref());
+                stack.push(r_expr.as_ref());
+            }
+            Expr::Binary {
+                op: BinOp::Eq,
+                left: l_expr,
+                right: r_expr,
+            } => {
+                for (a, b) in [(l_expr.as_ref(), r_expr.as_ref()), (r_expr.as_ref(), l_expr.as_ref())] {
+                    if let (
+                        Expr::Column {
+                            table: Some(ta),
+                            name: ca,
+                        },
+                        Expr::Column {
+                            table: Some(tb),
+                            name: cb,
+                        },
+                    ) = (a, b)
+                    {
+                        let ta = ta.to_lowercase();
+                        let tb = tb.to_lowercase();
+                        if let Some(lp) = lplans.iter().find(|p| p.alias == ta) {
+                            if right.alias == tb {
+                                if let Some(rci) = right
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.to_lowercase() == cb.to_lowercase())
+                                {
+                                    if let Some(lci) = lp
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.name.to_lowercase() == ca.to_lowercase())
+                                    {
+                                        let col_name = right.columns[rci].name.clone();
+                                        if engine
+                                            .table(&right.table_name)?
+                                            .single_column_index(&col_name)
+                                            .is_some()
+                                        {
+                                            return Ok(Some(JoinAssist {
+                                                left_pos: lp.offset + lci,
+                                                table_name: right.table_name.clone(),
+                                                column_name: col_name,
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
 
-    Ok(QueryResult::Select {
-        columns: out_columns,
-        rows: rows_out,
-    })
+fn concat_rows(lrow: &[Value], rrow: &[Value]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(lrow.len() + rrow.len());
+    out.extend_from_slice(lrow);
+    out.extend_from_slice(rrow);
+    out
+}
+
+fn extend_null(lrow: &[Value], width: usize) -> Vec<Value> {
+    let mut out = Vec::with_capacity(width);
+    out.extend_from_slice(lrow);
+    out.resize(width, Value::Null);
+    out
 }
 
 fn to_usize(value: &Value) -> Result<usize> {
@@ -1117,25 +1471,44 @@ fn exec_explain(
     match statement {
         Statement::Select(select) => {
             if let Some(from) = &select.from {
-                let (table_name, total) = {
-                    let table = engine.table(&from.table)?;
-                    (table.name.clone(), table.row_count)
-                };
-                rows.push(kv("表", table_name));
+                match from {
+                    TableSource::Table { name, .. } => {
+                        let (table_name, total) = {
+                            let table = engine.table(name)?;
+                            (table.name.clone(), table.row_count)
+                        };
+                        rows.push(kv("表", table_name));
 
-                let candidates =
-                    index_candidates(&*engine, &from.table, select.where_clause.as_ref(), params)?;
-                match candidates {
-                    Some(ids) => {
-                        rows.push(kv("访问方式", "索引查找".to_string()));
-                        rows.push(kv("扫描行数", ids.len().to_string()));
+                        let candidates = index_candidates(
+                            &*engine,
+                            name,
+                            select.where_clause.as_ref(),
+                            params,
+                        )?;
+                        match candidates {
+                            Some(ids) => {
+                                rows.push(kv("访问方式", "索引查找".to_string()));
+                                rows.push(kv("扫描行数", ids.len().to_string()));
+                            }
+                            None => {
+                                rows.push(kv("访问方式", "全表扫描".to_string()));
+                                rows.push(kv("扫描行数", total.to_string()));
+                            }
+                        }
+                        rows.push(kv("表总行数", total.to_string()));
                     }
-                    None => {
-                        rows.push(kv("访问方式", "全表扫描".to_string()));
-                        rows.push(kv("扫描行数", total.to_string()));
+                    TableSource::Join { kind, .. } => {
+                        rows.push(kv("表", from.describe()));
+                        rows.push(kv(
+                            "访问方式",
+                            match kind {
+                                JoinKind::Inner | JoinKind::Cross => "嵌套循环连接".to_string(),
+                                JoinKind::Left => "嵌套循环连接（外连接）".to_string(),
+                            },
+                        ));
+                        rows.push(kv("说明", "等值连接列上有索引时自动改走索引查找".to_string()));
                     }
                 }
-                rows.push(kv("表总行数", total.to_string()));
 
                 if !select.group_by.is_empty() {
                     rows.push(kv(

@@ -233,13 +233,18 @@ impl Parser {
             self.advance();
             return Ok(Statement::Rollback);
         }
-        for word in ["JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "FULL", "UNION"] {
+        for word in ["JOIN", "LEFT", "INNER", "CROSS", "UNION"] {
             if self.at_keyword(word) {
                 return Err(DbError::syntax(format!(
-                    "{} 不受支持：只支持单表查询，请在应用层合并结果",
+                    "语句不能以 {} 开头",
                     word
                 )));
             }
+        }
+        if self.at_keyword("RIGHT") || self.at_keyword("FULL") || self.at_keyword("OUTER") {
+            return Err(DbError::syntax(
+                "暂不支持 RIGHT / FULL OUTER JOIN：RIGHT JOIN 可交换两侧写成 LEFT JOIN",
+            ));
         }
         let got = self.peek().text.clone();
         Err(DbError::syntax(format!("无法识别的语句起始: \"{}\"", got)))
@@ -255,7 +260,6 @@ impl Parser {
         } else {
             None
         };
-        self.reject_multi_table()?;
 
         let where_clause = if self.eat_keyword("WHERE") {
             Some(self.parse_expr()?)
@@ -276,7 +280,7 @@ impl Parser {
             None
         };
 
-        let order_by = if self.eat_keyword("ORDER") {
+        let mut order_by = if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             let mut list = Vec::new();
             loop {
@@ -297,13 +301,47 @@ impl Parser {
             Vec::new()
         };
 
-        let limit = if self.eat_keyword("LIMIT") {
+        let mut limit = if self.eat_keyword("LIMIT") {
             Some(self.parse_expr()?)
         } else {
             None
         };
-        let offset = if self.eat_keyword("OFFSET") {
+        let mut offset = if self.eat_keyword("OFFSET") {
             Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // UNION / UNION ALL：末尾的 ORDER BY / LIMIT / OFFSET 归属整条
+        // 复合查询（标准语义），解析时从右侧上移；两侧都写才算错误
+        let union = if self.eat_keyword("UNION") {
+            let all = self.eat_keyword("ALL");
+            let mut right = self.parse_select_body()?;
+            if !right.order_by.is_empty() {
+                if !order_by.is_empty() {
+                    return Err(DbError::syntax(
+                        "ORDER BY 在 UNION 两侧都出现了，只能写一次",
+                    ));
+                }
+                order_by = std::mem::take(&mut right.order_by);
+            }
+            if right.limit.is_some() || right.offset.is_some() {
+                if limit.is_some() || offset.is_some() {
+                    return Err(DbError::syntax(
+                        "LIMIT/OFFSET 在 UNION 两侧都出现了，只能写一次",
+                    ));
+                }
+                limit = right.limit.take();
+                offset = right.offset.take();
+            }
+            Some((
+                if all {
+                    UnionKind::All
+                } else {
+                    UnionKind::Distinct
+                },
+                Box::new(right),
+            ))
         } else {
             None
         };
@@ -318,24 +356,16 @@ impl Parser {
             order_by,
             limit,
             offset,
+            union,
         }))
     }
 
-    fn reject_multi_table(&mut self) -> Result<()> {
-        if self.at_punct(",") {
-            return Err(DbError::syntax(
-                "不支持逗号连接的多表查询：只支持单表查询",
-            ));
+    /// parse_select 的内部形式：返回 SelectStmt 本身（供 UNION 右侧递归）
+    fn parse_select_body(&mut self) -> Result<SelectStmt> {
+        match self.parse_select()? {
+            Statement::Select(select) => Ok(select),
+            _ => unreachable!("parse_select 只返回 Select"),
         }
-        for word in ["JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "FULL", "UNION"] {
-            if self.at_keyword(word) {
-                return Err(DbError::syntax(format!(
-                    "{} 查询不受支持：只支持单表查询，请在应用层合并结果",
-                    word
-                )));
-            }
-        }
-        Ok(())
     }
 
     fn parse_select_items(&mut self) -> Result<Vec<SelectItem>> {
@@ -347,18 +377,20 @@ impl Parser {
                     expr: Expr::Literal(Literal::Null),
                     alias: None,
                     star: true,
+                    star_table: None,
                 });
             } else if self.peek().kind == TokenKind::Ident
                 && self.peek_at(1).is_punct(".")
                 && self.peek_at(2).is_punct("*")
             {
-                self.advance();
+                let table = self.advance().text;
                 self.advance();
                 self.advance();
                 items.push(SelectItem {
                     expr: Expr::Literal(Literal::Null),
                     alias: None,
                     star: true,
+                    star_table: Some(table),
                 });
             } else {
                 let expr = self.parse_expr()?;
@@ -373,6 +405,7 @@ impl Parser {
                     expr,
                     alias,
                     star: false,
+                    star_table: None,
                 });
             }
             if !self.eat_punct(",") {
@@ -382,7 +415,51 @@ impl Parser {
         Ok(items)
     }
 
-    fn parse_from(&mut self) -> Result<FromItem> {
+    /// FROM 子句：`表 [别名] (JOIN | `,`) 表 [别名] [ON ...]*` 的左深链
+    fn parse_from(&mut self) -> Result<TableSource> {
+        let mut left = self.parse_table_ref()?;
+        loop {
+            let kind = if self.at_keyword("INNER") {
+                self.advance();
+                self.expect_keyword("JOIN")?;
+                JoinKind::Inner
+            } else if self.eat_keyword("JOIN") {
+                JoinKind::Inner
+            } else if self.at_keyword("LEFT") {
+                self.advance();
+                let _ = self.eat_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                JoinKind::Left
+            } else if self.at_keyword("CROSS") {
+                self.advance();
+                self.expect_keyword("JOIN")?;
+                JoinKind::Cross
+            } else if self.at_punct(",") {
+                // 逗号连接 = CROSS JOIN
+                self.advance();
+                JoinKind::Cross
+            } else {
+                break;
+            };
+
+            let right = self.parse_table_ref()?;
+            let on = if kind == JoinKind::Cross {
+                None
+            } else {
+                self.expect_keyword("ON")?;
+                Some(self.parse_expr()?)
+            };
+            left = TableSource::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                kind,
+                on,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_table_ref(&mut self) -> Result<TableSource> {
         let table = self.expect_ident()?;
         let alias = if self.eat_keyword("AS") {
             Some(self.expect_ident()?)
@@ -391,7 +468,16 @@ impl Parser {
         } else {
             None
         };
-        Ok(FromItem { table, alias })
+        // 未支持的连接形式给出明确的替代建议，而不是笼统的语法错误
+        for (word, hint) in [("RIGHT", "用 LEFT JOIN 交换两侧即可"), ("FULL", "暂不支持 FULL OUTER JOIN")] {
+            if self.at_keyword(word) {
+                return Err(DbError::syntax(format!("{} JOIN 不受支持：{}", word, hint)));
+            }
+        }
+        if self.at_keyword("OUTER") {
+            return Err(DbError::syntax("OUTER 需要跟在 LEFT JOIN 中使用"));
+        }
+        Ok(TableSource::Table { name: table, alias })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -970,7 +1056,10 @@ mod tests {
         match stmt {
             Statement::Select(select) => {
                 assert_eq!(select.items.len(), 2);
-                assert_eq!(select.from.as_ref().unwrap().table, "users");
+                match select.from.as_ref().unwrap() {
+                    TableSource::Table { name, .. } => assert_eq!(name, "users"),
+                    other => panic!("期望单表，得到 {:?}", other),
+                }
                 assert!(select.where_clause.is_some());
                 assert_eq!(select.order_by.len(), 1);
                 assert!(select.order_by[0].desc);
@@ -986,7 +1075,10 @@ mod tests {
         match stmt {
             Statement::Select(select) => {
                 assert!(select.items[0].star);
-                assert_eq!(select.from.as_ref().unwrap().alias.as_deref(), Some("u"));
+                match select.from.as_ref().unwrap() {
+                    TableSource::Table { alias, .. } => assert_eq!(alias.as_deref(), Some("u")),
+                    other => panic!("期望单表，得到 {:?}", other),
+                }
             }
             other => panic!("期望 SELECT，得到 {:?}", other),
         }
@@ -1084,12 +1176,66 @@ mod tests {
     }
 
     #[test]
-    fn join_is_rejected_clearly() {
-        let err = Parser::parse("SELECT * FROM a JOIN b ON a.id = b.id").unwrap_err();
-        assert!(err.message.contains("只支持单表查询"), "{}", err.message);
-
-        let err = Parser::parse("SELECT * FROM a, b").unwrap_err();
-        assert!(err.message.contains("多表查询"), "{}", err.message);
+    fn join_union_parse() {
+        // INNER JOIN + ON
+        match parse("SELECT u.id, o.item FROM users u JOIN orders o ON u.id = o.user_id") {
+            Statement::Select(select) => match select.from.as_ref().unwrap() {
+                TableSource::Join { kind, on, .. } => {
+                    assert_eq!(*kind, JoinKind::Inner);
+                    assert!(on.is_some());
+                }
+                other => panic!("期望 JOIN，得到 {:?}", other),
+            },
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+        // LEFT OUTER JOIN / 逗号连接 / CROSS JOIN
+        assert!(matches!(
+            parse("SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.id"),
+            Statement::Select(_)
+        ));
+        match parse("SELECT * FROM a, b") {
+            Statement::Select(select) => match select.from.as_ref().unwrap() {
+                TableSource::Join { kind, on, .. } => {
+                    assert_eq!(*kind, JoinKind::Cross);
+                    assert!(on.is_none());
+                }
+                other => panic!("期望 CROSS，得到 {:?}", other),
+            },
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+        assert!(matches!(
+            parse("SELECT * FROM a CROSS JOIN b"),
+            Statement::Select(_)
+        ));
+        // UNION / UNION ALL
+        match parse("SELECT id FROM a UNION ALL SELECT id FROM b") {
+            Statement::Select(select) => {
+                let (kind, right) = select.union.as_ref().unwrap();
+                assert_eq!(*kind, UnionKind::All);
+                assert!(matches!(right.from.as_ref().unwrap(), TableSource::Table { .. }));
+            }
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+        assert!(matches!(
+            parse("SELECT id FROM a UNION SELECT id FROM b"),
+            Statement::Select(_)
+        ));
+        // 末尾 ORDER BY 归属整条复合查询（上移到左侧）
+        match parse("SELECT id FROM a UNION SELECT id FROM b ORDER BY id") {
+            Statement::Select(select) => {
+                assert_eq!(select.order_by.len(), 1);
+                assert!(select.union.as_ref().unwrap().1.order_by.is_empty());
+            }
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+        // 两侧都写 ORDER BY 才报错
+        let err =
+            Parser::parse("SELECT id FROM a ORDER BY id UNION SELECT id FROM b ORDER BY id")
+                .unwrap_err();
+        assert!(err.message.contains("只能写一次"), "{}", err.message);
+        // RIGHT / FULL 仍不支持，但给出明确指引
+        let err = Parser::parse("SELECT * FROM a RIGHT JOIN b ON a.id = b.id").unwrap_err();
+        assert!(err.message.contains("RIGHT"), "{}", err.message);
     }
 
     #[test]

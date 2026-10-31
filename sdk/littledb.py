@@ -35,11 +35,11 @@ from __future__ import annotations
 
 import datetime as _dt
 import decimal as _decimal
+import http.client as _http
 import json as _json
+import threading as _threading
 import time as _time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 __all__ = [
     "Client",
@@ -140,11 +140,35 @@ class Client:
         # 服务端回填；带上它才能让 BEGIN 的事务跨请求延续
         self.session_id = session_id
         self.timeout = timeout
+        # keep-alive 连接：一条 TCP 跑到底（实测点查 3.85ms → 0.20ms）。
+        # http.client 的连接不是线程安全的，用锁串行化；
+        # 多线程请给每个线程建独立的 Client（会话本来也是按连接隔离的）。
+        self._lock = _threading.Lock()
+        self._conn: _http.HTTPConnection | None = None
+        self._last_used = 0.0
+
+    def _connection(self) -> _http.HTTPConnection:
+        # 连接闲置超过 60 秒就换新的：服务端会回收空闲连接，
+        # 复用一条已被对端关闭的连接会无谓地报网络错误
+        if self._conn is not None and _time.monotonic() - self._last_used > 60:
+            self._drop_connection()
+        if self._conn is None:
+            parsed = urllib.parse.urlsplit(self.base_url)
+            self._conn = _http.HTTPConnection(
+                parsed.hostname, parsed.port or 80, timeout=self.timeout)
+        return self._conn
+
+    def _drop_connection(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
 
     # ------------------------------------------------------------ 底层请求
 
     def _request(self, method: str, path: str, body=None):
-        url = self.base_url + path
         headers = {"Accept": "application/json"}
         data = None
         if body is not None:
@@ -155,27 +179,35 @@ class Client:
         if self.session_id:
             headers["X-Session-Id"] = self.session_id
 
-        request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read()
-                sid = response.headers.get("X-Session-Id")
-                if sid:
-                    self.session_id = sid
-                payload = _parse_json(raw, response.status)
-        except urllib.error.HTTPError as err:
-            raw = err.read()
-            sid = err.headers.get("X-Session-Id") if err.headers else None
-            if sid:
-                self.session_id = sid
-            payload = _parse_json(raw, err.code)
-            raise _error_from(payload, err.code, err.headers)
-        except urllib.error.URLError as err:
-            raise LittleDBError(f"无法连接 LittleDB：{err.reason}", code="NETWORK")
-
-        if not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise _error_from(payload, 200, None)
-        return payload.get("result")
+        with self._lock:
+            last_error: Exception | None = None
+            for attempt in (0, 1):
+                try:
+                    conn = self._connection()
+                    conn.request(method, path, body=data, headers=headers)
+                    response = conn.getresponse()
+                    raw = response.read()
+                    sid = response.headers.get("X-Session-Id")
+                    if sid:
+                        self.session_id = sid
+                    self._last_used = _time.monotonic()
+                    payload = _parse_json(raw, response.status)
+                    if not isinstance(payload, dict) or payload.get("ok") is not True:
+                        raise _error_from(payload, response.status, response.headers)
+                    return payload.get("result")
+                except LittleDBError:
+                    raise  # 服务端的业务错误（4xx/5xx），连接本身是好的
+                except (_http.HTTPException, OSError) as err:
+                    # 连接级失败：空闲连接被对端关闭、网络抖动等。
+                    # 只对幂等的 GET 自动重试一次；写请求重发有双执行风险，直接报错，
+                    # 下一次请求会自动换新连接。
+                    last_error = err
+                    self._drop_connection()
+                    if method != "GET" or attempt == 1:
+                        break
+            raise LittleDBError(
+                f"请求失败（连接已重置，请重试）：{last_error}", code="NETWORK"
+            )
 
     # ------------------------------------------------------------ 查询
 

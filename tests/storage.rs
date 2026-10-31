@@ -246,9 +246,13 @@ fn wal_recovery_after_crash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 其它会话不能看到未提交事务的行（曾经是脏读：READ UNCOMMITTED）
+/// 快照可见性 + 多写语义：
+/// - 开放事务的未提交行对其它会话不可见（不脏读）
+/// - 其它会话的写不再被阻塞（P2 多写）
+/// - 同页写-写冲突 → 首写者获胜，后者收到 WRITE_CONFLICT
 #[test]
 fn cross_session_reads_see_only_committed() {
+    use littledb::error::WRITE_CONFLICT;
     use littledb::sql::executor::ConnSession;
     use littledb::sql::QueryResult;
     use std::sync::{Arc, RwLock};
@@ -271,7 +275,7 @@ fn cross_session_reads_see_only_committed() {
 
     let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
     let mut writer = ConnSession::new(Arc::clone(&engine));
-    let mut reader = littledb::sql::executor::ConnSession::new(Arc::clone(&engine));
+    let mut reader = ConnSession::new(Arc::clone(&engine));
 
     writer.execute("BEGIN", &[]).unwrap();
     writer
@@ -284,11 +288,23 @@ fn cross_session_reads_see_only_committed() {
         QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
         other => panic!("期望 SELECT，得到 {:?}", other),
     }
-    // 未提交期间，其它会话的写会被正确拒绝（全局单写锁语义保持不变）
-    assert!(reader.execute("INSERT INTO players VALUES (3, 'blocked', 0)", &[]).is_err());
 
-    writer.execute("COMMIT", &[]).unwrap();
-    // 提交之后立即可见
+    // P2：其它会话的写不再被阻塞（隐式事务立即提交）
+    reader
+        .execute("INSERT INTO players VALUES (3, 'by-reader', 0)", &[])
+        .unwrap_or_else(|e| panic!("多写下其它会话的写不应被阻塞: {}", e));
+    // 但写者的未提交数据依然不可见
+    let seen = reader.execute("SELECT COUNT(*) FROM players", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(2)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // 写者提交：与读者的插入落在同一页 → 页级写冲突，首写者（读者）获胜
+    let commit_err = writer.execute("COMMIT", &[]).unwrap_err();
+    assert_eq!(commit_err.code, WRITE_CONFLICT, "{}", commit_err.message);
+
+    // 冲突方数据已回滚：读者提交的数据完好，写者的未提交行消失
     let seen = reader.execute("SELECT COUNT(*) FROM players", &[]).unwrap();
     match seen {
         QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(2)]]),
@@ -311,6 +327,136 @@ fn cross_session_reads_see_only_committed() {
     drop(reader);
     let engine = Arc::into_inner(engine).unwrap();
     let mut engine = RwLock::into_inner(engine).unwrap();
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P2 主菜：两个会话同时各持开放事务，写不同的表互不阻塞、都提交成功
+#[test]
+fn multi_writer_disjoint_tables_commit() {
+    use littledb::sql::executor::ConnSession;
+    use littledb::sql::QueryResult;
+    use std::sync::{Arc, RwLock};
+
+    let dir = temp_dir("multiwriter");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+    engine
+        .write(|e| -> Result<()> {
+            e.create_table("notes", vec![Column::new("id", ColumnType::Int)], false)
+        })
+        .unwrap();
+    engine.close().unwrap();
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+    let mut a = ConnSession::new(Arc::clone(&engine));
+    let mut b = ConnSession::new(Arc::clone(&engine));
+
+    a.execute("BEGIN", &[]).unwrap();
+    b.execute("BEGIN", &[]).unwrap();
+    a.execute("INSERT INTO players VALUES (10, 'from-a', 0)", &[]).unwrap();
+    b.execute("INSERT INTO notes VALUES (1)", &[]).unwrap();
+    a.execute("COMMIT", &[]).unwrap();
+    b.execute("COMMIT", &[]).unwrap();
+
+    let seen = b.execute("SELECT COUNT(*) FROM players", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    let seen = a.execute("SELECT COUNT(*) FROM notes", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    drop(a);
+    drop(b);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 回滚的索引精确撤销：A 回滚后，B 的唯一索引查询不受污染
+#[test]
+fn rollback_keeps_index_consistent_for_others() {
+    use littledb::sql::executor::ConnSession;
+    use littledb::sql::QueryResult;
+    use std::sync::{Arc, RwLock};
+
+    let dir = temp_dir("rollback-index");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        setup(&mut engine).unwrap(); // name 列 UNIQUE
+        engine
+            .write(|e| -> Result<()> {
+                e.insert("players", vec![Value::Int(1), Value::Text("kept".into()), Value::Int(0)])?;
+                Ok(())
+            })
+            .unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+    let mut a = ConnSession::new(Arc::clone(&engine));
+    let mut b = ConnSession::new(Arc::clone(&engine));
+
+    a.execute("BEGIN", &[]).unwrap();
+    a.execute("INSERT INTO players VALUES (2, 'ghost', 0)", &[]).unwrap();
+    b.execute("INSERT INTO players VALUES (3, 'real', 0)", &[]).unwrap();
+    a.execute("ROLLBACK", &[]).unwrap();
+
+    // A 的幽灵行不在索引里：同 key 再插入应成功
+    b.execute("INSERT INTO players VALUES (4, 'ghost', 0)", &[]).unwrap();
+    let seen = b.execute("SELECT name FROM players WHERE name = 'ghost'", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // B 自己的未提交行在自己眼里可见
+    let seen = b.execute("SELECT COUNT(*) FROM players", &[]).unwrap();
+    match seen {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(3)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    b.execute("COMMIT", &[]).unwrap();
+
+    drop(a);
+    drop(b);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DDL 独占门禁：其它会话有开放事务时，DDL 拒绝执行
+#[test]
+fn ddl_gate_with_open_txn() {
+    use littledb::sql::executor::ConnSession;
+    use std::sync::{Arc, RwLock};
+
+    let dir = temp_dir("ddlgate");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        setup(&mut engine).unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+    let mut a = ConnSession::new(Arc::clone(&engine));
+    let mut b = ConnSession::new(Arc::clone(&engine));
+
+    a.execute("BEGIN", &[]).unwrap();
+    let err = b
+        .execute("CREATE TABLE gated (id INT PRIMARY KEY)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "DATABASE_LOCKED", "{}", err.message);
+    // A 提交后 DDL 恢复可用
+    a.execute("COMMIT", &[]).unwrap();
+    b.execute("CREATE TABLE gated (id INT PRIMARY KEY)", &[]).unwrap();
+
+    drop(a);
+    drop(b);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
     engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -627,5 +773,135 @@ fn subquery_in_where() {
     assert_eq!(got, vec![vec![Value::Text("bob".into())], vec![Value::Text("carol".into())]]);
 
     session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 复刻 HTTP 冲突场景：A BEGIN → A UPDATE → B BEGIN → B UPDATE → B COMMIT → A COMMIT
+#[test]
+fn http_conflict_sequence_repro() {
+    use littledb::sql::executor::ConnSession;
+    use std::sync::{Arc, RwLock};
+
+    let dir = temp_dir("httpconflict");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        engine
+            .write(|e| -> Result<()> {
+                e.create_table(
+                    "acc",
+                    vec![{
+                        let mut c = Column::new("id", ColumnType::Int);
+                        c.primary_key = true;
+                        c
+                    }],
+                    false,
+                )?;
+                e.insert("acc", vec![Value::Int(1)])?;
+                Ok(())
+            })
+            .unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+    let mut a = ConnSession::new(Arc::clone(&engine));
+    let mut b = ConnSession::new(Arc::clone(&engine));
+
+    a.execute("BEGIN", &[]).unwrap();
+    let r = a.execute("UPDATE acc SET id = 999 WHERE id = 1", &[]);
+    println!("A update: {:?}", r.as_ref().map(|x| x.summary()));
+    b.execute("BEGIN", &[]).unwrap();
+    let r = b.execute("UPDATE acc SET id = 777 WHERE id = 1", &[]);
+    println!("B update: {:?}", r.as_ref().map(|x| x.summary()));
+    let r = b.execute("COMMIT", &[]);
+    println!("B commit: {:?}", r.as_ref().map(|x| x.summary()));
+    let r = a.execute("COMMIT", &[]);
+    println!("A commit: {:?}", r);
+    let r = b.execute("SELECT id FROM acc", &[]).unwrap();
+    match r {
+        littledb::sql::QueryResult::Select { rows, .. } => println!("final rows: {:?}", rows),
+        other => println!("other: {:?}", other),
+    }
+
+    drop(a);
+    drop(b);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 跨会话连续 UPDATE：每个语句在不同会话的隐式事务里提交，
+/// 索引的语句期更新 + 提交/回滚撤销必须保持一致
+#[test]
+fn cross_session_sequential_updates() {
+    use littledb::sql::executor::ConnSession;
+    use std::sync::{Arc, RwLock};
+
+    let dir = temp_dir("sequpdate");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        engine
+            .write(|e| -> Result<()> {
+                e.create_table(
+                    "acc",
+                    vec![{
+                        let mut c = Column::new("id", ColumnType::Int);
+                        c.primary_key = true;
+                        c
+                    }],
+                    false,
+                )?;
+                e.insert("acc", vec![Value::Int(1)])?;
+                Ok(())
+            })
+            .unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+    for round in 0..4 {
+        let mut session = ConnSession::new(Arc::clone(&engine));
+        session
+            .execute(
+                &format!(
+                    "UPDATE acc SET id = {} WHERE id = {}",
+                    100 + round,
+                    if round == 0 { 1 } else { 99 + round }
+                ),
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("round {} update 失败: {}", round, e));
+        let mut probe = ConnSession::new(Arc::clone(&engine));
+        match probe.execute("SELECT id FROM acc", &[]).unwrap() {
+            littledb::sql::QueryResult::Select { rows, .. } => {
+                println!("after round {}: rows = {:?}", round, rows)
+            }
+            other => println!("after round {}: {:?}", round, other.summary()),
+        }
+        {
+            let g = engine.read().unwrap();
+            let s = g.store.stats();
+            println!(
+                "  stats: commit_seq(私有) pending_pages={} checkpoints={}",
+                s.pending_pages, s.checkpoints
+            );
+        }
+    }
+    let mut check = ConnSession::new(Arc::clone(&engine));
+    let seen = check.execute("SELECT COUNT(*) FROM acc", &[]).unwrap();
+    match seen {
+        littledb::sql::QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // 主键更新后旧值不可查、新值可查
+    let seen = check.execute("SELECT id FROM acc WHERE id = 103", &[]).unwrap();
+    match seen {
+        littledb::sql::QueryResult::Select { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    drop(check);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
+    engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

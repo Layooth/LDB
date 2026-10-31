@@ -16,6 +16,7 @@ pub const NOT_FOUND: &str = "NOT_FOUND";
 pub const ALREADY_EXISTS: &str = "ALREADY_EXISTS";
 pub const CONSTRAINT: &str = "CONSTRAINT_VIOLATION";
 pub const LOCKED: &str = "DATABASE_LOCKED";
+pub const WRITE_CONFLICT: &str = "WRITE_CONFLICT";
 pub const LIMIT: &str = "LIMIT_EXCEEDED";
 pub const AUTH: &str = "AUTH_FAILED";
 pub const INTERNAL: &str = "INTERNAL_ERROR";

@@ -10,7 +10,7 @@ use crate::catalog::{IndexDef, TableDef};
 use crate::codec::{self, Column, ColumnType, Value};
 use crate::error::{self, DbError, Result};
 use crate::json::Json;
-use crate::store::{Store, StoreStats};
+use crate::store::{IndexOp, RollbackInfo, Store, StoreStats};
 use crate::table::{self, Index, Table};
 
 pub struct Engine {
@@ -52,31 +52,138 @@ impl Engine {
         self.tables.iter().map(|t| t.name.clone()).collect()
     }
 
-    /// 在一个事务里执行写操作，出错自动回滚
+    /// 在一个事务里执行写操作，出错自动回滚（内部属主）
     pub fn write<T, F>(&mut self, action: F) -> Result<T>
     where
         F: FnOnce(&mut Engine) -> Result<T>,
     {
-        self.store.begin(INTERNAL_TXN_OWNER)?;
+        self.write_as(INTERNAL_TXN_OWNER, action)
+    }
+
+    /// 同 write，但事务属主由调用方指定（会话 id），
+    /// 这样 DDL 独占门禁不会把会话自己的隐式事务误判为「其它会话」
+    pub fn write_as<T, F>(&mut self, owner: u64, action: F) -> Result<T>
+    where
+        F: FnOnce(&mut Engine) -> Result<T>,
+    {
+        self.store.begin(owner)?;
         // 用 reborrow：FnOnce 会 move 掉 &mut，之后的 commit 还要用 self
         let outcome = action(&mut *self);
         match outcome {
-            Ok(value) => match self.store.commit() {
+            Ok(value) => match self.commit(owner) {
                 Ok(()) => Ok(value),
                 Err(err) => {
-                    self.rollback_and_reload();
+                    self.rollback_txn(owner);
                     Err(err)
                 }
             },
             Err(err) => {
-                self.rollback_and_reload();
+                self.rollback_txn(owner);
                 Err(err)
             }
         }
     }
 
-    fn rollback_and_reload(&mut self) {
-        self.store.rollback();
+    /// 回滚指定会话的事务：
+    /// - 纯 DML：按记录的索引操作逆序精确撤销 + 修正行数（不动其它事务）
+    /// - 含 DDL：从 catalog 重建全部表，再把其它开放事务的索引操作重放回去
+    fn rollback_txn(&mut self, owner: u64) {
+        let info = self.store.rollback(owner);
+        let info = match info {
+            Some(info) => info,
+            None => return,
+        };
+        if !info.catalog_dirty {
+            self.undo_index_ops(&info);
+        } else {
+            self.reload_tables();
+            // 其它开放事务的未提交索引状态随全量重建被抹掉，重放恢复
+            let ops = self.store.open_index_ops(owner);
+            self.apply_index_ops(&ops);
+        }
+    }
+
+    fn undo_index_ops(&mut self, info: &RollbackInfo) {
+        let mut ops: Vec<&IndexOp> = info.index_ops.iter().rev().collect();
+        for op in ops.drain(..) {
+            self.apply_inverse(op);
+        }
+        for (table_id, delta) in &info.row_deltas {
+            if let Ok(pos) = self.table_index_by_id(*table_id) {
+                let table = &mut self.tables[pos];
+                table.row_count = if *delta >= 0 {
+                    table.row_count.saturating_sub(*delta as u32)
+                } else {
+                    table.row_count.saturating_add((-*delta) as u32)
+                };
+            }
+        }
+    }
+
+    fn apply_index_ops(&mut self, ops: &[IndexOp]) {
+        for op in ops {
+            self.apply_op(op);
+        }
+    }
+
+    fn apply_op(&mut self, op: &IndexOp) {
+        let (table_id, index_pos, key, row_id, added) = match op {
+            IndexOp::Add {
+                table_id,
+                index_pos,
+                key,
+                row_id,
+            } => (*table_id, *index_pos, key, *row_id, true),
+            IndexOp::Remove {
+                table_id,
+                index_pos,
+                key,
+                row_id,
+            } => (*table_id, *index_pos, key, *row_id, false),
+        };
+        if let Ok(pos) = self.table_index_by_id(table_id) {
+            let table = &mut self.tables[pos];
+            if added {
+                table::index_add_key(table, index_pos, key, row_id);
+            } else {
+                table::index_remove_key(table, index_pos, key, row_id);
+            }
+        }
+    }
+
+    fn apply_inverse(&mut self, op: &IndexOp) {
+        let (table_id, index_pos, key, row_id, added) = match op {
+            IndexOp::Add {
+                table_id,
+                index_pos,
+                key,
+                row_id,
+            } => (*table_id, *index_pos, key, *row_id, true),
+            IndexOp::Remove {
+                table_id,
+                index_pos,
+                key,
+                row_id,
+            } => (*table_id, *index_pos, key, *row_id, false),
+        };
+        if let Ok(pos) = self.table_index_by_id(table_id) {
+            let table = &mut self.tables[pos];
+            if added {
+                table::index_remove_key(table, index_pos, key, row_id);
+            } else {
+                table::index_add_key(table, index_pos, key, row_id);
+            }
+        }
+    }
+
+    fn table_index_by_id(&self, table_id: u32) -> Result<usize> {
+        self.tables
+            .iter()
+            .position(|t| t.id == table_id)
+            .ok_or_else(|| DbError::internal("内部错误：索引操作指向不存在的表"))
+    }
+
+    fn reload_tables(&mut self) {
         // catalog 可能被回滚，内存表结构需要与之一致
         let defs: Vec<TableDef> = self.store.catalog.tables.clone();
         let mut tables = Vec::with_capacity(defs.len());
@@ -345,12 +452,34 @@ impl Engine {
         self.store.begin(owner)
     }
 
-    pub fn commit(&mut self) -> Result<()> {
-        self.store.commit()
+    /// 提交：先做页级写冲突检测（首写者获胜），冲突则回滚本事务
+    pub fn commit(&mut self, owner: u64) -> Result<()> {
+        if let Some(table_id) = self.store.check_conflict(owner) {
+            self.rollback_txn(owner);
+            let name = self
+                .tables
+                .iter()
+                .find(|t| t.id == table_id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| format!("#{}", table_id));
+            return Err(DbError::new(
+                error::WRITE_CONFLICT,
+                format!(
+                    "写冲突：事务期间表 \"{}\" 的数据已被其它事务修改并提交，请重试整个事务",
+                    name
+                ),
+            ));
+        }
+        self.store.commit(owner)
     }
 
-    pub fn rollback(&mut self) {
-        self.rollback_and_reload();
+    pub fn rollback(&mut self, owner: u64) {
+        self.rollback_txn(owner);
+    }
+
+    /// DDL 独占门禁：其它会话有开放事务时拒绝
+    pub fn ensure_ddl_exclusive(&self, owner: u64) -> Result<()> {
+        self.store.ensure_no_other_txns(owner)
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {

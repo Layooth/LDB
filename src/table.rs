@@ -9,7 +9,7 @@ use crate::catalog::{IndexDef, TableDef};
 use crate::codec::{self, Column, Value};
 use crate::error::{self, DbError, Result};
 use crate::page as pg;
-use crate::store::Store;
+use crate::store::{IndexOp, Store};
 
 /// 页内剩余空间低于此值时不再作为插入候选（避免碎片化）
 const FREE_PAGE_MIN: i32 = 128;
@@ -282,33 +282,79 @@ pub fn get(store: &mut Store, table: &Table, row_id: u32) -> Result<Option<Vec<V
     }
 }
 
-fn index_add(table: &mut Table, values: &[Value], row_id: u32) {
-    for index in table.indexes.iter_mut() {
-        let picked: Vec<Value> = index.columns.iter().map(|i| values[*i].clone()).collect();
-        if let Some(key) = codec::index_key_of(&picked) {
-            index
-                .map
-                .entry(key)
-                .or_insert_with(Vec::new)
-                .push(row_id);
+/// 应用/撤销索引操作（key 级）
+pub fn index_add_key(table: &mut Table, index_pos: usize, key: &str, row_id: u32) {
+    if let Some(index) = table.indexes.get_mut(index_pos) {
+        index
+            .map
+            .entry(key.to_string())
+            .or_insert_with(Vec::new)
+            .push(row_id);
+    }
+}
+
+pub fn index_remove_key(table: &mut Table, index_pos: usize, key: &str, row_id: u32) {
+    if let Some(index) = table.indexes.get_mut(index_pos) {
+        let mut empty = false;
+        if let Some(list) = index.map.get_mut(key) {
+            list.retain(|id| *id != row_id);
+            empty = list.is_empty();
+        }
+        if empty {
+            index.map.remove(key);
         }
     }
 }
 
-fn index_remove(table: &mut Table, values: &[Value], row_id: u32) {
-    for index in table.indexes.iter_mut() {
+/// 把行的索引键应用到共享索引，返回操作记录（供事务回滚/冲突撤销）。
+/// 记录必须与真实变更一一对应：no-op 不记录，否则撤销会制造幽灵条目。
+fn index_add(table: &mut Table, values: &[Value], row_id: u32) -> Vec<IndexOp> {
+    let mut ops = Vec::new();
+    for (pos, index) in table.indexes.iter_mut().enumerate() {
+        let picked: Vec<Value> = index.columns.iter().map(|i| values[*i].clone()).collect();
+        if let Some(key) = codec::index_key_of(&picked) {
+            let list = index.map.entry(key.clone()).or_insert_with(Vec::new);
+            if !list.contains(&row_id) {
+                list.push(row_id);
+                ops.push(IndexOp::Add {
+                    table_id: table.id,
+                    index_pos: pos,
+                    key,
+                    row_id,
+                });
+            }
+        }
+    }
+    ops
+}
+
+fn index_remove(table: &mut Table, values: &[Value], row_id: u32) -> Vec<IndexOp> {
+    let mut ops = Vec::new();
+    for (pos, index) in table.indexes.iter_mut().enumerate() {
         let picked: Vec<Value> = index.columns.iter().map(|i| values[*i].clone()).collect();
         if let Some(key) = codec::index_key_of(&picked) {
             let mut empty = false;
+            let mut removed = false;
             if let Some(list) = index.map.get_mut(&key) {
+                let before = list.len();
                 list.retain(|id| *id != row_id);
+                removed = list.len() != before;
                 empty = list.is_empty();
             }
             if empty {
                 index.map.remove(&key);
             }
+            if removed {
+                ops.push(IndexOp::Remove {
+                    table_id: table.id,
+                    index_pos: pos,
+                    key,
+                    row_id,
+                });
+            }
         }
     }
+    ops
 }
 
 fn check_not_null(table: &Table, values: &[Value]) -> Result<()> {
@@ -448,7 +494,10 @@ pub fn insert(store: &mut Store, table: &mut Table, values: Vec<Value>) -> Resul
     let record = codec::encode_row(&table.columns, &values)?;
     check_unique(table, &values, None)?;
     let row_id = insert_physical(store, table, &record)?;
-    index_add(table, &values, row_id);
+    for op in index_add(table, &values, row_id) {
+        store.record_index_op(op);
+    }
+    store.record_row_delta(table.id, 1);
     table.row_count += 1;
     Ok(row_id)
 }
@@ -458,9 +507,13 @@ pub fn delete(store: &mut Store, table: &mut Table, row_id: u32) -> Result<bool>
         Some(v) => v,
         None => return Ok(false),
     };
-    index_remove(table, &values, row_id);
+    let ops = index_remove(table, &values, row_id);
     let removed = delete_physical(store, table, row_id)?;
     if removed {
+        for op in ops {
+            store.record_index_op(op);
+        }
+        store.record_row_delta(table.id, -1);
         table.row_count = table.row_count.saturating_sub(1);
     }
     Ok(removed)
@@ -479,14 +532,18 @@ pub fn update(
     check_not_null(table, &values)?;
     let record = codec::encode_row(&table.columns, &values)?;
 
-    index_remove(table, &old, row_id);
+    let remove_ops = index_remove(table, &old, row_id);
     if let Err(err) = check_unique(table, &values, Some(row_id)) {
-        index_add(table, &old, row_id);
+        for op in remove_ops {
+            index_add_key(table, op_index_pos(&op), op_key(&op), row_id);
+        }
         return Err(err);
     }
 
     if !delete_physical(store, table, row_id)? {
-        index_add(table, &old, row_id);
+        for op in remove_ops {
+            index_add_key(table, op_index_pos(&op), op_key(&op), row_id);
+        }
         return Ok(None);
     }
     table.row_count = table.row_count.saturating_sub(1);
@@ -495,9 +552,25 @@ pub fn update(
     // 真失败就交给上层回滚整个事务，不做半吊子的就地恢复。
     let new_row_id = insert_physical(store, table, &record)?;
 
-    index_add(table, &values, new_row_id);
+    let add_ops = index_add(table, &values, new_row_id);
+    for op in remove_ops.iter().chain(add_ops.iter()) {
+        store.record_index_op(op.clone());
+    }
+    // 删 + 插，行数净变化为 0
     table.row_count += 1;
     Ok(Some(new_row_id))
+}
+
+fn op_index_pos(op: &IndexOp) -> usize {
+    match op {
+        IndexOp::Add { index_pos, .. } | IndexOp::Remove { index_pos, .. } => *index_pos,
+    }
+}
+
+fn op_key(op: &IndexOp) -> &str {
+    match op {
+        IndexOp::Add { key, .. } | IndexOp::Remove { key, .. } => key,
+    }
 }
 
 /// 按等值条件查索引，返回 rowId 列表；没有可用索引返回 None
@@ -566,14 +639,14 @@ mod tests {
             ],
         )
         .unwrap();
-        store.commit().unwrap();
+        store.commit(0).unwrap();
 
         let row = get(&mut store, &table, id).unwrap().unwrap();
         assert_eq!(row[1], Value::Text("alice".to_string()));
 
         store.begin(0).unwrap();
         assert!(delete(&mut store, &mut table, id).unwrap());
-        store.commit().unwrap();
+        store.commit(0).unwrap();
         assert!(get(&mut store, &table, id).unwrap().is_none());
 
         store.close().unwrap();
@@ -599,7 +672,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, error::CONSTRAINT);
-        store.rollback();
+        store.rollback(0);
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -623,7 +696,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, error::CONSTRAINT);
-        store.rollback();
+        store.rollback(0);
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -641,7 +714,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, error::CONSTRAINT);
-        store.rollback();
+        store.rollback(0);
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -665,7 +738,7 @@ mod tests {
             )
             .unwrap();
         }
-        store.commit().unwrap();
+        store.commit(0).unwrap();
 
         let ids = find_by_equality(&table, "id", &Value::Int(17)).unwrap();
         assert_eq!(ids.len(), 1);
@@ -696,7 +769,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            store.commit().unwrap();
+            store.commit(0).unwrap();
             store.close().unwrap();
         }
 
@@ -715,7 +788,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, error::CONSTRAINT);
-        store.rollback();
+        store.rollback(0);
         store.close().unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);

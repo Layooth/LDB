@@ -510,6 +510,8 @@ fn to_error(err: DbError) -> (u16, Json, Vec<(String, String)>) {
         401
     } else if err.code == error::NOT_FOUND {
         404
+    } else if err.code == error::WRITE_CONFLICT {
+        409
     } else {
         400
     };
@@ -841,23 +843,41 @@ fn alter_table(
         _ => return Err(DbError::syntax("缺少数组字段 columns")),
     };
 
+    let durable = {
+        let engine = state
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+        engine.store.durable_commits()
+    };
     let mut engine = state
         .engine
         .write()
         .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+    engine.ensure_ddl_exclusive(crate::engine::INTERNAL_TXN_OWNER)?;
 
     // 重建是「删表 + 建表 + 逐行写回」，必须在单个事务里完成
     engine.begin(crate::engine::INTERNAL_TXN_OWNER)?;
-    let outcome = match engine.rebuild_table(&name, &columns) {
-        Ok(out) => match engine.commit() {
-            Ok(()) => out,
+    engine.store.set_active_owner(crate::engine::INTERNAL_TXN_OWNER);
+    let (outcome, barrier, seq) = match engine.rebuild_table(&name, &columns) {
+        Ok(out) => match engine.commit(crate::engine::INTERNAL_TXN_OWNER) {
+            Ok(()) => {
+                let barrier = engine.store.commit_barrier();
+                let seq = engine.store.last_commit_seq();
+                (out, barrier, seq)
+            }
             Err(err) => return Err(err),
         },
         Err(err) => {
-            engine.rollback();
+            engine.rollback(crate::engine::INTERNAL_TXN_OWNER);
             return Err(err);
         }
     };
+    drop(engine);
+    // full 模式：写锁释放后再等待 fsync 确认
+    if durable {
+        barrier.wait_for(seq)?;
+    }
 
     Ok(Json::Obj(vec![
         (

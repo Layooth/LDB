@@ -392,7 +392,7 @@ impl Session {
 
     pub fn close(&mut self) -> Result<()> {
         if self.in_txn {
-            self.engine.rollback();
+            self.engine.rollback(crate::engine::EXCLUSIVE_TXN_OWNER);
             self.in_txn = false;
         }
         self.engine.close()
@@ -402,7 +402,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if self.in_txn {
-            self.engine.rollback();
+            self.engine.rollback(crate::engine::EXCLUSIVE_TXN_OWNER);
         }
     }
 }
@@ -473,7 +473,7 @@ impl ConnSession {
     pub fn close(&mut self) {
         if self.in_txn {
             if let Ok(mut guard) = self.engine.write() {
-                guard.rollback();
+                guard.rollback(self.session_id);
             }
             self.in_txn = false;
         }
@@ -494,6 +494,8 @@ pub fn execute_on(
     params: &[Value],
     owner: u64,
 ) -> Result<QueryResult> {
+    // 写路径的脏页/索引操作都记到本语句属主名下（多写下必须逐语句设置）
+    engine.store.set_active_owner(owner);
     match statement {
         Statement::Begin => {
             if *in_txn {
@@ -513,7 +515,7 @@ pub fn execute_on(
                     message: "当前没有进行中的事务".to_string(),
                 });
             }
-            let outcome = engine.commit();
+            let outcome = engine.commit(owner);
             *in_txn = false;
             outcome?;
             return Ok(QueryResult::Transaction {
@@ -526,7 +528,7 @@ pub fn execute_on(
                     message: "当前没有进行中的事务".to_string(),
                 });
             }
-            engine.rollback();
+            engine.rollback(owner);
             *in_txn = false;
             return Ok(QueryResult::Transaction {
                 message: "事务已回滚".to_string(),
@@ -541,8 +543,10 @@ pub fn execute_on(
         return run_with_engine(engine, statement, params, committed_only, owner);
     }
 
-    // 单语句隐式事务
-    let outcome = engine.write(|inner| run_with_engine(inner, statement, params, false, owner));
+    // 单语句隐式事务（属主 = 会话 id，DDL 门禁据此识别自己人）
+    let outcome = engine.write_as(owner, |inner| {
+        run_with_engine(inner, statement, params, false, owner)
+    });
     if outcome.is_err() {
         *in_txn = false;
     }
@@ -563,14 +567,19 @@ fn run_with_engine(
         Statement::Insert(insert) => exec_insert(engine, insert, params),
         Statement::Update(update) => exec_update(engine, update, params),
         Statement::Delete(delete) => exec_delete(engine, delete, params),
-        Statement::CreateTable(create) => exec_create_table(engine, create, params),
+        Statement::CreateTable(create) => {
+            engine.ensure_ddl_exclusive(owner)?;
+            exec_create_table(engine, create, params)
+        }
         Statement::DropTable { name, if_exists } => {
+            engine.ensure_ddl_exclusive(owner)?;
             engine.drop_table(name, *if_exists)?;
             Ok(QueryResult::Ddl {
                 message: format!("已删除表 \"{}\"", name),
             })
         }
         Statement::CreateIndex(create) => {
+            engine.ensure_ddl_exclusive(owner)?;
             engine.create_index(
                 &create.name,
                 &create.table,
@@ -588,6 +597,7 @@ fn run_with_engine(
             })
         }
         Statement::DropIndex { name, if_exists } => {
+            engine.ensure_ddl_exclusive(owner)?;
             engine.drop_index(name, *if_exists)?;
             Ok(QueryResult::Ddl {
                 message: format!("已删除索引 \"{}\"", name),

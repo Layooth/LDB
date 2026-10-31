@@ -149,12 +149,40 @@ struct Txn {
     catalog_dirty: bool,
     drops: Vec<u32>,
     page_count_before: HashMap<u32, u32>,
+    index_ops: Vec<IndexOp>,
+    row_deltas: HashMap<u32, i64>,
 }
 
 /// 一次提交产生的页集合（按 seq 有序存放，checkpoint 时按水位线落盘）
 struct CommittedPages {
     seq: u64,
     pages: HashMap<PageKey, Vec<u8>>,
+}
+
+/// 一条语句对内存索引的修改记录（回滚/冲突时按逆序精确撤销，
+/// 避免全量重建抹掉其它开放事务的未提交索引状态）
+#[derive(Debug, Clone)]
+pub enum IndexOp {
+    Add {
+        table_id: u32,
+        index_pos: usize,
+        key: String,
+        row_id: u32,
+    },
+    Remove {
+        table_id: u32,
+        index_pos: usize,
+        key: String,
+        row_id: u32,
+    },
+}
+
+/// 回滚时交给引擎的撤销信息
+pub struct RollbackInfo {
+    pub index_ops: Vec<IndexOp>,
+    /// 表 id → 行数增量（插入为正、删除为负）
+    pub row_deltas: HashMap<u32, i64>,
+    pub catalog_dirty: bool,
 }
 
 pub struct Store {
@@ -430,6 +458,74 @@ impl Store {
         !self.txns.is_empty()
     }
 
+    /// 设置「当前正在执行语句的属主」。
+    ///
+    /// P2 之前单写者时代，begin 时设置一次即可；多写后多个事务同时开放，
+    /// 别的会话 begin 会覆盖这个字段——所以每条语句开始时都必须重新设置
+    /// （语句持有引擎写锁，期间不会被覆盖）。
+    pub fn set_active_owner(&mut self, owner: u64) {
+        self.txn_owner = Some(owner);
+    }
+
+    /// DDL 独占门禁：存在其它会话的开放事务时拒绝 DDL
+    pub fn ensure_no_other_txns(&self, owner: u64) -> Result<()> {
+        if self.txns.keys().any(|existing| *existing != owner) {
+            return Err(DbError::new(
+                crate::error::LOCKED,
+                "存在其它会话的开放事务，DDL 语句暂不支持并发执行",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 提交冲突预检：我的写集与快照之后他人提交的页是否重叠
+    pub fn check_conflict(&self, owner: u64) -> Option<u32> {
+        let txn = self.txns.get(&owner)?;
+        for entry in &self.committed {
+            if entry.seq <= txn.snapshot {
+                continue;
+            }
+            for key in &txn.dirty {
+                if entry.pages.contains_key(key) {
+                    return Some(key.0); // 冲突表 id
+                }
+            }
+        }
+        None
+    }
+
+    /// 记录语句期的索引修改（回滚/冲突时撤销用）
+    pub fn record_index_op(&mut self, op: IndexOp) {
+        if let Some(owner) = self.txn_owner {
+            if let Some(txn) = self.txns.get_mut(&owner) {
+                txn.index_ops.push(op);
+            }
+        }
+    }
+
+    /// 记录行数增量
+    pub fn record_row_delta(&mut self, table_id: u32, delta: i64) {
+        if let Some(owner) = self.txn_owner {
+            if let Some(txn) = self.txns.get_mut(&owner) {
+                *txn.row_deltas.entry(table_id).or_insert(0) += delta;
+            }
+        }
+    }
+
+    /// 其它开放事务（排除 owner）的索引操作快照
+    pub fn open_index_ops(&self, exclude_owner: u64) -> Vec<IndexOp> {
+        let mut ops = Vec::new();
+        let mut keys: Vec<&u64> = self.txns.keys().collect();
+        keys.sort();
+        for key in keys {
+            if *key == exclude_owner {
+                continue;
+            }
+            ops.extend(self.txns[key].index_ops.iter().cloned());
+        }
+        ops
+    }
+
     /// 最老活跃快照：checkpoint 只能落盘 seq <= watermark 的已提交页，
     /// 否则会破坏开放事务的读视图
     fn snapshot_watermark(&self) -> u64 {
@@ -442,17 +538,7 @@ impl Store {
 
     pub fn begin(&mut self, owner: u64) -> Result<()> {
         self.assert_usable()?;
-        // P1 单写者门禁：其它会话持有事务时仍拒绝（P2 换成写冲突检测）
-        if self
-            .txns
-            .keys()
-            .any(|existing| *existing != owner)
-        {
-            return Err(DbError::new(
-                crate::error::LOCKED,
-                "数据库正被其它写事务占用，请稍后重试",
-            ));
-        }
+        // P2：多写开放。写-写冲突在提交时按页检测（首写者获胜）。
         if self.txns.contains_key(&owner) {
             return Err(DbError::new(
                 crate::error::LOCKED,
@@ -471,18 +557,26 @@ impl Store {
                 catalog_dirty: false,
                 drops: Vec::new(),
                 page_count_before: HashMap::new(),
+                index_ops: Vec::new(),
+                row_deltas: HashMap::new(),
             },
         );
         Ok(())
     }
 
-    pub fn commit(&mut self) -> Result<()> {
+    pub fn commit(&mut self, owner: u64) -> Result<()> {
         self.assert_usable()?;
-        let owner = self.txn_owner.take().unwrap_or(0);
         let txn = match self.txns.remove(&owner) {
             Some(t) => t,
             None => return Err(DbError::internal("没有进行中的事务")),
         };
+        if self.txns.is_empty() {
+            self.txn_owner = None;
+        } else if self.txn_owner == Some(owner) {
+            // 还有其它开放事务：owner 指针让给任意一个存活事务，
+            // 写路径（dirty_page/alloc_page）按调用时的 txn_owner 定位
+            self.txn_owner = None;
+        }
 
         let empty = txn.dirty.is_empty() && !txn.catalog_dirty;
         if empty {
@@ -561,21 +655,36 @@ impl Store {
         Ok(())
     }
 
-    pub fn rollback(&mut self) -> bool {
-        let owner = self.txn_owner.take().unwrap_or(0);
-        match self.txns.remove(&owner) {
-            Some(txn) => {
-                self.discard_txn(&txn);
-                true
-            }
-            None => false,
+    /// 回滚指定会话的事务，返回撤销信息（None = 该会话没有开放事务）。
+    /// 页与 catalog 的恢复在 discard_txn 内完成；
+    /// 索引与行数的撤销由引擎用返回的信息执行。
+    pub fn rollback(&mut self, owner: u64) -> Option<RollbackInfo> {
+        let txn = self.txns.remove(&owner)?;
+        if self.txns.is_empty() {
+            self.txn_owner = None;
+        } else if self.txn_owner == Some(owner) {
+            self.txn_owner = None;
         }
+        let info = RollbackInfo {
+            index_ops: txn.index_ops.clone(),
+            row_deltas: txn.row_deltas.clone(),
+            catalog_dirty: txn.catalog_dirty,
+        };
+        self.discard_txn(&txn);
+        Some(info)
     }
 
     fn discard_txn(&mut self, txn: &Txn) {
         for (table_id, count) in &txn.page_count_before {
-            if let Some(f) = self.files.get_mut(table_id) {
-                f.pages = *count;
+            // 其它开放事务在此表上分配过页或写过页时，不能收缩页计数
+            // （会砍掉它们的页），容忍空洞页——空闲页扫描会复用
+            let others_use_table = self.txns.values().any(|t| {
+                t.dirty.iter().any(|k| k.0 == *table_id) || t.page_count_before.contains_key(table_id)
+            });
+            if !others_use_table {
+                if let Some(f) = self.files.get_mut(table_id) {
+                    f.pages = (*count).min(f.pages);
+                }
             }
         }
         if txn.catalog_dirty {
@@ -800,8 +909,10 @@ impl Store {
     }
 
     pub fn close(&mut self) -> Result<()> {
+        // 关闭时无法等待开放事务：直接丢弃（进程退出，未提交数据本就不该持久化）
         if !self.txns.is_empty() {
-            self.rollback();
+            self.txns.clear();
+            self.txn_owner = None;
         }
         // 先确认全部提交落盘，再 checkpoint（会截断 WAL）
         let _ = self.commit_barrier.wait_all();
@@ -944,7 +1055,7 @@ mod tests {
             let mut page = store.read_page(1, 0).unwrap();
             page[100] = 42;
             store.dirty_page(1, 0, page).unwrap();
-            store.commit().unwrap();
+            store.commit(0).unwrap();
             store.checkpoint().unwrap();
 
             let back = store.read_page(1, 0).unwrap();
@@ -962,14 +1073,14 @@ mod tests {
             store.begin(0).unwrap();
             store.alloc_page(1).unwrap();
             assert_eq!(store.page_count(1), 1);
-            store.rollback();
+            store.rollback(0);
             assert_eq!(store.page_count(1), 0);
 
             // 回滚后重新分配应得到同一个页号
             store.begin(0).unwrap();
             let page_no = store.alloc_page(1).unwrap();
             assert_eq!(page_no, 0);
-            store.commit().unwrap();
+            store.commit(0).unwrap();
             store.close().unwrap();
         }
         let _ = fs::remove_dir_all(&dir);
@@ -985,13 +1096,13 @@ mod tests {
             let mut page = store.read_page(7, 0).unwrap();
             page[10] = 9;
             store.dirty_page(7, 0, page).unwrap();
-            store.commit().unwrap();
+            store.commit(0).unwrap();
 
             // 还没 checkpoint，但新事务必须能读到
             store.begin(0).unwrap();
             let page = store.read_page(7, 0).unwrap();
             assert_eq!(page[10], 9);
-            store.rollback();
+            store.rollback(0);
             store.close().unwrap();
         }
         let _ = fs::remove_dir_all(&dir);
@@ -1007,7 +1118,7 @@ mod tests {
             let mut page = store.read_page(3, 0).unwrap();
             page[500] = 77;
             store.dirty_page(3, 0, page).unwrap();
-            store.commit().unwrap();
+            store.commit(0).unwrap();
             // 故意不 checkpoint、不 close：模拟崩溃
         }
 

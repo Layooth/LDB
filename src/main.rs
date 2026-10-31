@@ -33,7 +33,9 @@ fn print_help() {
     println!("  --no-http            只启动协议服务，不启动 Web 控制台");
     println!("  --no-open            启动后不自动打开浏览器");
     println!("  --web-dir <目录>     指定 Web 控制台静态文件目录");
-    println!("  --token <令牌>       启用认证，客户端需携带相同 token");
+    println!("  --token <令牌>       启用认证，客户端需携带相同 token（也可用环境变量 LDB_TOKEN）");
+    println!("  --cors-origin <列表> Web 端可跨源访问的来源，逗号分隔；* 表示不限制（默认同源）");
+    println!("  --allow-insecure     允许「监听非回环地址且没有 token」——仅调试用，默认拒绝启动");
     println!("  --max-connections <n> 最大并发连接数（默认 64）");
     println!("  --slow-ms <毫秒>     超过该耗时打印慢查询");
     println!("  --sync <full|normal> 提交耐久性（默认 full）：normal 在 checkpoint 时才 fsync，");
@@ -275,6 +277,13 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
                 i += 1;
                 options.token = extra.get(i).cloned();
             }
+            "--cors-origin" => {
+                i += 1;
+                if let Some(value) = extra.get(i) {
+                    options.cors_origin = Some(value.clone());
+                }
+            }
+            "--allow-insecure" => options.allow_insecure = true,
             "--max-connections" => {
                 i += 1;
                 if let Some(value) = extra.get(i) {
@@ -305,6 +314,22 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
             }
         }
         i += 1;
+    }
+
+    // 环境变量兜底：避免令牌出现在命令行（进程列表、PowerShell 历史都能看到）
+    if options.token.is_none() {
+        if let Ok(value) = std::env::var("LDB_TOKEN") {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                options.token = Some(value);
+            }
+        }
+    }
+
+    // 安全默认：对外监听却没有令牌 → 拒绝启动（--allow-insecure 可显式放行）
+    if let Err(err) = littledb::server::validate_bind(&options) {
+        eprintln!("[LittleDB] {}", err.message);
+        exit(1);
     }
 
     let engine = Engine::open(Path::new(dir))?;

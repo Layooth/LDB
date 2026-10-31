@@ -1169,6 +1169,11 @@ fn range_index_scan() {
 
 /// 起一个真实 HTTP 服务实例（随机端口），用于协议级用例
 fn start_http(dir: &std::path::Path) -> u16 {
+    start_http_with(dir, None)
+}
+
+/// 同上，可指定 CORS 策略（None = 只允许同源）
+fn start_http_with(dir: &std::path::Path, cors: Option<&str>) -> u16 {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, RwLock};
 
@@ -1177,7 +1182,7 @@ fn start_http(dir: &std::path::Path) -> u16 {
     let port = probe.local_addr().unwrap().port();
     drop(probe);
 
-    let state = littledb::http::HttpState::new(
+    let mut state = littledb::http::HttpState::new(
         engine,
         None,
         littledb::http::find_web_dir(),
@@ -1187,6 +1192,9 @@ fn start_http(dir: &std::path::Path) -> u16 {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     );
+    if let Some(policy) = cors {
+        state = state.with_cors(policy.to_string());
+    }
     std::thread::spawn(move || {
         let _ = littledb::http::serve(state, "127.0.0.1", port);
     });
@@ -1256,6 +1264,63 @@ fn http_rejects_malformed_requests() {
     assert!(response.starts_with("HTTP/1.1 200"), "{}", response);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CORS 默认只允许同源：任意网页不能借用户浏览器读写数据库
+#[test]
+fn cors_is_same_origin_by_default() {
+    let dir = temp_dir("cors");
+    let port = start_http(&dir);
+
+    let resp = http_roundtrip(
+        port,
+        "GET /api/health HTTP/1.1\r\nHost: t\r\nOrigin: http://evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp);
+    assert!(
+        !resp.to_ascii_lowercase().contains("access-control-allow-origin"),
+        "默认不应回跨源头：{}",
+        resp
+    );
+
+    let resp = http_roundtrip(
+        port,
+        "OPTIONS /api/sql HTTP/1.1\r\nHost: t\r\nOrigin: http://evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.starts_with("HTTP/1.1 204"), "{}", resp);
+    assert!(
+        !resp.to_ascii_lowercase().contains("access-control-allow-origin"),
+        "预检也不该放行：{}",
+        resp
+    );
+
+    // 显式白名单：只回匹配来源，且带 Vary: Origin
+    let dir2 = temp_dir("cors2");
+    let port2 = start_http_with(&dir2, Some("http://ok.example"));
+    let resp = http_roundtrip(
+        port2,
+        "GET /api/health HTTP/1.1\r\nHost: t\r\nOrigin: http://ok.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        resp.to_ascii_lowercase()
+            .contains("access-control-allow-origin: http://ok.example"),
+        "{}",
+        resp
+    );
+    assert!(resp.to_ascii_lowercase().contains("vary: origin"), "{}", resp);
+
+    let resp = http_roundtrip(
+        port2,
+        "GET /api/health HTTP/1.1\r\nHost: t\r\nOrigin: http://evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        !resp.to_ascii_lowercase().contains("access-control-allow-origin"),
+        "不在白名单的来源不应放行：{}",
+        resp
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
 }
 
 /// 静态文件：只有根路径映射 index.html，其余缺失文件必须 404
@@ -1469,7 +1534,7 @@ fn update_delete_use_index() {
         .unwrap();
     session.execute("INSERT INTO w VALUES (1,0),(2,0),(3,0),(4,0),(42,0),(43,0)", &[]).unwrap();
 
-    let mut affected = |session: &mut Session, sql: &str| -> usize {
+    let affected = |session: &mut Session, sql: &str| -> usize {
         match session.execute(sql, &[]).unwrap() {
             QueryResult::Update { updated } => updated,
             QueryResult::Delete { deleted } => deleted,

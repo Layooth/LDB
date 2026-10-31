@@ -2303,28 +2303,46 @@ fn exec_explain(
                             params,
                             Some(owner),
                         )?;
-                        match candidates {
+                        let read_rows = match candidates {
                             Some(lookup) => {
+                                let read = lookup.ids.len();
                                 rows.push(kv("访问方式", lookup.label));
-                                rows.push(kv("扫描行数", lookup.ids.len().to_string()));
+                                rows.push(kv("扫描行数", read.to_string()));
+                                read
                             }
                             None => {
                                 match range_candidates(engine, name, select.where_clause.as_ref(), params)? {
                                     Some(ids) => {
                                         rows.push(kv(
                                             "访问方式",
-                                            "范围索引查找（单列索引，边界已按列类型转换）".to_string(),
+                                            "范围索引查找（前导列索引，边界已按列类型转换）".to_string(),
                                         ));
                                         rows.push(kv("扫描行数", ids.len().to_string()));
+                                        ids.len()
                                     }
                                     None => {
                                         rows.push(kv("访问方式", "全表扫描".to_string()));
                                         rows.push(kv("扫描行数", total.to_string()));
+                                        total as usize
                                     }
                                 }
                             }
-                        }
+                        };
                         rows.push(kv("表总行数", total.to_string()));
+                        // 代价粗估：没有直方图/NDV 统计，只能按「读取行数占比」给个量级
+                        let total_usize = total.max(1) as usize;
+                        let percent = if total_usize == 0 {
+                            0
+                        } else {
+                            (read_rows * 100 / total_usize).min(100)
+                        };
+                        rows.push(kv(
+                            "代价粗估",
+                            format!(
+                                "预计读取 {} 行（约全表 {}%）；仅按行数比例粗估，未做直方图统计",
+                                read_rows, percent
+                            ),
+                        ));
                         if let Some(cap) = early_row_cap(select, params) {
                             rows.push(kv(
                                 "LIMIT 下推",

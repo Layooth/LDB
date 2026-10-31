@@ -122,10 +122,13 @@ $base = "http://127.0.0.1:$httpPort"
 $proc = $null
 $checks = 0
 
+# 令牌走环境变量（不落命令行）：顺带验证 LDB_TOKEN 这条路径
+$env:LDB_TOKEN = $token
+
 try {
     $proc = Start-Process -PassThru -FilePath $exe -ArgumentList @(
         "serve", "`"$tempDir`"", "--port", "$protoPort", "--http-port", "$httpPort",
-        "--no-open", "--token", $token
+        "--no-open"
     ) -RedirectStandardOutput (Join-Path $tempDir "server.log") `
       -RedirectStandardError (Join-Path $tempDir "server.err")
 
@@ -139,7 +142,11 @@ try {
 
     $r = Invoke-Api "GET" "$base/api/health" $null $null $token
     if ([int]$r.StatusCode -ne 200) { Fail "health 应 200，实际 $($r.StatusCode)" }
-    $checks++; Ok "health → 200"
+    # 默认不放行跨源（安全默认值；要放行必须显式 --cors-origin）
+    if ($r.Headers["Access-Control-Allow-Origin"]) {
+        Fail "默认不应返回 Access-Control-Allow-Origin，实际 $($r.Headers["Access-Control-Allow-Origin"])"
+    }
+    $checks++; Ok "health → 200（默认不放行跨源）"
 
     # 2. 建表 / 写入 / 查询
     $r = Sql $base $token "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, price DECIMAL(10,2))"
@@ -223,5 +230,6 @@ try {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
         $proc.WaitForExit(5000) | Out-Null
     }
+    Remove-Item Env:LDB_TOKEN -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
 }

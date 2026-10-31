@@ -31,6 +31,10 @@ pub struct ServerOptions {
     pub open_browser: bool,
     /// true = 每次提交 fsync（full，默认）；false = normal 模式
     pub durable_commits: bool,
+    /// Web 端允许的跨源来源，逗号分隔；`*` 表示不限制。None = 只允许同源
+    pub cors_origin: Option<String>,
+    /// 允许「监听非回环地址但没有 token」——仅调试用
+    pub allow_insecure: bool,
 }
 
 impl Default for ServerOptions {
@@ -46,8 +50,35 @@ impl Default for ServerOptions {
             web_dir: crate::http::find_web_dir(),
             open_browser: true,
             durable_commits: true,
+            cors_origin: None,
+            allow_insecure: false,
         }
     }
+}
+
+/// 监听地址是否是回环（只允许本机访问）
+pub fn is_loopback(host: &str) -> bool {
+    let host = host.trim().trim_matches(|c| c == '[' || c == ']');
+    matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.")
+}
+
+/// 启动前的安全校验。
+///
+/// 默认配置是「只监听回环」，所以无 token 也能用；但一旦把 `--host` 改到
+/// 0.0.0.0 / 局域网 IP，无认证就等于把库交给整个网络，必须显式放行。
+pub fn validate_bind(options: &ServerOptions) -> Result<()> {
+    if options.token.is_some() || options.allow_insecure || is_loopback(&options.host) {
+        return Ok(());
+    }
+    Err(DbError::new(
+        error::AUTH,
+        format!(
+            "拒绝启动：监听 {} 但没有设置访问令牌。\n\
+             远程可访问且无认证 = 任何人都能读写你的库。\n\
+             请加 --token <令牌>（或环境变量 LDB_TOKEN）；确实需要请显式加 --allow-insecure。",
+            options.host
+        ),
+    ))
 }
 
 pub struct Server {
@@ -87,6 +118,11 @@ impl Server {
                 Arc::clone(&self.slow_queries),
                 Arc::clone(&self.rejected),
             );
+            // 默认不放行跨源：控制台是同源页面，不需要 CORS
+            let state = match &self.options.cors_origin {
+                Some(policy) => state.with_cors(policy.clone()),
+                None => state,
+            };
             let host = self.options.host.clone();
             thread::spawn(move || {
                 if let Err(err) = crate::http::serve(state, &host, http_port) {
@@ -457,6 +493,47 @@ fn open_browser(url: &str) {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
     println!("[LittleDB] 已在浏览器打开 {}", url);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_detection() {
+        for host in ["127.0.0.1", "127.0.1.5", "localhost", "::1", "[::1]"] {
+            assert!(is_loopback(host), "{} 应判定为回环", host);
+        }
+        for host in ["0.0.0.0", "192.168.1.10", "[::]", "example.com"] {
+            assert!(!is_loopback(host), "{} 不应判定为回环", host);
+        }
+    }
+
+    #[test]
+    fn insecure_bind_is_rejected_without_token() {
+        let mut options = ServerOptions {
+            host: "0.0.0.0".to_string(),
+            token: None,
+            ..ServerOptions::default()
+        };
+        let err = validate_bind(&options).unwrap_err();
+        assert_eq!(err.code, error::AUTH, "{}", err.message);
+        assert!(err.message.contains("--allow-insecure"), "{}", err.message);
+
+        // 回环地址无 token：允许（本地默认用法）
+        options.host = "127.0.0.1".to_string();
+        assert!(validate_bind(&options).is_ok());
+
+        // 对外监听 + token：允许
+        options.host = "0.0.0.0".to_string();
+        options.token = Some("secret".to_string());
+        assert!(validate_bind(&options).is_ok());
+
+        // 显式放行：允许
+        options.token = None;
+        options.allow_insecure = true;
+        assert!(validate_bind(&options).is_ok());
+    }
 }
 
 fn one_line(sql: &str) -> String {

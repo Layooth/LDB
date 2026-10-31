@@ -100,6 +100,8 @@ pub struct HttpState {
     pub queries: Arc<AtomicUsize>,
     pub slow_queries: Arc<AtomicUsize>,
     pub rejected: Arc<AtomicUsize>,
+    /// 允许的跨源来源，逗号分隔；`*` 不限制。None = 只允许同源（默认）
+    cors_origin: Option<String>,
 }
 
 impl HttpState {
@@ -125,7 +127,15 @@ impl HttpState {
             queries,
             slow_queries,
             rejected,
+            cors_origin: None,
         }
+    }
+
+    /// 配置允许的跨源来源（逗号分隔，`*` 表示不限制）
+    pub fn with_cors(mut self, policy: String) -> HttpState {
+        let policy = policy.trim().to_string();
+        self.cors_origin = if policy.is_empty() { None } else { Some(policy) };
+        self
     }
 }
 
@@ -269,9 +279,20 @@ fn handle(state: HttpState, mut stream: TcpStream) {
         let keep_alive = wants_keep_alive(&request);
 
         if request.method == "OPTIONS" {
-            send_response(&mut stream, 204, "No Content", "text/plain", b"", &[], keep_alive);
+            // 预检：只有配置了 --cors-origin 才回跨源头，否则同源访问本就不需要
+            let extra = cors_headers(&state, &request);
+            send_response(
+                &mut stream,
+                204,
+                "No Content",
+                "text/plain",
+                b"",
+                &extra,
+                keep_alive,
+            );
         } else if request.path.starts_with("/api/") {
-            let (status, payload, extra) = route(&state, &request);
+            let (status, payload, mut extra) = route(&state, &request);
+            extra.extend(cors_headers(&state, &request));
             let body = payload.to_string();
             send_response(
                 &mut stream,
@@ -487,11 +508,9 @@ fn send_response(
     } else {
         "Connection: close\r\n"
     });
-    head.push_str("Access-Control-Allow-Origin: *\r\n");
-    head.push_str("Access-Control-Allow-Headers: Content-Type, Authorization, X-Session-Id\r\n");
-    head.push_str("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
-    head.push_str("Access-Control-Expose-Headers: X-Session-Id\r\n");
+    // 跨源头不在这里写死：由 cors_headers() 按 --cors-origin 策略决定
     head.push_str("Cache-Control: no-store\r\n");
+    head.push_str("X-Content-Type-Options: nosniff\r\n");
     for (key, value) in extra {
         head.push_str(&format!("{}: {}\r\n", key, value));
     }
@@ -548,6 +567,43 @@ fn fail(status: u16, code: &str, message: &str) -> (u16, Json, Vec<(String, Stri
         ]),
         Vec::new(),
     )
+}
+
+/// 跨源响应头。默认（未配置 `--cors-origin`）返回空——控制台同源，不需要 CORS，
+/// 而 `Access-Control-Allow-Origin: *` 会让任意网页借用户浏览器读写数据库。
+fn cors_headers(state: &HttpState, request: &Request) -> Vec<(String, String)> {
+    let Some(policy) = &state.cors_origin else {
+        return Vec::new();
+    };
+    let allowed = if policy == "*" {
+        Some("*".to_string())
+    } else {
+        let origin = request.header("origin").unwrap_or("");
+        policy
+            .split(',')
+            .map(|item| item.trim())
+            .find(|item| item.eq_ignore_ascii_case(origin))
+            .map(|item| item.to_string())
+    };
+    let Some(allow) = allowed else {
+        return Vec::new();
+    };
+    vec![
+        ("Access-Control-Allow-Origin".to_string(), allow),
+        (
+            "Access-Control-Allow-Headers".to_string(),
+            "Content-Type, Authorization, X-Session-Id".to_string(),
+        ),
+        (
+            "Access-Control-Allow-Methods".to_string(),
+            "GET, POST, DELETE, OPTIONS".to_string(),
+        ),
+        (
+            "Access-Control-Expose-Headers".to_string(),
+            "X-Session-Id".to_string(),
+        ),
+        ("Vary".to_string(), "Origin".to_string()),
+    ]
 }
 
 // ------------------------------------------------------------------ 路由

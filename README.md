@@ -28,8 +28,20 @@ littledb.exe demo .\tmp-demo              # 建演示库并验证读写
 ```
 
 `serve` 选项：`--host`、`-p/--port`、`--http-port`、`--no-http`、`--no-open`、
-`--web-dir`、`--token`、`--max-connections`（默认 64）、`--slow-ms`、
+`--web-dir`、`--token`（或环境变量 `LDB_TOKEN`）、`--cors-origin <列表>`、
+`--allow-insecure`、`--max-connections`（默认 64）、`--slow-ms`、
 `--sync full|normal`（默认 full：每次提交 fsync；normal：只写 OS 缓存）、`--verbose`。
+
+### 安全默认值
+
+| 项 | 默认行为 | 如何放开 |
+|---|---|---|
+| 监听地址 | `127.0.0.1`（仅本机） | `--host 0.0.0.0` |
+| 无令牌 + 对外监听 | **拒绝启动**（远程无认证 = 谁都能读写） | 加 `--token`，或显式 `--allow-insecure` |
+| 令牌传递 | 环境变量 `LDB_TOKEN` 优先于命令行（命令行对其它进程可见） | 启动器已改用环境变量 |
+| 跨源访问 | 只允许同源（不回 `Access-Control-Allow-Origin`） | `--cors-origin "https://a.example,https://b.example"` 或 `*` |
+| 控制台令牌存储 | `sessionStorage`（关标签即失效）+ 落地后清掉 URL 里的 `?token=` | — |
+| 响应头 | 带 `X-Content-Type-Options: nosniff`、`Cache-Control: no-store` | — |
 
 ## 构建与测试
 
@@ -132,7 +144,9 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 
 ## HTTP API（默认 7802）
 
-认证：`Authorization: Bearer <token>`（未配置 `--token` 则不校验；query 里的 token 不认）。
+认证：`Authorization: Bearer <token>`（只认这个头，query 里的 token 不认）。
+令牌来自 `--token` 或环境变量 `LDB_TOKEN`；两者都没设时**只允许回环地址**，
+对外监听会被拒绝启动（见「安全默认值」）。
 
 | 方法与路径 | 作用 |
 |---|---|
@@ -187,5 +201,8 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
   不能单独走索引（也不支持「第二列等值」直接定位）。
 - `UPDATE`/`DELETE` 的 WHERE 能用单列索引定位候选行（等值/范围），但命中后仍逐行复检；
   无索引可用时退回全表扫描并受 50 万行上限保护。
+- **没有结果流式/游标**：查询在服务端整体物化后一次性返回（LDBP 单帧上限 16MB），
+  大结果请用 `LIMIT`/分页；真正流式需要把执行器从「全物化」改成「迭代器」。
+- `EXPLAIN` 的「代价粗估」只按读取行数占比给量级，没有直方图/NDV 统计，不做代价模型。
 - 视图、触发器、外键、分布式、TLS。
 - `Transfer-Encoding: chunked` 请求体不支持（会显式返回 411，不会静默当空 body）。

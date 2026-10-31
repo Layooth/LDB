@@ -557,7 +557,15 @@ impl ConnSession {
                 }
                 let barrier = guard.store.commit_barrier();
                 let seq = guard.store.last_commit_seq();
-                (QueryResult::Batch { results }, barrier, seq)
+                // 单语句直接返回该语句的结果，不再套一层 batch：
+                // 客户端（SDK/控制台/curl）解析 `result.type` 就行，
+                // 不用先判 `batch` 再取 `results[0]`。多语句仍然是 batch。
+                let outcome = if results.len() == 1 {
+                    results.pop().expect("刚判断过长度")
+                } else {
+                    QueryResult::Batch { results }
+                };
+                (outcome, barrier, seq)
             };
             if engine_read(&self.engine).store.durable_commits() {
                 barrier.wait_for(seq)?;

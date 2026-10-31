@@ -166,6 +166,9 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | `{"type":"ping"}` | 保活 |
 | `{"type":"query","id":1,"sql":"...","params":[...]}` | 执行 SQL，回 `{"id":1,"ok":true,"result":{...},"elapsedMs":..}` |
 
+单语句直接返回该语句的结果；多语句（`a;b;c`）返回 `{type:"batch",results:[...]}`。
+HTTP 的 `/api/sql` 语义完全一致（客户端可据此做兼容）。
+
 `select` 结果的字段（与 HTTP 的 `/api/sql` 完全一致，客户端按此解析）：
 
 ```json
@@ -234,6 +237,32 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | `SESSION_BUSY` | 503 | 同一 `X-Session-Id` 还有请求在执行，等待超时（带 `Retry-After`） |
 | `INTERNAL_ERROR` | 400 | 内部错误（含待恢复状态） |
 
+### JS 客户端 SDK
+
+`sdk/littledb.js`：零依赖，浏览器（`window.LittleDB.createClient`）与 Node 18+ 通用。
+
+```js
+const { createClient } = require('./sdk/littledb.js');
+const db = createClient('http://127.0.0.1:7802', { token: '...' });
+
+await db.sql('CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, price DECIMAL(10,2))');
+
+const ins = await db.insert('t', [{ name: 'a', price: '1.50' }]);   // {inserted, ids, lastId}
+const rows = await db.rows('SELECT id, name, price FROM t');        // [{id, name, price:'1.50'}]
+const { types } = await db.query('SELECT id, price FROM t');        // ['INT','DECIMAL']
+
+await db.upsert('t', [{ id: 1, name: 'a2' }], ['id'], ['name']);    // ON CONFLICT DO UPDATE
+await db.transaction(async () => {                                  // 抛错自动 ROLLBACK
+  await db.sql("INSERT INTO t (name) VALUES ('c')");
+});
+```
+
+封装掉的东西：`X-Session-Id` 自动续传（事务跨请求）、错误码映射到
+`LittleDBError#code / #status / #retryAfterMs`、`DECIMAL` 保持字符串、
+`insert`/`upsert` 自动拼 `?` 参数、`transaction()` 失败自动回滚（可配 `{retries}` 重试写冲突）。
+
+测试：`LDB_BASE=http://127.0.0.1:7802 LDB_TOKEN=xxx node sdk/test.js`（`tools/verify.ps1` 已包含这一项）。
+
 ## 限制一览
 
 | 项 | 值 |
@@ -261,4 +290,5 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
   真正流式需要把执行器从「全物化」改成「迭代器」。
 - `EXPLAIN` 的「代价粗估」只按读取行数占比给量级，没有直方图/NDV 统计，不做代价模型。
 - 视图、触发器、外键、分布式、TLS。
+- 只有 JS 客户端（`sdk/littledb.js`）；Python / C# 等需按 HTTP 约定自行封装。
 - `Transfer-Encoding: chunked` 请求体不支持（会显式返回 411，不会静默当空 body）。

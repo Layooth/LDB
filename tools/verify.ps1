@@ -216,6 +216,20 @@ try {
     if ([int]$r.StatusCode -ne 200) { Fail "首页应 200，实际 $($r.StatusCode)" }
     $checks++; Ok "控制台首页 → 200"
 
+    # JS SDK 端到端（Node 18+；没装 node 就跳过，不算失败）
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if ($node) {
+        $env:LDB_BASE = $base
+        $env:LDB_TOKEN = $token
+        & $node.Source (Join-Path $src "sdk\test.js") | Out-Null
+        $sdkExit = $LASTEXITCODE
+        Remove-Item Env:LDB_BASE, Env:LDB_TOKEN -ErrorAction SilentlyContinue
+        if ($sdkExit -ne 0) { Fail "SDK 测试失败：node sdk/test.js（单独跑一次看详情）" }
+        $checks++; Ok "JS SDK（12 项：insert/upsert/事务/错误码/分页）"
+    } else {
+        Write-Host "  [跳过] 未安装 node，跳过 SDK 测试"
+    }
+
     # 认证失败限速（放在最后：会把本机来源打入退避窗口）
     for ($i = 1; $i -le 6; $i++) {
         [void](Invoke-Api "GET" "$base/api/health" $null $null "definitely-wrong")

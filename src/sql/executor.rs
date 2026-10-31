@@ -278,7 +278,7 @@ impl QueryResult {
 fn value_json(value: &Value) -> Json {
     match value {
         Value::Null => Json::Null,
-        Value::Int(n) => Json::Num(*n as f64),
+        Value::Int(n) => Json::Int(*n),
         Value::Real(n) => Json::Num(*n),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Bool(b) => Json::Bool(*b),
@@ -607,7 +607,8 @@ fn run_with_engine(
 
 // ------------------------------------------------------------------ SELECT
 
-fn exec_select(
+/// SELECT 执行管线。pub(crate) 供 eval 模块的线路精确性测试复用
+pub(crate) fn exec_select(
     engine: &mut Engine,
     stmt: &SelectStmt,
     params: &[Value],

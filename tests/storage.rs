@@ -269,7 +269,7 @@ fn cross_session_reads_see_only_committed() {
     }
 
     let engine = Arc::new(Mutex::new(Engine::open(&dir).unwrap()));
-    let mut writer = littledb::sql::executor::ConnSession::new(Arc::clone(&engine));
+    let mut writer = ConnSession::new(Arc::clone(&engine));
     let mut reader = littledb::sql::executor::ConnSession::new(Arc::clone(&engine));
 
     writer.execute("BEGIN", &[]).unwrap();

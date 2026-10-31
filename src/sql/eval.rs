@@ -836,4 +836,27 @@ mod tests {
         assert_eq!(eval_int("SELECT -9223372036854775807 - 1"), Value::Int(i64::MIN));
         assert_eq!(eval_int("SELECT 3 * 4"), Value::Int(12));
     }
+
+    #[test]
+    fn big_int_survives_wire_json() {
+        // 曾经：计算层精确了，但线路上的 Json::Num 是 f64，>2^53 又被截断
+        let stmt = Parser::parse("SELECT 9007199254740993").unwrap();
+        let result = match stmt {
+            crate::sql::Statement::Select(select) => {
+                crate::sql::executor::exec_select(&mut test_engine(), &select, &[], false).unwrap()
+            }
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        };
+        let wire = result.to_wire_json().to_string();
+        assert!(wire.contains("9007199254740993"), "线路上应保留精确整数: {}", wire);
+        assert!(!wire.contains("9007199254740992"), "不应被 f64 截断: {}", wire);
+    }
+
+    fn test_engine() -> crate::engine::Engine {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("littledb-eval-eng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::engine::Engine::open(&dir).unwrap()
+    }
 }

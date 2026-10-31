@@ -55,7 +55,7 @@ pub struct Catalog {
 fn value_to_json(value: &Value) -> Json {
     match value {
         Value::Null => Json::Null,
-        Value::Int(n) => Json::Num(*n as f64),
+        Value::Int(n) => Json::Int(*n),
         Value::Real(n) => Json::Num(*n),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Bool(b) => Json::Bool(*b),
@@ -66,6 +66,7 @@ fn value_from_json(value: &Json) -> Value {
     match value {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Bool(*b),
+        Json::Int(n) => Value::Int(*n),
         Json::Num(n) => {
             if n.fract() == 0.0 {
                 Value::Int(*n as i64)

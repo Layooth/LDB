@@ -13,9 +13,8 @@ use std::path::{Path, PathBuf};
 
 use crate::catalog::Catalog;
 use crate::error::{self, DbError, Result};
-use crate::json::{self, Json};
 use crate::page::{init_page, PAGE_SIZE};
-use crate::wal::Wal;
+use crate::wal::{Wal, WalRecord};
 
 pub type PageKey = (u32, u32);
 
@@ -111,56 +110,36 @@ impl Store {
     // ------------------------------------------------------------ 恢复
 
     fn recover(&mut self) -> Result<()> {
-        let text = self.wal.read_all()?;
-        if !text.is_empty() {
-            let mut pending: HashMap<i64, Vec<Json>> = HashMap::new();
-            let mut txns = 0usize;
-            let mut records = 0usize;
-
-            for line in text.split('\n') {
-                if line.is_empty() {
-                    continue;
-                }
-                let record = match json::parse(line) {
-                    Ok(value) => value,
-                    Err(_) => break,
-                };
-                let kind = record.get("k").and_then(|v| v.as_str()).unwrap_or("");
-                if kind == "commit" {
-                    let txn_id = record.get("t").and_then(|v| v.as_i64()).unwrap_or(-1);
-                    if let Some(list) = pending.remove(&txn_id) {
-                        for item in list {
-                            self.apply_record(&item)?;
-                            records += 1;
-                        }
-                        txns += 1;
-                    }
-                } else if let Some(txn_id) = record.get("t").and_then(|v| v.as_i64()) {
-                    pending.entry(txn_id).or_insert_with(Vec::new).push(record);
-                }
-            }
-
-            self.recovered_txns = txns;
-            self.recovered_records = records;
+        let mut replayed: Vec<WalRecord> = Vec::new();
+        let (txns, records) = self.wal.recover(|record| {
+            replayed.push(record.clone());
+            Ok(())
+        })?;
+        for record in &replayed {
+            self.apply_record(record)?;
         }
-        self.wal.truncate(true)?;
+        self.recovered_txns = txns;
+        self.recovered_records = records;
         Ok(())
     }
 
-    fn apply_record(&mut self, record: &Json) -> Result<()> {
-        let kind = record.get("k").and_then(|v| v.as_str()).unwrap_or("");
-        if kind == "page" {
-            let table_id = record.get("tb").and_then(|v| v.as_i64()).unwrap_or(-1) as u32;
-            let page_no = record.get("p").and_then(|v| v.as_i64()).unwrap_or(-1) as u32;
-            let data = record.get("d").and_then(|v| v.as_str()).unwrap_or("");
-            let bytes = json::b64_decode(data)?;
-            if bytes.len() != PAGE_SIZE {
-                return Err(DbError::internal("WAL 中的页镜像长度非法"));
+    fn apply_record(&mut self, record: &WalRecord) -> Result<()> {
+        match record {
+            WalRecord::Page {
+                table_id,
+                page_no,
+                data,
+                ..
+            } => {
+                if data.len() != PAGE_SIZE {
+                    return Err(DbError::internal("WAL 中的页镜像长度非法"));
+                }
+                self.write_page_raw(*table_id, *page_no, data)?;
             }
-            self.write_page_raw(table_id, page_no, &bytes)?;
-        } else if kind == "catalog" {
-            let data = record.get("d").and_then(|v| v.as_str()).unwrap_or("");
-            fs::write(&self.catalog_path, data.as_bytes())?;
+            WalRecord::Catalog { json, .. } => {
+                fs::write(&self.catalog_path, json.as_bytes())?;
+            }
+            WalRecord::Commit { .. } => {}
         }
         Ok(())
     }
@@ -284,32 +263,24 @@ impl Store {
             return Ok(());
         }
 
-        let mut records: Vec<Json> = Vec::new();
+        let mut records: Vec<WalRecord> = Vec::new();
         if txn.catalog_dirty {
-            records.push(Json::Obj(vec![
-                ("k".to_string(), Json::str("catalog")),
-                ("t".to_string(), Json::Num(txn.id as f64)),
-                (
-                    "d".to_string(),
-                    Json::str(self.catalog.to_json().to_string()),
-                ),
-            ]));
+            records.push(WalRecord::Catalog {
+                txn: txn.id as u32,
+                json: self.catalog.to_json().to_string(),
+            });
         }
         for key in &txn.dirty {
             if let Some(page) = txn.pages.get(key) {
-                records.push(Json::Obj(vec![
-                    ("k".to_string(), Json::str("page")),
-                    ("t".to_string(), Json::Num(txn.id as f64)),
-                    ("tb".to_string(), Json::Num(key.0 as f64)),
-                    ("p".to_string(), Json::Num(key.1 as f64)),
-                    ("d".to_string(), Json::str(json::b64_encode(page))),
-                ]));
+                records.push(WalRecord::Page {
+                    txn: txn.id as u32,
+                    table_id: key.0,
+                    page_no: key.1,
+                    data: page.clone(),
+                });
             }
         }
-        records.push(Json::Obj(vec![
-            ("k".to_string(), Json::str("commit")),
-            ("t".to_string(), Json::Num(txn.id as f64)),
-        ]));
+        records.push(WalRecord::Commit { txn: txn.id as u32 });
 
         if let Err(err) = self.wal.append(&records) {
             self.discard_txn(&txn);

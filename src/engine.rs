@@ -545,6 +545,7 @@ fn json_to_value(value: &Json) -> Value {
     match value {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Bool(*b),
+        Json::Int(n) => Value::Int(*n),
         Json::Num(n) => {
             if n.fract() == 0.0 && n.abs() < 9007199254740992.0 {
                 Value::Int(*n as i64)

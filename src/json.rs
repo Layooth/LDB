@@ -11,7 +11,10 @@ use crate::error::{DbError, Result};
 pub enum Json {
     Null,
     Bool(bool),
+    /// 一般数字（含小数、超出 i64 的整数）
     Num(f64),
+    /// 精确整数：f64 只有 53 位尾数，2^53 以上的整数必须走这里才不丢精度
+    Int(i64),
     Str(String),
     Arr(Vec<Json>),
     Obj(Vec<(String, Json)>),
@@ -51,6 +54,7 @@ impl Json {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Num(n) => Some(*n),
+            Json::Int(n) => Some(*n as f64),
             _ => None,
         }
     }
@@ -58,6 +62,7 @@ impl Json {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Json::Num(n) => Some(*n as i64),
+            Json::Int(n) => Some(*n),
             _ => None,
         }
     }
@@ -132,6 +137,9 @@ fn write_value(out: &mut String, value: &Json) {
         Json::Bool(true) => out.push_str("true"),
         Json::Bool(false) => out.push_str("false"),
         Json::Num(n) => write_number(out, *n),
+        Json::Int(n) => {
+            let _ = write!(out, "{}", n);
+        }
         Json::Str(s) => write_string(out, s),
         Json::Arr(items) => {
             out.push('[');
@@ -413,8 +421,12 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
+        let mut is_integer = true;
         while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E' || c == b'+' || c == b'-' {
+            if c.is_ascii_digit() {
+                self.pos += 1;
+            } else if c == b'.' || c == b'e' || c == b'E' || c == b'+' || c == b'-' {
+                is_integer = false;
                 self.pos += 1;
             } else {
                 break;
@@ -422,6 +434,13 @@ impl<'a> Parser<'a> {
         }
         let text = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| DbError::internal("JSON 数字非法"))?;
+        // 整数形态的数字优先按 i64 解析：f64 只有 53 位尾数，
+        // 2^53 以上会静默丢精度（JS 客户端同样截断，但服务端必须保住原值）
+        if is_integer {
+            if let Ok(v) = text.parse::<i64>() {
+                return Ok(Json::Int(v));
+            }
+        }
         let value: f64 = text
             .parse()
             .map_err(|_| DbError::internal(format!("JSON 数字非法: {}", text)))?;
@@ -566,5 +585,24 @@ mod tests {
         // 上限内的正常嵌套不受影响
         let ok = format!("{}{}", "[".repeat(MAX_JSON_DEPTH), "]".repeat(MAX_JSON_DEPTH));
         assert!(parse(&ok).is_ok());
+    }
+
+    #[test]
+    fn integers_beyond_f53_stay_exact() {
+        // f64 只有 53 位尾数：2^53+1 用 Num 会变成 9007199254740992
+        let big = parse("9007199254740993").unwrap();
+        assert_eq!(big.as_i64(), Some(9007199254740993));
+        assert_eq!(big.to_string(), "9007199254740993");
+
+        // 嵌套在对象/数组里同样精确
+        let obj = parse(r#"{"a":[1,9007199254740993],"b":-9223372036854775808}"#).unwrap();
+        assert_eq!(obj.get("a").unwrap().as_array().unwrap()[1].as_i64(), Some(9007199254740993));
+        assert_eq!(obj.get("b").unwrap().as_i64(), Some(i64::MIN));
+
+        // 小数/科学计数法仍是 Num
+        assert!(matches!(parse("2.5").unwrap(), Json::Num(_)));
+        assert!(matches!(parse("3e2").unwrap(), Json::Num(_)));
+        // 超出 i64 的巨大整数退回 Num（f64）
+        assert!(matches!(parse("99999999999999999999").unwrap(), Json::Num(_)));
     }
 }

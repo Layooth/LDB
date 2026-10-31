@@ -537,21 +537,24 @@ $payload = json_decode(curl_exec($ch), true);   // $payload['result']
 
 ## 性能测试
 
-### 可视化测试台（推荐）
+### 可视化测试台（推荐，双击即可）
 
-双击 `bench\启动性能测试.bat`（或 `python bench\app.py`）：自动起一个隔离的数据库实例
-（随机空闲端口，数据放在 `bench\data\`，与真实数据隔离）并打开浏览器界面——
-填规模、点「开始测试」，看进度条、吞吐对比图和延迟分位数，跑完自动停库。
+双击 `bench\启动性能测试.bat`（或 `python bench\app.py`）——**不需要手动启动数据库**：
 
-### 命令行版
+- 测试台会自己拉起一个隔离的数据库实例（随机空闲端口，数据在 `bench\data\`，
+  与真实数据完全隔离），测完自动停掉，不留残留进程；
+- 浏览器自动打开测试界面：填规模 → 点「开始测试」→ 看进度条、吞吐对比图和延迟分位数。
 
-`tools/bench.py` 按真实部署形态（HTTP + 认证 + 参数化）测六类场景：
+### 命令行版（进阶，适合脚本/CI）
+
+`tools/bench.py` 是同一套场景的命令行形态，**需要你自己先起一个服务**再指给它
+（这就是它和可视化版的唯一区别）：
 
 ```powershell
-# 起一个服务（建议用 release 版 dist\littledb.exe）
+# 第 1 步：手动起一个服务（可视化版里这一步是自动的）
 .\dist\littledb.exe serve .\bench-data --http-port 7802 --no-open --token bench
 
-# 跑基准（约 30 秒，规模可用 BENCH_* 环境变量调）
+# 第 2 步：跑基准（约 30 秒，规模可用 BENCH_* 环境变量调）
 $env:LDB_BASE = "http://127.0.0.1:7802"; $env:LDB_TOKEN = "bench"
 python tools\bench.py
 ```

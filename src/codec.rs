@@ -545,7 +545,16 @@ pub fn coerce(ty: ColumnType, scale: u8, value: &Value) -> Result<Value> {
         }
         ColumnType::Json => {
             let text = value.as_text();
-            let parsed = crate::json::parse(&text)?;
+            // 非法 JSON 是**用户输入错误**，不能报成 INTERNAL_ERROR：
+            // 客户端会当成服务端故障去重试，实际应该修数据
+            let parsed = crate::json::parse(&text).map_err(|err| {
+                let preview: String = text.chars().take(40).collect();
+                let suffix = if text.chars().count() > 40 { "…" } else { "" };
+                DbError::type_error(format!(
+                    "JSON 列只接受合法 JSON：{}{}（{}）",
+                    preview, suffix, err.message
+                ))
+            })?;
             Ok(Value::Text(parsed.to_string()))
         }
     }

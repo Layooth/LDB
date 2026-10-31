@@ -1289,7 +1289,9 @@ fn infer_expr_type(expr: &Expr, plans: &[TablePlan]) -> String {
             let upper = name.to_uppercase();
             match upper.as_str() {
                 "COUNT" | "LENGTH" | "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND"
-                | "DATEDIFF" => "INT".to_string(),
+                | "DATEDIFF" | "JSON_ARRAY_LENGTH" => "INT".to_string(),
+                "JSON_VALID" => "BOOL".to_string(),
+                "JSON_TYPE" => "TEXT".to_string(),
                 "AVG" => "REAL".to_string(),
                 "UPPER" | "LOWER" | "NOW" | "CURRENT_TIMESTAMP" | "CURDATE" | "CURRENT_DATE"
                 | "TODAY" | "DATE_ADD" | "DATE_SUB" | "DATE_FORMAT" | "TO_DATE" | "DATE_ONLY" => {

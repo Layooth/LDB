@@ -11,6 +11,7 @@ pub mod engine;
 pub mod error;
 pub mod http;
 pub mod json;
+pub mod jsonpath;
 pub mod page;
 pub mod protocol;
 pub mod server;

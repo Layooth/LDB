@@ -196,10 +196,16 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | 表达式 | 算术、比较、`AND/OR/NOT`、`IS [NOT] NULL`、`IN (...)`、`BETWEEN`、`LIKE`、`CAST(x AS 类型)`、`?` 参数 |
 | 函数 | `COALESCE LENGTH UPPER LOWER ABS ROUND`、`NOW CURDATE`；聚合 `COUNT SUM AVG MIN MAX`（含 DISTINCT / `COUNT(*)`） |
 | 日期时间 | `DATE_ADD(d, n, unit)` / `DATE_SUB(d, n, unit)`（unit: `day/week/hour/minute/second/month/year`）、`DATEDIFF(a, b)`、`YEAR MONTH DAY HOUR MINUTE SECOND`、`TO_DATE(d)`、`DATE_FORMAT(d, '%Y-%m-%d %H:%M:%S')` |
+| JSON | `JSON_EXTRACT(j, '$.a.b[0]')`、`JSON_TYPE(j)`、`JSON_VALID(j)`、`JSON_ARRAY_LENGTH(j)` |
 
 **不支持**：`RIGHT/FULL JOIN`、标量子查询、`ANY/ALL`、窗口函数、
 `INSERT ... SELECT`、`TRUNCATE`、视图/触发器/序列。`ALTER TABLE` 的列变更通过
 「影子表重建」实现：**表 id 会变、行号会重排、数据完整保留**，索引按列名迁移。
+
+JSON 列在存储层就是 TEXT，`JSON_*` 在求值期解析：路径语法 `$` / `$.键` / `[下标]`
+（可混写 `$.a.b[0]`），**路径不存在返回 NULL**（不是错误，方便做「有这个字段吗」）；
+标量原样返回（2^53 以上的整数仍是 `INT`，不经过 f64），对象/数组返回 JSON 文本；
+非法 JSON 报 `TYPE_ERROR` 并提示先用 `JSON_VALID` 检查，路径语法错报 `SYNTAX_ERROR`。
 
 日期时间统一按 **UTC** 的 `YYYY-MM-DD[ HH:MM:SS]` 解析（`NOW()` 返回 UTC）；`DATE_ADD`/`DATE_SUB`
 的 `month`/`year` 按日历推进并对月末做裁剪（`2026-01-31 + 1 month = 2026-02-28`，

@@ -835,6 +835,59 @@ fn eval_scalar(
                 &format.as_text(),
             )?))
         }
+        // ------------------------------------------------------------ JSON
+        // JSON 列在存储层就是 TEXT，这几个函数在求值期解析、按需取值。
+        "JSON_VALID" => {
+            require_args(name, args, 1)?;
+            let value = eval(&args[0], ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Bool(
+                crate::jsonpath::parse_document(&value.as_text()).is_ok(),
+            ))
+        }
+        "JSON_TYPE" => {
+            require_args(name, args, 1)?;
+            let value = eval(&args[0], ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let doc = crate::jsonpath::parse_document(&value.as_text())?;
+            Ok(Value::Text(crate::jsonpath::type_name(&doc).to_string()))
+        }
+        "JSON_EXTRACT" => {
+            require_args(name, args, 2)?;
+            let value = eval(&args[0], ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let path = eval(&args[1], ctx, params)?;
+            if path.is_null() {
+                return Ok(Value::Null);
+            }
+            let doc = crate::jsonpath::parse_document(&value.as_text())?;
+            match crate::jsonpath::extract(&doc, &path.as_text())? {
+                Some(node) => Ok(crate::jsonpath::to_value(node)),
+                // 路径不存在是 NULL（不是错误）：查询里常用它做「有这个字段吗」
+                None => Ok(Value::Null),
+            }
+        }
+        "JSON_ARRAY_LENGTH" => {
+            require_args(name, args, 1)?;
+            let value = eval(&args[0], ctx, params)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let doc = crate::jsonpath::parse_document(&value.as_text())?;
+            match doc.as_array() {
+                Some(items) => Ok(Value::Int(items.len() as i64)),
+                None => Err(DbError::type_error(format!(
+                    "JSON_ARRAY_LENGTH 需要数组，实际是 {}",
+                    crate::jsonpath::type_name(&doc)
+                ))),
+            }
+        }
         other => Err(DbError::syntax(format!("不支持的函数 {}", other))),
     }
 }

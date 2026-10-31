@@ -2122,6 +2122,116 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// JSON 函数：JSON_VALID / JSON_TYPE / JSON_EXTRACT / JSON_ARRAY_LENGTH
+#[test]
+fn json_functions() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("jsonfn");
+    let mut session = Session::open(&dir).unwrap();
+
+    let one = |session: &mut Session, sql: &str| -> Value {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1, "{} 应返回 1 行", sql);
+                rows[0][0].clone()
+            }
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 取值：嵌套对象 / 数组 / 混合路径
+    assert_eq!(
+        one(&mut session, r#"SELECT JSON_EXTRACT('{"a":{"b":1}}', '$.a.b')"#),
+        Value::Int(1)
+    );
+    assert_eq!(
+        one(
+            &mut session,
+            r#"SELECT JSON_EXTRACT('{"list":[10,20,30]}', '$.list[1]')"#
+        ),
+        Value::Int(20)
+    );
+    assert_eq!(
+        one(
+            &mut session,
+            r#"SELECT JSON_EXTRACT('{"user":{"name":"alice"}}', '$.user.name')"#
+        ),
+        Value::Text("alice".into())
+    );
+    // 对象/数组返回 JSON 文本
+    assert_eq!(
+        one(&mut session, r#"SELECT JSON_EXTRACT('{"a":{"b":1}}', '$.a')"#),
+        Value::Text("{\"b\":1}".into())
+    );
+    // 路径不存在 → NULL（不是报错）
+    assert_eq!(
+        one(&mut session, r#"SELECT JSON_EXTRACT('{"a":1}', '$.missing')"#),
+        Value::Null
+    );
+
+    // 类型与合法性
+    assert_eq!(
+        one(&mut session, r#"SELECT JSON_TYPE('{"a":[1,true]}')"#),
+        Value::Text("object".into())
+    );
+    assert_eq!(
+        one(&mut session, r#"SELECT JSON_TYPE('"x"')"#),
+        Value::Text("string".into())
+    );
+    assert_eq!(one(&mut session, "SELECT JSON_VALID('{\"a\":1}')"), Value::Bool(true));
+    assert_eq!(one(&mut session, "SELECT JSON_VALID('{oops}')"), Value::Bool(false));
+    assert_eq!(
+        one(&mut session, r#"SELECT JSON_ARRAY_LENGTH('[1,2,3]')"#),
+        Value::Int(3)
+    );
+
+    // 错误路径：非法 JSON / 非数组 / 非法路径
+    let err = session.execute(r#"SELECT JSON_TYPE('{oops}')"#, &[]).unwrap_err();
+    assert_eq!(err.code, "TYPE_ERROR", "{}", err.message);
+    assert!(err.message.contains("JSON_VALID"), "{}", err.message);
+    let err = session
+        .execute(r#"SELECT JSON_ARRAY_LENGTH('{"a":1}')"#, &[])
+        .unwrap_err();
+    assert_eq!(err.code, "TYPE_ERROR", "{}", err.message);
+    let err = session
+        .execute(r#"SELECT JSON_EXTRACT('{"a":1}', 'a.b')"#, &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+
+    // 真实用法：JSON 列上按字段过滤 + 聚合
+    session
+        .execute("CREATE TABLE logs (id INT PRIMARY KEY, payload JSON)", &[])
+        .unwrap();
+    session
+        .execute(
+            r#"INSERT INTO logs VALUES
+               (1,'{"level":"error","ms":12}'),
+               (2,'{"level":"warn","ms":3}'),
+               (3,'{"level":"error","ms":7}')"#,
+            &[],
+        )
+        .unwrap();
+    match session
+        .execute(
+            "SELECT COUNT(*) AS n, SUM(JSON_EXTRACT(payload, '$.ms')) AS total \
+             FROM logs WHERE JSON_EXTRACT(payload, '$.level') = 'error'",
+            &[],
+        )
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(
+            rows,
+            vec![vec![Value::Int(2), Value::Int(19)]],
+            "两条 error，ms 之和 12+7"
+        ),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 日期时间函数：加减、差值、取字段、格式化
 #[test]
 fn date_time_functions() {

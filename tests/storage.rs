@@ -1174,6 +1174,16 @@ fn start_http(dir: &std::path::Path) -> u16 {
 
 /// 同上，可指定 CORS 策略（None = 只允许同源）
 fn start_http_with(dir: &std::path::Path, cors: Option<&str>) -> u16 {
+    start_http_full(dir, None, cors, 5)
+}
+
+/// 完整版：可指定访问令牌与认证失败阈值
+fn start_http_full(
+    dir: &std::path::Path,
+    token: Option<&str>,
+    cors: Option<&str>,
+    auth_fail_limit: u32,
+) -> u16 {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, RwLock};
 
@@ -1184,7 +1194,7 @@ fn start_http_with(dir: &std::path::Path, cors: Option<&str>) -> u16 {
 
     let mut state = littledb::http::HttpState::new(
         engine,
-        None,
+        token.map(|t| t.to_string()),
         littledb::http::find_web_dir(),
         Arc::new(AtomicUsize::new(0)),
         8,
@@ -1195,6 +1205,9 @@ fn start_http_with(dir: &std::path::Path, cors: Option<&str>) -> u16 {
     if let Some(policy) = cors {
         state = state.with_cors(policy.to_string());
     }
+    state = state.with_auth_limiter(std::sync::Arc::new(littledb::auth::AuthLimiter::new(
+        auth_fail_limit,
+    )));
     std::thread::spawn(move || {
         let _ = littledb::http::serve(state, "127.0.0.1", port);
     });
@@ -1263,6 +1276,119 @@ fn http_rejects_malformed_requests() {
     );
     assert!(response.starts_with("HTTP/1.1 200"), "{}", response);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// HTTP 认证失败限速：连续猜错后返回 429 + Retry-After，退避期内正确 token 也拒
+#[test]
+fn http_auth_failures_back_off() {
+    let dir = temp_dir("httpauth");
+    let port = start_http_full(&dir, Some("good-token"), None, 3);
+
+    let wrong = "GET /api/health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+                 Authorization: Bearer bad-token\r\n\r\n";
+    for attempt in 1..=3 {
+        let resp = http_roundtrip(port, wrong);
+        assert!(resp.starts_with("HTTP/1.1 401"), "第 {} 次: {}", attempt, resp);
+    }
+    // 第 4 次失败跨过阈值：本次仍是 401，但已进入退避
+    let resp = http_roundtrip(port, wrong);
+    assert!(resp.starts_with("HTTP/1.1 401"), "{}", resp);
+
+    // 之后一律 429，且带 Retry-After
+    let resp = http_roundtrip(port, wrong);
+    assert!(resp.starts_with("HTTP/1.1 429"), "{}", resp);
+    assert!(resp.to_ascii_lowercase().contains("retry-after:"), "{}", resp);
+    assert!(resp.contains("RATE_LIMITED"), "{}", resp);
+
+    // 退避期内正确 token 也不放行（否则爆破方可以靠“猜中一次”绕过退避）
+    let good = "GET /api/health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+                Authorization: Bearer good-token\r\n\r\n";
+    let resp = http_roundtrip(port, good);
+    assert!(resp.starts_with("HTTP/1.1 429"), "{}", resp);
+
+    // 关闭限速（limit=0）时不会锁
+    let dir2 = temp_dir("httpauth2");
+    let port2 = start_http_full(&dir2, Some("good-token"), None, 0);
+    for _ in 0..20 {
+        let resp = http_roundtrip(port2, wrong);
+        assert!(resp.starts_with("HTTP/1.1 401"), "{}", resp);
+    }
+    let resp = http_roundtrip(port2, good);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// LDBP 端口同样限速：猜错 N 次后 hello 返回 RATE_LIMITED
+#[test]
+fn ldbp_auth_failures_back_off() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let dir = temp_dir("ldbpauth");
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let engine = Engine::open(&dir).unwrap();
+    let options = littledb::server::ServerOptions {
+        host: "127.0.0.1".to_string(),
+        port,
+        http_port: None,
+        token: Some("good-token".to_string()),
+        auth_fail_limit: 3,
+        open_browser: false,
+        ..Default::default()
+    };
+    let server = littledb::server::Server::new(engine, options);
+    std::thread::spawn(move || {
+        let _ = server.run();
+    });
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    fn read_frame(stream: &mut TcpStream) -> String {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+    fn send_frame(stream: &mut TcpStream, text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(bytes);
+        stream.write_all(&frame).unwrap();
+        read_frame(stream)
+    }
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let welcome = read_frame(&mut stream);
+    assert!(welcome.contains("welcome"), "{}", welcome);
+
+    for attempt in 1..=3 {
+        let resp = send_frame(&mut stream, r#"{"type":"hello","token":"bad"}"#);
+        assert!(resp.contains("AUTH_FAILED"), "第 {} 次: {}", attempt, resp);
+    }
+    // 第 4 次失败：仍回 AUTH_FAILED，但此后进入退避
+    let resp = send_frame(&mut stream, r#"{"type":"hello","token":"bad"}"#);
+    assert!(resp.contains("AUTH_FAILED"), "{}", resp);
+    let resp = send_frame(&mut stream, r#"{"type":"hello","token":"bad"}"#);
+    assert!(resp.contains("RATE_LIMITED"), "{}", resp);
+    // 正确 token 在退避期内也被拒
+    let resp = send_frame(&mut stream, r#"{"type":"hello","token":"good-token"}"#);
+    assert!(resp.contains("RATE_LIMITED"), "{}", resp);
+
+    drop(stream);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

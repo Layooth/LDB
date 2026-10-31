@@ -3,12 +3,13 @@
 //! 每个连接一个线程，共享同一个 `Engine`（RwLock 读写分离）。
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::auth::AuthLimiter;
 use crate::codec::Value;
 use crate::engine::Engine;
 use crate::error::{self, DbError, Result};
@@ -35,6 +36,8 @@ pub struct ServerOptions {
     pub cors_origin: Option<String>,
     /// 允许「监听非回环地址但没有 token」——仅调试用
     pub allow_insecure: bool,
+    /// 同一来源连续认证失败多少次后开始退避；0 = 关闭限速
+    pub auth_fail_limit: u32,
 }
 
 impl Default for ServerOptions {
@@ -52,6 +55,7 @@ impl Default for ServerOptions {
             durable_commits: true,
             cors_origin: None,
             allow_insecure: false,
+            auth_fail_limit: 5,
         }
     }
 }
@@ -84,6 +88,8 @@ pub fn validate_bind(options: &ServerOptions) -> Result<()> {
 pub struct Server {
     engine: Arc<RwLock<Engine>>,
     options: ServerOptions,
+    /// 认证失败限速（协议端口与 HTTP 端口共用同一份计数）
+    auth: Arc<AuthLimiter>,
     active: Arc<AtomicUsize>,
     pub connections: Arc<AtomicUsize>,
     pub queries: Arc<AtomicUsize>,
@@ -94,9 +100,11 @@ pub struct Server {
 impl Server {
     pub fn new(mut engine: Engine, options: ServerOptions) -> Server {
         engine.store.set_sync_mode(options.durable_commits);
+        let auth = Arc::new(AuthLimiter::new(options.auth_fail_limit));
         Server {
             engine: Arc::new(RwLock::new(engine)),
             options,
+            auth,
             active: Arc::new(AtomicUsize::new(0)),
             connections: Arc::new(AtomicUsize::new(0)),
             queries: Arc::new(AtomicUsize::new(0)),
@@ -123,6 +131,8 @@ impl Server {
                 Some(policy) => state.with_cors(policy.clone()),
                 None => state,
             };
+            // 与协议端口共用认证失败计数：只打 HTTP 或只打 TCP 都逃不掉退避
+            let state = state.with_auth_limiter(Arc::clone(&self.auth));
             let host = self.options.host.clone();
             thread::spawn(move || {
                 if let Err(err) = crate::http::serve(state, &host, http_port) {
@@ -208,11 +218,14 @@ impl Server {
 
                     // 栈按解析器闸门给：MAX_EXPR_DEPTH=64、MAX_TOKENS=2万，2MB 足够
                     let slot = Arc::clone(&active);
+                    let auth = Arc::clone(&self.auth);
+                    let remote: Option<IpAddr> = stream.peer_addr().ok().map(|addr| addr.ip());
                     let spawn = thread::Builder::new()
                         .stack_size(2 * 1024 * 1024)
                         .spawn(move || {
                             handle_connection(
-                                stream, engine, options, queries, slow, connections,
+                                stream, engine, options, queries, slow, connections, auth,
+                                remote,
                             );
                             slot.fetch_sub(1, Ordering::SeqCst);
                         });
@@ -240,6 +253,8 @@ fn handle_connection(
     queries: Arc<AtomicUsize>,
     slow_queries: Arc<AtomicUsize>,
     connections: Arc<AtomicUsize>,
+    auth: Arc<AuthLimiter>,
+    remote: Option<IpAddr>,
 ) {
     connections.fetch_add(1, Ordering::SeqCst);
     let _ = stream.set_nodelay(true);
@@ -276,6 +291,8 @@ fn handle_connection(
                         &options,
                         &queries,
                         &slow_queries,
+                        &auth,
+                        remote,
                         &frame,
                     ) {
                         keep_going = false;
@@ -320,6 +337,8 @@ fn handle_message(
     options: &ServerOptions,
     queries: &Arc<AtomicUsize>,
     slow_queries: &Arc<AtomicUsize>,
+    auth: &AuthLimiter,
+    remote: Option<IpAddr>,
     message: &Json,
 ) -> bool {
     let id = message.get("id").cloned().unwrap_or(Json::Null);
@@ -331,14 +350,32 @@ fn handle_message(
 
     if kind == "hello" {
         if let Some(expected) = &options.token {
+            // 退避窗口内直接拒绝，不再比较 token
+            if let Some(ip) = remote {
+                if let Err(wait) = auth.check(ip) {
+                    let payload = error_frame(
+                        id,
+                        error::RATE_LIMITED,
+                        &format!("认证失败次数过多，请 {} 秒后再试", wait),
+                    );
+                    send(stream, &payload);
+                    return true;
+                }
+            }
             let given = message
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if !crate::protocol::secret_eq(given, expected) {
+                if let Some(ip) = remote {
+                    auth.record_failure(ip);
+                }
                 let payload = error_frame(id, error::AUTH, "认证失败：token 不正确");
                 send(stream, &payload);
                 return true;
+            }
+            if let Some(ip) = remote {
+                auth.record_success(ip);
             }
         }
         *authed = true;

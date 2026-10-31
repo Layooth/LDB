@@ -216,6 +216,15 @@ try {
     if ([int]$r.StatusCode -ne 200) { Fail "首页应 200，实际 $($r.StatusCode)" }
     $checks++; Ok "控制台首页 → 200"
 
+    # 认证失败限速（放在最后：会把本机来源打入退避窗口）
+    for ($i = 1; $i -le 6; $i++) {
+        [void](Invoke-Api "GET" "$base/api/health" $null $null "definitely-wrong")
+    }
+    $r = Invoke-Api "GET" "$base/api/health" $null $null "definitely-wrong"
+    if ([int]$r.StatusCode -ne 429) { Fail "连续猜错后应 429，实际 $($r.StatusCode)" }
+    if (-not $r.Headers["Retry-After"]) { Fail "429 响应应带 Retry-After" }
+    $checks++; Ok "认证失败限速 → 429 + Retry-After"
+
     Write-Host ("`n冒烟通过：$checks 项检查全部 OK") -ForegroundColor Green
     exit 0
 } catch {

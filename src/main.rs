@@ -36,6 +36,7 @@ fn print_help() {
     println!("  --token <令牌>       启用认证，客户端需携带相同 token（也可用环境变量 LDB_TOKEN）");
     println!("  --cors-origin <列表> Web 端可跨源访问的来源，逗号分隔；* 表示不限制（默认同源）");
     println!("  --allow-insecure     允许「监听非回环地址且没有 token」——仅调试用，默认拒绝启动");
+    println!("  --auth-fail-limit <n> 同一来源连续认证失败多少次后开始退避（默认 5，0 = 关闭）");
     println!("  --max-connections <n> 最大并发连接数（默认 64）");
     println!("  --slow-ms <毫秒>     超过该耗时打印慢查询");
     println!("  --sync <full|normal> 提交耐久性（默认 full）：normal 在 checkpoint 时才 fsync，");
@@ -284,6 +285,12 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
                 }
             }
             "--allow-insecure" => options.allow_insecure = true,
+            "--auth-fail-limit" => {
+                i += 1;
+                if let Some(value) = extra.get(i) {
+                    options.auth_fail_limit = value.parse().unwrap_or(5);
+                }
+            }
             "--max-connections" => {
                 i += 1;
                 if let Some(value) = extra.get(i) {

@@ -1,6 +1,7 @@
 //! LittleDB 的 Rust 实现（独立项目，磁盘格式以本实现为准：
 //! slotted page、行编码、catalog.json、LDBW2 二进制 WAL）。
 
+pub mod auth;
 pub mod catalog;
 pub mod codec;
 pub mod engine;

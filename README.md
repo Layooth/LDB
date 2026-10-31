@@ -39,6 +39,7 @@ littledb.exe demo .\tmp-demo              # 建演示库并验证读写
 | 监听地址 | `127.0.0.1`（仅本机） | `--host 0.0.0.0` |
 | 无令牌 + 对外监听 | **拒绝启动**（远程无认证 = 谁都能读写） | 加 `--token`，或显式 `--allow-insecure` |
 | 令牌传递 | 环境变量 `LDB_TOKEN` 优先于命令行（命令行对其它进程可见） | 启动器已改用环境变量 |
+| 猜令牌 | 同一来源连续失败 5 次后指数退避（30s→60s→…上限 15min），HTTP 回 429 + `Retry-After`，LDBP 回 `RATE_LIMITED` | `--auth-fail-limit <n>`（0 = 关闭） |
 | 跨源访问 | 只允许同源（不回 `Access-Control-Allow-Origin`） | `--cors-origin "https://a.example,https://b.example"` 或 `*` |
 | 控制台令牌存储 | `sessionStorage`（关标签即失效）+ 落地后清掉 URL 里的 `?token=` | — |
 | 响应头 | 带 `X-Content-Type-Options: nosniff`、`Cache-Control: no-store` | — |
@@ -177,6 +178,7 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | `AUTH_FAILED` | 401 | 令牌缺失或错误 |
 | `PROTOCOL_ERROR` | 400 | 报文非法（含重复的关键头部、非法 Content-Length） |
 | `LENGTH_REQUIRED` | 411 | 客户端用了 `Transfer-Encoding: chunked`，请改用 `Content-Length` |
+| `RATE_LIMITED` | 429 | 认证失败次数过多，正在退避（响应带 `Retry-After`） |
 | `INTERNAL_ERROR` | 400 | 内部错误（含待恢复状态） |
 
 ## 限制一览

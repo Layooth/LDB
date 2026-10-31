@@ -24,6 +24,8 @@ pub const ROW_TOO_LARGE: &str = "ROW_TOO_LARGE";
 pub const PROTOCOL: &str = "PROTOCOL_ERROR";
 /// 需要 Content-Length（例如客户端用了 chunked 传输）
 pub const LENGTH_REQUIRED: &str = "LENGTH_REQUIRED";
+/// 认证失败次数过多，正在退避（HTTP 429）
+pub const RATE_LIMITED: &str = "RATE_LIMITED";
 
 impl DbError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {

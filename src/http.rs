@@ -15,13 +15,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::auth::AuthLimiter;
 use crate::codec::Value;
 use crate::engine::Engine;
 use crate::error::{self, DbError, Result};
@@ -41,6 +42,8 @@ const TXN_SESSION_TTL_SECS: u64 = 120;
 /// 同时在册的会话上限：每个会话都持有 Arc<Engine> 与未提交状态，
 /// 无上限就是一条内存增长型 DoS 通道。超限时淘汰最久未使用的空闲会话。
 const MAX_SESSIONS: usize = 512;
+/// 认证失败限速的默认阈值（与 ServerOptions 的默认值保持一致）
+const DEFAULT_AUTH_FAIL_LIMIT: u32 = 5;
 
 /// 一个 HTTP 会话。
 ///
@@ -102,6 +105,8 @@ pub struct HttpState {
     pub rejected: Arc<AtomicUsize>,
     /// 允许的跨源来源，逗号分隔；`*` 不限制。None = 只允许同源（默认）
     cors_origin: Option<String>,
+    /// 认证失败限速（与 LDBP 端口共用同一份计数）
+    auth: Arc<AuthLimiter>,
 }
 
 impl HttpState {
@@ -128,6 +133,7 @@ impl HttpState {
             slow_queries,
             rejected,
             cors_origin: None,
+            auth: Arc::new(AuthLimiter::new(DEFAULT_AUTH_FAIL_LIMIT)),
         }
     }
 
@@ -135,6 +141,12 @@ impl HttpState {
     pub fn with_cors(mut self, policy: String) -> HttpState {
         let policy = policy.trim().to_string();
         self.cors_origin = if policy.is_empty() { None } else { Some(policy) };
+        self
+    }
+
+    /// 与 LDBP 端口共用同一份认证失败计数
+    pub fn with_auth_limiter(mut self, limiter: Arc<AuthLimiter>) -> HttpState {
+        self.auth = limiter;
         self
     }
 }
@@ -239,6 +251,8 @@ impl Request {
 }
 
 fn handle(state: HttpState, mut stream: TcpStream) {
+    // 来源 IP 用于认证失败限速（拿不到就当未知来源，不限速）
+    let remote: Option<IpAddr> = stream.peer_addr().ok().map(|addr| addr.ip());
     // 读/写超时：连接建立后客户端必须在时限内继续发数据，
     // 否则线程不会永远等下去（防 slowloris；正常请求毫秒级完成）
     let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
@@ -291,7 +305,7 @@ fn handle(state: HttpState, mut stream: TcpStream) {
                 keep_alive,
             );
         } else if request.path.starts_with("/api/") {
-            let (status, payload, mut extra) = route(&state, &request);
+            let (status, payload, mut extra) = route(&state, &request, remote);
             extra.extend(cors_headers(&state, &request));
             let body = payload.to_string();
             send_response(
@@ -535,6 +549,7 @@ fn status_text(status: u16) -> &'static str {
         409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         500 => "Internal Server Error",
         _ => "Unknown",
@@ -550,6 +565,17 @@ fn ok(payload: Json) -> (u16, Json, Vec<(String, String)>) {
         ]),
         Vec::new(),
     )
+}
+
+/// 认证退避：429 + `Retry-After`（秒）
+fn rate_limited(wait_secs: u64) -> (u16, Json, Vec<(String, String)>) {
+    let (status, payload, mut extra) = fail(
+        429,
+        error::RATE_LIMITED,
+        &format!("认证失败次数过多，请 {} 秒后再试", wait_secs),
+    );
+    extra.push(("Retry-After".to_string(), wait_secs.to_string()));
+    (status, payload, extra)
 }
 
 fn fail(status: u16, code: &str, message: &str) -> (u16, Json, Vec<(String, String)>) {
@@ -608,8 +634,18 @@ fn cors_headers(state: &HttpState, request: &Request) -> Vec<(String, String)> {
 
 // ------------------------------------------------------------------ 路由
 
-fn route(state: &HttpState, request: &Request) -> (u16, Json, Vec<(String, String)>) {
+fn route(
+    state: &HttpState,
+    request: &Request,
+    remote: Option<IpAddr>,
+) -> (u16, Json, Vec<(String, String)>) {
     if let Some(expected) = &state.token {
+        // 退避窗口内直接 429，连比较都不做（避免继续给爆破方反馈）
+        if let Some(ip) = remote {
+            if let Err(wait) = state.auth.check(ip) {
+                return rate_limited(wait);
+            }
+        }
         // 只认 Authorization 头：query 里的 token 会进访问日志和浏览器历史
         let provided = request
             .header("authorization")
@@ -617,7 +653,13 @@ fn route(state: &HttpState, request: &Request) -> (u16, Json, Vec<(String, Strin
             .unwrap_or("");
         // 常量时间比较，避免逐字节短路的时序侧信道
         if !crate::protocol::secret_eq(provided, expected) {
+            if let Some(ip) = remote {
+                state.auth.record_failure(ip);
+            }
             return fail(401, error::AUTH, "认证失败：缺少或错误的 access token");
+        }
+        if let Some(ip) = remote {
+            state.auth.record_success(ip);
         }
     }
 
@@ -688,6 +730,8 @@ fn to_error(err: DbError) -> (u16, Json, Vec<(String, String)>) {
         404
     } else if err.code == error::WRITE_CONFLICT {
         409
+    } else if err.code == error::RATE_LIMITED {
+        429
     } else {
         400
     };

@@ -220,10 +220,15 @@ pub struct Store {
     sync_thread: Option<thread::JoinHandle<()>>,
     sync_thread_started: AtomicBool,
     pub needs_recovery: bool,
+    /// 导致 needs_recovery 的底层原因（checkpoint / WAL 的 I/O 错误），诊断用
+    pub io_error: Option<String>,
     pub checkpoints: u64,
     pub recovered_txns: usize,
     pub recovered_records: usize,
     pub orphans_removed: usize,
+    /// 测试注入：下一次 checkpoint 强制失败，用于验证「提交成功但落盘降级」的语义
+    #[cfg(test)]
+    fail_checkpoint_once: bool,
 }
 
 impl Store {
@@ -259,10 +264,13 @@ impl Store {
             sync_thread: None,
             sync_thread_started: AtomicBool::new(false),
             needs_recovery: false,
+            io_error: None,
             checkpoints: 0,
             recovered_txns: 0,
             recovered_records: 0,
             orphans_removed: 0,
+            #[cfg(test)]
+            fail_checkpoint_once: false,
         };
 
         store.recover()?;
@@ -319,6 +327,12 @@ impl Store {
         self.wal_limit = bytes;
     }
 
+    /// 测试专用：让下一次 checkpoint 失败，验证「提交成功但落盘降级」的语义
+    #[cfg(test)]
+    pub fn force_checkpoint_failure(&mut self) {
+        self.fail_checkpoint_once = true;
+    }
+
     /// 提交耐久性：true = full，调用方等待 fsync 确认后才返回（默认，掉电安全）；
     /// false = normal，立即返回，后台线程异步 fsync（掉电可能丢最近提交）
     pub fn set_sync_mode(&mut self, durable: bool) {
@@ -339,9 +353,14 @@ impl Store {
 
     pub fn assert_usable(&self) -> Result<()> {
         if self.needs_recovery {
-            return Err(DbError::internal(
-                "数据库处于待恢复状态（上次提交落盘失败），请重启进程以重放 WAL",
-            ));
+            let reason = match &self.io_error {
+                Some(err) => format!("：{}", err),
+                None => String::new(),
+            };
+            return Err(DbError::internal(format!(
+                "数据库处于待恢复状态（落盘降级{}），请重启进程以重放 WAL",
+                reason
+            )));
         }
         Ok(())
     }
@@ -617,12 +636,17 @@ impl Store {
         if let Some(err) = self.commit_barrier.error() {
             self.discard_txn(&txn);
             self.needs_recovery = true;
+            self.io_error = Some(format!("WAL fsync 失败：{}", err));
             return Err(DbError::internal(format!(
                 "之前的 WAL fsync 失败（{}），本事务未提交，请重启恢复",
                 err
             )));
         }
 
+        // ---------- 提交判定点：append 成功即视为「本事务已提交」 ----------
+        // 之后的一切（挂 pending、checkpoint）都只影响可用性与落盘进度，
+        // 不能再把错误回报成「提交失败」——调用方会撤销索引/行数，
+        // 而重启重放 WAL 又会让这笔数据出现，造成「报错却已提交」的语义分裂。
         if let Err(err) = self.wal.append(&records) {
             self.discard_txn(&txn);
             return Err(DbError::internal(format!(
@@ -631,7 +655,7 @@ impl Store {
             )));
         }
 
-        // 提交页集合挂入有序列表；seq 在下方递增后回填
+        // 提交页集合挂入有序列表；seq 由下方递增，两者保持一致
         let entry_seq = self.commit_seq + 1;
         self.committed.push_back(CommittedPages {
             seq: entry_seq,
@@ -649,22 +673,19 @@ impl Store {
             self.pending_drops.push(*id);
         }
 
-        if self.wal.bytes >= self.wal_limit {
-            // 增量 checkpoint：有开放事务也能安全推进（只落盘水位线内的条目）。
-            // 只有真实 I/O 错误才会标记 needs_recovery。
-            if let Err(err) = self.checkpoint() {
-                self.needs_recovery = true;
-                return Err(DbError::internal(format!(
-                    "checkpoint 失败（{}），数据库已标记为待恢复",
-                    err.message
-                )));
-            }
-        }
-
         // 发布提交序号；full 模式由调用方在【释放引擎写锁之后】等待 fsync 确认
         self.commit_seq += 1;
         debug_assert_eq!(self.committed.back().unwrap().seq, self.commit_seq);
         self.commit_barrier.publish(self.commit_seq);
+
+        // 增量 checkpoint：有开放事务也能安全推进（只落盘水位线内的条目）。
+        // 失败只降级为「待恢复」（重启后靠 WAL 重放补上），不影响本次提交的成功语义。
+        if self.wal.bytes >= self.wal_limit {
+            if let Err(err) = self.checkpoint() {
+                self.needs_recovery = true;
+                self.io_error = Some(format!("checkpoint 失败：{}", err.message));
+            }
+        }
         Ok(())
     }
 
@@ -720,6 +741,11 @@ impl Store {
     }
 
     fn checkpoint_inner(&mut self, page_cap: usize) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_checkpoint_once {
+            self.fail_checkpoint_once = false;
+            return Err(DbError::internal("注入的 checkpoint 故障（测试）"));
+        }
         // WAL 截断（如果发生）前必须确认所有已写入的提交都已 fsync
         self.commit_barrier.wait_all()?;
         let watermark = self.snapshot_watermark();
@@ -1193,6 +1219,41 @@ mod tests {
         assert!(third.is_ok(), "释放锁后应能重新打开");
 
         drop(third);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 提交判定点在 WAL append 之后：checkpoint 失败只能降级为「待恢复」，
+    /// 绝不能把已经进 WAL 的事务回报成失败（否则索引/行数被撤销，
+    /// 重启重放又让数据出现 → 报错却已提交）。
+    #[test]
+    fn checkpoint_failure_does_not_lie_about_commit() {
+        let dir = temp_dir("ckptfail");
+        fs::create_dir_all(dir.join("data")).unwrap();
+        // 表 3 必须先登记，否则重开时它会被当成孤儿改名
+        let catalog = r#"{"version":1,"nextTableId":4,"tables":[{"id":3,"name":"t3","columns":[{"name":"id","type":"INT","notNull":false,"unique":false,"primaryKey":false}],"indexes":[]}]}"#;
+        fs::write(dir.join("catalog.json"), catalog).unwrap();
+
+        {
+            let mut store = Store::open(&dir).unwrap();
+            store.set_wal_limit(1); // 每次提交后都会尝试 checkpoint
+            store.begin(0).unwrap();
+            let page_no = store.alloc_page(3).unwrap();
+            let mut page = store.read_page(3, page_no).unwrap();
+            page[500] = 55;
+            store.dirty_page(3, page_no, page).unwrap();
+
+            store.force_checkpoint_failure();
+            store.commit(0).expect("WAL 已写入 commit，提交就不能报失败");
+            assert!(store.needs_recovery, "checkpoint 故障后必须降级为待恢复");
+            assert!(store.assert_usable().is_err(), "待恢复状态应拒绝后续操作");
+            assert!(store.io_error.is_some(), "应保留降级原因");
+            // 不 close：模拟崩溃，靠 WAL 恢复
+        }
+
+        let mut store = Store::open(&dir).unwrap();
+        let page = store.read_page(3, 0).unwrap();
+        assert_eq!(page[500], 55, "报成功的提交在重启后必须仍然存在");
+        store.close().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

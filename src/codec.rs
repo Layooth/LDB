@@ -150,6 +150,18 @@ impl Value {
         matches!(self, Value::Null)
     }
 
+    /// 类型名，错误信息用
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Null => "NULL",
+            Value::Int(_) => "INT",
+            Value::Real(_) => "REAL",
+            Value::Decimal { .. } => "DECIMAL",
+            Value::Text(_) => "TEXT",
+            Value::Bool(_) => "BOOL",
+        }
+    }
+
     pub fn as_text(&self) -> String {
         match self {
             Value::Null => String::new(),

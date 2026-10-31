@@ -1012,13 +1012,14 @@ fn incremental_checkpoint_drains_over_multiple_calls() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Tier2：不同表的并发写真正并行（吞吐显著高于同表串行）
+/// 多会话并发写：语句级由引擎写锁串行（见 mvcc-design.md §3.9），
+/// 这里验证的是「并发写不丢行、不报错」，耗时只做诊断输出。
 #[test]
-fn concurrent_writes_to_different_tables_scale() {
+fn concurrent_writes_stay_correct() {
     use littledb::sql::executor::ConnSession;
     use littledb::sql::QueryResult;
     use std::sync::{Arc, RwLock};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let dir = temp_dir("parwrite");
     {
@@ -1087,11 +1088,13 @@ fn concurrent_writes_to_different_tables_scale() {
     }
     let same_elapsed = t0.elapsed();
 
+    // 只做诊断输出，不断言耗时：写语句整条持有引擎全局写锁
+    // （见 docs/mvcc-design.md §3.9），跨表写并没有真并行，
+    // 两组耗时接近才是当前架构的预期。本用例断言的是正确性：并发写不丢行。
     println!(
         "multi-table(2 tables): {:?}, same-table: {:?}",
         multi_elapsed, same_elapsed
     );
-    let _ = Duration::from_secs(0);
 
     drop(check);
     let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
@@ -1157,6 +1160,404 @@ fn range_index_scan() {
     // 反向形式（常量在左）
     let got = rows("SELECT COUNT(*) FROM scores WHERE 45 < score");
     assert_eq!(got, vec![vec![Value::Int(4)]], "45 < score");
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// EXPLAIN 必须反映真实决策：范围索引 / 复合索引前缀 / LIMIT 下推
+#[test]
+fn explain_matches_real_access_path() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("explainpath");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE e (id INT PRIMARY KEY, a INT, b INT, c TEXT)", &[])
+        .unwrap();
+    session
+        .execute("INSERT INTO e VALUES (1,1,1,'x'),(2,1,2,'y'),(3,2,1,'z'),(4,3,3,'w')", &[])
+        .unwrap();
+    session.execute("CREATE INDEX ix_ab ON e(a, b)", &[]).unwrap();
+    session.execute("CREATE INDEX ix_a ON e(a)", &[]).unwrap();
+
+    fn plan(session: &mut Session, sql: &str) -> Vec<(String, String)> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| (row[0].as_text(), row[1].as_text()))
+                .collect(),
+            other => panic!("期望 EXPLAIN，得到 {:?}", other),
+        }
+    }
+    fn field(rows: &[(String, String)], key: &str) -> String {
+        rows.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    // 等值：两张索引都命中前导列 a，应选前导最长的复合索引
+    let rows = plan(&mut session, "EXPLAIN SELECT * FROM e WHERE a = 1 AND b = 2");
+    let way = field(&rows, "访问方式");
+    assert!(way.contains("索引查找"), "{}", way);
+    assert!(way.contains("ix_ab"), "应选前导列更长的复合索引：{}", way);
+
+    // 只给前导列 → 复合索引前缀查找
+    let rows = plan(&mut session, "EXPLAIN SELECT * FROM e WHERE a = 2");
+    let way = field(&rows, "访问方式");
+    assert!(way.contains("复合索引前缀查找"), "{}", way);
+
+    // 范围条件（无等值可用）→ 范围索引
+    let rows = plan(&mut session, "EXPLAIN SELECT * FROM e WHERE a > 2");
+    let way = field(&rows, "访问方式");
+    assert!(way.contains("范围索引"), "{}", way);
+
+    // 无 ORDER BY 的 LIMIT → 下推提示
+    let rows = plan(&mut session, "EXPLAIN SELECT * FROM e LIMIT 2");
+    assert!(
+        field(&rows, "LIMIT 下推").contains("2 行"),
+        "应报告 LIMIT 下推：{:?}",
+        field(&rows, "LIMIT 下推")
+    );
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 复合索引：完整键精确命中，前导列前缀命中，结果与全表扫描一致
+#[test]
+fn composite_index_prefix_lookup() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("composite");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE m (id INT PRIMARY KEY, a INT, b INT, c TEXT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO m VALUES (1,1,1,'x'),(2,1,2,'y'),(3,1,2,'z'),(4,2,1,'w'),(5,2,2,'v')",
+            &[],
+        )
+        .unwrap();
+    session.execute("CREATE INDEX ix_ab ON m(a, b)", &[]).unwrap();
+
+    fn ids(session: &mut Session, sql: &str) -> Vec<i64> {
+        let mut out: Vec<i64> = match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| match &row[0] {
+                    Value::Int(n) => *n,
+                    other => panic!("期望 INT，得到 {:?}", other),
+                })
+                .collect(),
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        };
+        out.sort_unstable();
+        out
+    }
+
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a = 1 AND b = 2"),
+        vec![2, 3],
+        "完整键（a=1,b=2）"
+    );
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a = 1"),
+        vec![1, 2, 3],
+        "前缀（a=1）"
+    );
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a = 2 AND b = 1"),
+        vec![4]
+    );
+
+    // 对照：表达式用不上索引，走全表扫描，结果应一致
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a + 0 = 1"),
+        vec![1, 2, 3],
+        "a+0 用不上索引，走全表扫描"
+    );
+
+    // 前缀查找也要能看到本事务未提交的行（读己之写）
+    session.execute("BEGIN", &[]).unwrap();
+    session
+        .execute("INSERT INTO m VALUES (6,1,9,'new')", &[])
+        .unwrap();
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a = 1"),
+        vec![1, 2, 3, 6],
+        "未提交行应在前缀查找中可见"
+    );
+    session.execute("ROLLBACK", &[]).unwrap();
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM m WHERE a = 1"),
+        vec![1, 2, 3],
+        "回滚后不可见"
+    );
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ALTER TABLE：加列/删列/改名/改表名，数据与行数都要保住
+#[test]
+fn alter_table_add_drop_rename() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("alter");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE a (id INT PRIMARY KEY, n TEXT)", &[])
+        .unwrap();
+    session
+        .execute("INSERT INTO a VALUES (1,'one'),(2,'two'),(3,'three')", &[])
+        .unwrap();
+    session.execute("CREATE INDEX ix_n ON a(n)", &[]).unwrap();
+
+    // 加列：有默认值 → 旧行取默认值
+    session
+        .execute("ALTER TABLE a ADD COLUMN score INT DEFAULT 7", &[])
+        .unwrap();
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+    assert_eq!(
+        rows(&mut session, "SELECT DISTINCT score FROM a"),
+        vec![vec![Value::Int(7)]]
+    );
+
+    // 加列：无默认值 → NULL
+    session.execute("ALTER TABLE a ADD tag TEXT", &[]).unwrap();
+    assert_eq!(
+        rows(&mut session, "SELECT COUNT(*) FROM a WHERE tag IS NULL"),
+        vec![vec![Value::Int(3)]]
+    );
+
+    // 列改名：数据跟着走
+    session.execute("ALTER TABLE a RENAME COLUMN n TO name", &[]).unwrap();
+    let names: Vec<String> = rows(&mut session, "SELECT name FROM a ORDER BY id")
+        .into_iter()
+        .map(|row| row[0].as_text())
+        .collect();
+    assert_eq!(names, vec!["one", "two", "three"]);
+    assert_eq!(
+        rows(&mut session, "SELECT COUNT(*) FROM a WHERE name = 'two'"),
+        vec![vec![Value::Int(1)]],
+        "改名后原索引仍然可用（按列名迁移）"
+    );
+
+    // 删列
+    session.execute("ALTER TABLE a DROP COLUMN tag", &[]).unwrap();
+    let columns: Vec<String> = match session.execute("DESCRIBE a", &[]).unwrap() {
+        QueryResult::Describe { columns, .. } => {
+            columns.into_iter().map(|c| c.name.clone()).collect()
+        }
+        other => panic!("期望 DESCRIBE，得到 {:?}", other),
+    };
+    assert!(!columns.iter().any(|c| c == "tag"), "tag 应已删除：{:?}", columns);
+    assert_eq!(rows(&mut session, "SELECT COUNT(*) FROM a"), vec![vec![Value::Int(3)]]);
+
+    // 表改名：数据在，旧名没了
+    session.execute("ALTER TABLE a RENAME TO b", &[]).unwrap();
+    assert!(session.execute("SELECT * FROM a", &[]).is_err(), "旧表名应失效");
+    assert_eq!(rows(&mut session, "SELECT COUNT(*) FROM b"), vec![vec![Value::Int(3)]]);
+
+    session.close().unwrap();
+
+    // 重开后元数据与数据都要一致
+    let mut reopened = Session::open(&dir).unwrap();
+    assert_eq!(rows(&mut reopened, "SELECT COUNT(*) FROM b"), vec![vec![Value::Int(3)]]);
+    assert_eq!(reopened.engine.table("b").unwrap().row_count, 3);
+    reopened.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ALTER TABLE 的拒绝路径：主键列、重名、NOT NULL 无默认值
+#[test]
+fn alter_table_rejects_unsafe_changes() {
+    let dir = temp_dir("alterbad");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE c (id INT PRIMARY KEY, v INT)", &[])
+        .unwrap();
+    session.execute("INSERT INTO c VALUES (1,1)", &[]).unwrap();
+
+    let drop_pk = session.execute("ALTER TABLE c DROP COLUMN id", &[]).unwrap_err();
+    assert_eq!(drop_pk.code, "SYNTAX_ERROR", "{}", drop_pk.message);
+
+    let dup = session.execute("ALTER TABLE c ADD COLUMN v INT", &[]).unwrap_err();
+    assert_eq!(dup.code, "ALREADY_EXISTS", "{}", dup.message);
+
+    let rename_dup = session
+        .execute("ALTER TABLE c RENAME COLUMN v TO id", &[])
+        .unwrap_err();
+    assert_eq!(rename_dup.code, "ALREADY_EXISTS", "{}", rename_dup.message);
+
+    // 已有数据时加 NOT NULL 且无默认值 → 拒绝（旧行的 NULL 无法满足约束）
+    let not_null = session
+        .execute("ALTER TABLE c ADD COLUMN must INT NOT NULL", &[])
+        .unwrap_err();
+    assert_eq!(not_null.code, "CONSTRAINT_VIOLATION", "{}", not_null.message);
+
+    // 失败的 ALTER 不能破坏原表
+    assert_eq!(
+        match session.execute("SELECT COUNT(*) FROM c", &[]).unwrap() {
+            littledb::sql::QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        },
+        vec![vec![Value::Int(1)]]
+    );
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 行数增量必须在提交后计入共享 row_count：
+/// 旧实现是在 store.commit 之后才取 delta，而那时事务已被移除，
+/// 拿到永远是空表 → 运行期 row_count 恒为 0（控制台 total 显示 0）。
+#[test]
+fn row_count_tracks_commits_and_rollbacks() {
+    let dir = temp_dir("rowcount");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE c (id INT PRIMARY KEY, v INT)", &[])
+        .unwrap();
+    fn count(session: &Session, name: &str) -> u32 {
+        session.engine.table(name).unwrap().row_count
+    }
+    assert_eq!(count(&session, "c"), 0);
+
+    session.execute("INSERT INTO c VALUES (1,10),(2,20)", &[]).unwrap();
+    assert_eq!(count(&session, "c"), 2, "隐式事务提交后行数应更新");
+
+    session.execute("UPDATE c SET v = 99 WHERE id = 1", &[]).unwrap();
+    assert_eq!(count(&session, "c"), 2, "UPDATE = 删 + 插，行数不变");
+
+    session.execute("DELETE FROM c WHERE id = 2", &[]).unwrap();
+    assert_eq!(count(&session, "c"), 1);
+
+    session.execute("BEGIN", &[]).unwrap();
+    session.execute("INSERT INTO c VALUES (3,30),(4,40)", &[]).unwrap();
+    assert_eq!(count(&session, "c"), 1, "未提交的行不计入共享行数");
+    session.execute("ROLLBACK", &[]).unwrap();
+    assert_eq!(count(&session, "c"), 1, "回滚不影响行数");
+
+    session.execute("BEGIN", &[]).unwrap();
+    session.execute("INSERT INTO c VALUES (5,50)", &[]).unwrap();
+    session.execute("COMMIT", &[]).unwrap();
+    assert_eq!(count(&session, "c"), 2);
+    session.close().unwrap();
+
+    // 重开后由扫描重建，必须与提交结果一致
+    let mut reopened = Session::open(&dir).unwrap();
+    assert_eq!(count(&reopened, "c"), 2);
+    reopened.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// LIMIT 下推（无 ORDER BY 时边扫边停）必须与「全量扫描后再裁剪」结果一致
+#[test]
+fn limit_pushdown_matches_full_scan() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("limitpush");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE nums (id INT PRIMARY KEY, score INT, tag TEXT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO nums VALUES (0,0,'t'),(1,1,'t'),(2,2,'t'),(3,3,'t'),(4,4,'t'),\
+             (5,5,'t'),(6,6,'t'),(7,7,'t'),(8,8,'t'),(9,9,'t'),(10,10,'u'),(11,11,'u'),\
+             (12,12,'u'),(13,13,'u'),(14,14,'u'),(15,15,'u'),(16,16,'u'),(17,17,'u')",
+            &[],
+        )
+        .unwrap();
+
+    let mut rows = |sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 全量结果作为基准，再手算「跳过 3 行取 5 行」
+    let full = rows("SELECT id FROM nums WHERE score >= 10");
+    assert_eq!(full.len(), 8);
+    let expected: Vec<Vec<Value>> = full.into_iter().skip(3).take(5).collect();
+    assert_eq!(rows("SELECT id FROM nums WHERE score >= 10 LIMIT 5 OFFSET 3"), expected);
+
+    // 边界：LIMIT 0 / OFFSET 越界
+    assert!(rows("SELECT id FROM nums LIMIT 0").is_empty());
+    assert!(rows("SELECT id FROM nums OFFSET 100").is_empty());
+    // LIMIT 大于剩余行数
+    assert_eq!(rows("SELECT id FROM nums WHERE score >= 16 LIMIT 99").len(), 2);
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 非 NULL 但类型不可比 → 明确报 TYPE_ERROR（旧实现静默变 NULL，看起来像「查不到」）
+#[test]
+fn cross_type_comparison_reports_error() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("typecmp");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)", &[])
+        .unwrap();
+    session.execute("INSERT INTO items VALUES (5, 'five')", &[]).unwrap();
+
+    let err = session.execute("SELECT * FROM items WHERE id = '5'", &[]).unwrap_err();
+    assert_eq!(err.code, "TYPE_ERROR", "{}", err.message);
+    assert!(err.message.contains("CAST"), "错误信息应提示加 CAST：{}", err.message);
+
+    // 正确写法照常工作
+    match session.execute("SELECT name FROM items WHERE id = 5", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Text("five".into())]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    match session.execute("SELECT name FROM items WHERE id = CAST('5' AS INT)", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // NULL 参与比较仍是 NULL（三值逻辑不受影响）
+    assert!(matches!(
+        session.execute("SELECT * FROM items WHERE id = NULL", &[]).unwrap(),
+        QueryResult::Select { rows, .. } if rows.is_empty()
+    ));
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `IN (SELECT ...)` 对 DECIMAL 列必须命中（旧实现把 DECIMAL 转成 TEXT，恒定不命中）
+#[test]
+fn in_subquery_with_decimal() {
+    use littledb::sql::QueryResult;
+    let dir = temp_dir("indec");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE goods (id INT PRIMARY KEY, price DECIMAL(10,2))", &[])
+        .unwrap();
+    session
+        .execute("CREATE TABLE picks (id INT PRIMARY KEY, price DECIMAL(10,2))", &[])
+        .unwrap();
+    session
+        .execute("INSERT INTO goods VALUES (1,'19.99'),(2,'5.00'),(3,'0.01')", &[])
+        .unwrap();
+    session
+        .execute("INSERT INTO picks VALUES (1,'19.99')", &[])
+        .unwrap();
+
+    match session
+        .execute("SELECT id FROM goods WHERE price IN (SELECT price FROM picks)", &[])
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
 
     session.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);

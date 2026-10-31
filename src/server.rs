@@ -280,7 +280,7 @@ fn handle_message(
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if given != expected.as_str() {
+            if !crate::protocol::secret_eq(given, expected) {
                 let payload = error_frame(id, error::AUTH, "认证失败：token 不正确");
                 send(stream, &payload);
                 return true;

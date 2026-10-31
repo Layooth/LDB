@@ -12,6 +12,23 @@ use crate::json::{self, Json};
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// 常量时间字符串比较（认证令牌用）。
+///
+/// 普通 `==` 在第一个不同字节处短路返回，攻击者可以按响应时间逐字节
+/// 猜出 token 前缀。这里固定遍历到较长者末尾，只累积差异、不提前返回。
+/// 长度本身不算秘密，可以直接比较。
+pub fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff: u8 = if a.len() == b.len() { 0 } else { 1 };
+    let width = a.len().max(b.len());
+    for i in 0..width {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub fn encode_frame(message: &Json) -> Result<Vec<u8>> {
     let text = message.to_string();
     let bytes = text.as_bytes();

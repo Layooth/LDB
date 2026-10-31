@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,12 +38,60 @@ const SESSION_TTL_SECS: u64 = 30 * 60;
 /// 被抛弃的 BEGIN 会一直握着全局写锁（其它会话全部 DATABASE_LOCKED），
 /// 等 30 分钟才释放是不可接受的，所以这里用短得多的超时。
 const TXN_SESSION_TTL_SECS: u64 = 120;
+/// 同时在册的会话上限：每个会话都持有 Arc<Engine> 与未提交状态，
+/// 无上限就是一条内存增长型 DoS 通道。超限时淘汰最久未使用的空闲会话。
+const MAX_SESSIONS: usize = 512;
+
+/// 一个 HTTP 会话。
+///
+/// 用 `Arc<SessionEntry>` + 内部 `Mutex` 而不是把 `ConnSession` 直接存在
+/// map 里：旧实现在执行期间把会话从 map 取出、结束时插回，同一 sid 的两个
+/// 并发请求会各自新建一个 `ConnSession` 并互相覆盖（前一个的开放事务被
+/// Drop 静默回滚）。现在同一会话的请求在入口处串行，不同会话仍然并行。
+struct SessionEntry {
+    session: Mutex<ConnSession>,
+    last_used: Mutex<Instant>,
+}
+
+impl SessionEntry {
+    fn new(engine: Arc<RwLock<Engine>>) -> SessionEntry {
+        SessionEntry {
+            session: Mutex::new(ConnSession::new(engine)),
+            last_used: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// 是否在事务中；None = 会话正被请求占用（拿不到锁）
+    fn in_transaction(&self) -> Option<bool> {
+        match self.session.try_lock() {
+            Ok(guard) => Some(guard.in_transaction()),
+            Err(_) => None,
+        }
+    }
+
+    fn touch(&self) {
+        if let Ok(mut last) = self.last_used.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    fn idle_secs(&self) -> u64 {
+        self.last_used
+            .lock()
+            .map(|last| last.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    /// 没有请求正在使用它：可以安全移除（移除后 Drop 会回滚未提交事务）
+    fn is_idle(&self) -> bool {
+        self.session.try_lock().is_ok()
+    }
+}
 
 #[derive(Clone)]
 pub struct HttpState {
     pub engine: Arc<RwLock<Engine>>,
-    sessions: Arc<Mutex<HashMap<String, (ConnSession, Instant)>>>,
-    counter: Arc<AtomicU64>,
+    sessions: Arc<Mutex<HashMap<String, Arc<SessionEntry>>>>,
     started: Instant,
     pub token: Option<String>,
     pub web_dir: PathBuf,
@@ -69,7 +117,6 @@ impl HttpState {
         HttpState {
             engine,
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            counter: Arc::new(AtomicU64::new(0)),
             started: Instant::now(),
             token,
             web_dir,
@@ -440,7 +487,8 @@ fn route(state: &HttpState, request: &Request) -> (u16, Json, Vec<(String, Strin
             .header("authorization")
             .and_then(|v| v.strip_prefix("Bearer "))
             .unwrap_or("");
-        if provided != expected.as_str() {
+        // 常量时间比较，避免逐字节短路的时序侧信道
+        if !crate::protocol::secret_eq(provided, expected) {
             return fail(401, error::AUTH, "认证失败：缺少或错误的 access token");
         }
     }
@@ -523,55 +571,107 @@ fn with_session<T>(
     sid: Option<&str>,
     action: impl FnOnce(&mut ConnSession) -> T,
 ) -> (String, T) {
-    let mut guard = match state.sessions.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
+    let (id, entry) = {
+        let mut guard = lock_sessions(state);
+        reap_sessions(&mut guard);
+
+        let id = match sid {
+            // 已知会话 id 且仍然存活 → 复用（事务状态因此跟着走）
+            Some(existing) if guard.contains_key(existing) => existing.to_string(),
+            // 未知/未提供 → 新建，id 通过响应头回给客户端
+            _ => {
+                let fresh = new_session_id();
+                guard.insert(
+                    fresh.clone(),
+                    Arc::new(SessionEntry::new(Arc::clone(&state.engine))),
+                );
+                fresh
+            }
+        };
+        let entry = guard
+            .get(&id)
+            .map(Arc::clone)
+            .expect("会话刚插入/校验过，必然存在");
+        (id, entry)
     };
 
-    // 顺手清理过期会话；事务中的会话用短超时，尽快交还全局写锁
-    let now = Instant::now();
-    let expired: Vec<String> = guard
+    // 只锁「本会话」：同一 sid 的并发请求在此串行（一个会话就是一条连接），
+    // 不同会话完全并行，长查询不会阻塞别的请求的会话解析。
+    let outcome = {
+        let mut session = match entry.session.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        action(&mut session)
+    };
+    entry.touch();
+    (id, outcome)
+}
+
+fn lock_sessions(
+    state: &HttpState,
+) -> std::sync::MutexGuard<'_, HashMap<String, Arc<SessionEntry>>> {
+    match state.sessions.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// 清理过期会话；条目数达到上限时再淘汰最久未使用的空闲会话。
+/// 只处理拿得到锁的会话——正在执行的请求不会被抽走底层 ConnSession。
+fn reap_sessions(sessions: &mut HashMap<String, Arc<SessionEntry>>) {
+    let expired: Vec<String> = sessions
         .iter()
-        .filter(|(_, (session, last))| {
-            let ttl = if session.in_transaction() {
-                TXN_SESSION_TTL_SECS
-            } else {
-                SESSION_TTL_SECS
+        .filter(|(_, entry)| {
+            // 事务中的会话用短超时：被抛弃的 BEGIN 会一直握着写锁
+            let ttl = match entry.in_transaction() {
+                Some(true) => TXN_SESSION_TTL_SECS,
+                _ => SESSION_TTL_SECS,
             };
-            now.duration_since(*last).as_secs() > ttl
+            entry.idle_secs() > ttl
         })
         .map(|(id, _)| id.clone())
         .collect();
     for id in expired {
-        if let Some((mut session, _)) = guard.remove(&id) {
-            session.close();
+        let idle = sessions.get(&id).map(|e| e.is_idle()).unwrap_or(false);
+        if idle {
+            sessions.remove(&id);
         }
     }
 
-    let id = match sid {
-        Some(existing) if guard.contains_key(existing) => existing.to_string(),
-        _ => {
-            let n = state.counter.fetch_add(1, Ordering::SeqCst);
-            format!("h{}-{}", now_millis(), n)
+    while sessions.len() >= MAX_SESSIONS {
+        let victim = sessions
+            .iter()
+            .filter(|(_, entry)| entry.is_idle())
+            .max_by_key(|(_, entry)| entry.idle_secs())
+            .map(|(id, _)| id.clone());
+        match victim {
+            Some(id) => {
+                sessions.remove(&id);
+            }
+            None => break, // 全都在执行中：宁可暂时超限也不要打断请求
         }
-    };
+    }
+}
 
-    let mut session = match guard.remove(&id) {
-        Some((session, _)) => session,
-        None => ConnSession::new(Arc::clone(&state.engine)),
-    };
-    // 会话已从 map 取出：执行期间不再持有 sessions 互斥锁，
-    // 长查询不会阻塞 health/tables 等其它请求的会话解析
-    drop(guard);
-
-    let outcome = action(&mut session);
-
-    let mut guard = match state.sessions.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard.insert(id.clone(), (session, Instant::now()));
-    (id, outcome)
+/// 会话 id。旧实现是 `h{毫秒时间戳}-{自增计数}`，完全可枚举，
+/// 枚举到别人的 id 就能接手对方未提交的事务。改用 std 的 `RandomState`
+/// （由操作系统熵做种）派生，不引入第三方依赖也不需要额外状态。
+fn new_session_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut id = String::with_capacity(49);
+    id.push('s');
+    for round in 0..3u64 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(nanos);
+        hasher.write_u64(round);
+        id.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    id
 }
 
 fn health(state: &HttpState) -> Result<Json> {
@@ -1040,13 +1140,6 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request, ke
                 keep_alive,
             );
         }
-    }
-}
-
-fn now_millis() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_millis() as i64,
-        Err(_) => 0,
     }
 }
 

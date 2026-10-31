@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::codec::{self, Column, ColumnType, Value};
-use crate::engine::Engine;
-use crate::error::{DbError, Result};
+use crate::engine::{Engine, IndexLookup};
+use crate::error::{self, DbError, Result};
+use crate::table;
 use crate::json::Json;
 
 use super::ast::*;
@@ -320,6 +321,7 @@ fn expr_label(expr: &Expr) -> String {
             Literal::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
             Literal::Int(n) => n.to_string(),
             Literal::Real(n) => n.to_string(),
+            Literal::Decimal { v, scale } => codec::format_decimal(*v, *scale),
             Literal::Text(s) => format!("'{}'", s),
         },
         Expr::Param(index) => format!("?{}", *index + 1),
@@ -433,8 +435,12 @@ impl Drop for Session {
 
 /// 服务端使用的会话：多连接共享同一个引擎。
 ///
-/// 锁策略：写语句 / 事务控制 / 事务内语句拿写锁（独占，单写者语义不变）；
-/// 非事务只读语句拿读锁，多个会话的 SELECT 可以真正并行。
+/// 锁策略（实测结论，见 docs/mvcc-design.md §3.9）：
+/// - **非事务只读语句**拿引擎读锁 → 多个会话的 SELECT 真正并行；
+/// - **任何写语句 / 事务控制 / 事务内语句**整条持有引擎写锁 → 写语句串行。
+///   语句执行全程需要 `&mut Engine`，在不动存储层内部可变性的前提下，
+///   「写锁外构建脏页」无法实现，所以多写的收益体现在**事务级交错**
+///   （两个会话可各自持有开放事务、互不 DATABASE_LOCKED），而不是语句级并行。
 /// 行可见性由会话 id 决定（read_shared 的 owner 检查）。
 pub struct ConnSession {
     engine: Arc<RwLock<Engine>>,
@@ -642,6 +648,10 @@ fn run_with_engine(
                 message: format!("已删除索引 \"{}\"", name),
             })
         }
+        Statement::AlterTable { table, action } => {
+            engine.ensure_ddl_exclusive(owner)?;
+            exec_alter_table(engine, table, action, params)
+        }
         Statement::ShowTables | Statement::Describe { .. } | Statement::Explain { .. } => {
             run_read_only(engine, statement, params, committed_only, owner)
         }
@@ -749,6 +759,53 @@ struct TablePlan {
 /// 无索引辅助的 JOIN 组合行数上限，超过直接报错而不是挂死
 const MAX_JOIN_PAIRS: usize = 2_000_000;
 
+/// 单条 SELECT 允许物化的行数上限。走索引或 LIMIT 下推的查询碰不到它，
+/// 只有「全表扫描 + 无 LIMIT」才会，此时报错比把服务端内存打满更好。
+const MAX_SCAN_ROWS: usize = 500_000;
+
+fn scan_limit_error() -> DbError {
+    DbError::new(
+        error::LIMIT,
+        format!(
+            "语句需要处理超过 {} 行，请加 WHERE 条件（SELECT 也可用 LIMIT）缩小范围",
+            MAX_SCAN_ROWS
+        ),
+    )
+}
+
+/// 叶子计划 → (别名, 列, 组合行内的起始下标)
+fn plan_sources(plans: &[TablePlan]) -> Vec<(&str, &[Column], usize)> {
+    plans
+        .iter()
+        .map(|p| (p.alias.as_str(), p.columns.as_slice(), p.offset))
+        .collect()
+}
+
+/// LIMIT 下推的适用条件：无 ORDER BY / GROUP BY / HAVING / DISTINCT / UNION / 聚合，
+/// 结果顺序就等于扫描顺序。返回扫描阶段需要凑够的行数（offset + limit）。
+fn early_row_cap(stmt: &SelectStmt, params: &[Value]) -> Option<usize> {
+    if stmt.union.is_some()
+        || stmt.distinct
+        || stmt.having.is_some()
+        || !stmt.order_by.is_empty()
+        || !stmt.group_by.is_empty()
+    {
+        return None;
+    }
+    if stmt.items.iter().any(|item| contains_aggregate(&item.expr))
+        || stmt.order_by.iter().any(|o| contains_aggregate(&o.expr))
+    {
+        return None;
+    }
+    let empty = RowContext::new(&[], Vec::new());
+    let limit = to_usize(&eval(stmt.limit.as_ref()?, &empty, params).ok()?).ok()?;
+    let offset = match &stmt.offset {
+        Some(expr) => to_usize(&eval(expr, &empty, params).ok()?).ok()?,
+        None => 0,
+    };
+    Some(offset.saturating_add(limit))
+}
+
 /// 把表达式里的 `IN (SELECT ...)` 执行成 `IN (值列表)`（非关联子查询）。
 fn resolve_subqueries(
     engine: &Engine,
@@ -779,9 +836,9 @@ fn resolve_subqueries(
                             Some(Value::Null) => Literal::Null,
                             Some(Value::Int(n)) => Literal::Int(n),
                             Some(Value::Real(n)) => Literal::Real(n),
-                            Some(Value::Decimal { v, scale }) => {
-                                Literal::Text(crate::codec::format_decimal(v, scale))
-                            }
+                            // 保持 DECIMAL 类型：转成 Text 会让 `decimal 列 IN (子查询)`
+                            // 变成 TEXT 与 DECIMAL 比较，恒定不命中
+                            Some(Value::Decimal { v, scale }) => Literal::Decimal { v, scale },
                             Some(Value::Text(s)) => Literal::Text(s),
                             Some(Value::Bool(b)) => Literal::Bool(b),
                             None => Literal::Null,
@@ -874,6 +931,9 @@ fn select_base(
     };
     let mut plans: Vec<TablePlan> = Vec::new();
     let mut raw_rows: Vec<Vec<Value>> = Vec::new();
+    // LIMIT 下推的流式扫描：结果已经是过滤过的 RowContext（WHERE 已在扫描里应用）
+    let mut streamed_rows: Option<Vec<RowContext>> = None;
+    let mut where_applied = false;
 
     if let Some(source) = &stmt.from {
         match source {
@@ -896,19 +956,50 @@ fn select_base(
                 } else {
                     None
                 };
-                match candidates.or(range_ids) {
+                match candidates.map(|lookup| lookup.ids).or(range_ids) {
                     Some(ids) => {
                         for id in ids {
+                            if raw_rows.len() > MAX_SCAN_ROWS {
+                                return Err(scan_limit_error());
+                            }
                             if let Some(values) = engine.get_shared(name, id, owner)? {
                                 raw_rows.push(values);
                             }
                         }
                     }
-                    None => {
-                        for (_, values) in engine.scan_shared(name, owner)? {
-                            raw_rows.push(values);
+                    // 无排序/分组/聚合时把 LIMIT 推到扫描里：边扫边过滤，
+                    // 凑够 offset+limit 行就停，不必把整表物化进内存
+                    None => match early_row_cap(stmt, params) {
+                        Some(cap) => {
+                            let sources = plan_sources(&plans);
+                            let mut kept: Vec<RowContext> = Vec::new();
+                            table::scan_shared_while(
+                                &engine.store,
+                                table,
+                                owner,
+                                |_row_id, values| {
+                                    let row = RowContext::from_tables(&sources, values);
+                                    if let Some(where_clause) = &where_clause {
+                                        if !matches(&eval(where_clause, &row, params)?) {
+                                            return Ok(true);
+                                        }
+                                    }
+                                    kept.push(row);
+                                    Ok(kept.len() < cap)
+                                },
+                            )?;
+                            streamed_rows = Some(kept);
+                            where_applied = true;
                         }
-                    }
+                        None => {
+                            for (_, values) in engine.scan_shared(name, owner)? {
+                                raw_rows.push(values);
+                            }
+                            if raw_rows.len() > MAX_SCAN_ROWS {
+                                return Err(scan_limit_error());
+                            }
+                        }
+                    },
                 }
             }
             // JOIN 树，或 committed_only 的单表（绕开含未提交键的索引）
@@ -922,25 +1013,28 @@ fn select_base(
         raw_rows.push(Vec::new());
     }
 
-    let sources: Vec<(&str, &[Column], usize)> = plans
-        .iter()
-        .map(|p| (p.alias.as_str(), p.columns.as_slice(), p.offset))
-        .collect();
-    let mut rows: Vec<RowContext> = raw_rows
-        .into_iter()
-        .map(|values| RowContext::from_tables(&sources, values))
-        .collect();
+    let sources = plan_sources(&plans);
+    let mut rows: Vec<RowContext> = match streamed_rows {
+        Some(rows) => rows,
+        None => raw_rows
+            .into_iter()
+            .map(|values| RowContext::from_tables(&sources, values))
+            .collect(),
+    };
 
     // ---------------------------------------------------------------- WHERE
+    // （LIMIT 下推时 WHERE 已经在扫描过程中逐行应用过）
     if let Some(where_clause) = &where_clause {
-        let mut kept = Vec::with_capacity(rows.len());
-        for row in rows {
-            let value = eval(where_clause, &row, params)?;
-            if matches(&value) {
-                kept.push(row);
+        if !where_applied {
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = eval(where_clause, &row, params)?;
+                if matches(&value) {
+                    kept.push(row);
+                }
             }
+            rows = kept;
         }
-        rows = kept;
     }
 
     // ---------------------------------------------------------------- 投影列
@@ -1058,12 +1152,15 @@ fn apply_offset_limit(
         Some(expr) => Some(to_usize(&eval(expr, &empty, params)?)?),
         None => None,
     };
-    *pairs = pairs
-        .iter()
-        .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
-        .cloned()
-        .collect();
+    // 就地裁剪（旧实现是 iter().cloned().collect()，白复制一整份结果集）
+    if offset >= pairs.len() {
+        pairs.clear();
+        return Ok(());
+    }
+    pairs.drain(..offset);
+    if let Some(limit) = limit {
+        pairs.truncate(limit);
+    }
     Ok(())
 }
 
@@ -1227,6 +1324,9 @@ fn join_frame(
                                         }
                                         out.push(combined);
                                         matched = true;
+                                        if out.len() > MAX_SCAN_ROWS {
+                                            return Err(scan_limit_error());
+                                        }
                                     }
                                 }
                             }
@@ -1259,6 +1359,11 @@ fn join_frame(
                             if pass {
                                 out.push(combined);
                                 matched = true;
+                                // 输出行数上限：行对数有闸门，但结果是物化的，
+                                // 这里再兜一层，避免把内存吃光
+                                if out.len() > MAX_SCAN_ROWS {
+                                    return Err(scan_limit_error());
+                                }
                             }
                         }
                         if !matched && *kind == JoinKind::Left {
@@ -1641,19 +1746,22 @@ fn extract_range_columns(
     Ok(out)
 }
 
-/// 找到 WHERE 里可用的等值索引条件
+/// 收集 WHERE 里所有 `列 = 常量` 约束，交给引擎挑索引。
+///
+/// 旧实现只认「第一个等值条件 + 单列索引」，复合索引用不上；
+/// 现在把整棵 AND 树的等值条件都交上去，由引擎选前导列匹配最长的索引。
 fn index_candidates(
     engine: &Engine,
     table: &str,
     where_clause: Option<&Expr>,
     params: &[Value],
     owner: Option<u64>,
-) -> Result<Option<Vec<u32>>> {
-    let expr = match where_clause {
-        Some(e) => e,
-        None => return Ok(None),
+) -> Result<Option<IndexLookup>> {
+    let Some(expr) = where_clause else {
+        return Ok(None);
     };
     let empty = RowContext::new(&[], Vec::new());
+    let mut equals: Vec<(String, Value)> = Vec::new();
     let mut stack: Vec<&Expr> = vec![expr];
 
     while let Some(current) = stack.pop() {
@@ -1671,30 +1779,34 @@ fn index_candidates(
                 left,
                 right,
             } => {
-                if let Expr::Column { name, .. } = left.as_ref() {
-                    let constant = eval(right, &empty, params);
-                    if let Ok(value) = constant {
-                        if !value.is_null() {
-                            if let Some(ids) =
-                                engine.find_by_equality(table, name, &value, owner)?
-{
-                                return Ok(Some(ids));
-                            }
-                        }
+                // 常量在左、列在右也算（`5 = id`）
+                let (column, constant_expr) = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column { name, .. }, other) => (name, other),
+                    (other, Expr::Column { name, .. }) => (name, other),
+                    _ => continue,
+                };
+                if let Ok(value) = eval(constant_expr, &empty, params) {
+                    if !value.is_null() {
+                        equals.push((column.clone(), value));
                     }
                 }
             }
             _ => {}
         }
     }
-    Ok(None)
+
+    if equals.is_empty() {
+        return Ok(None);
+    }
+    engine.find_by_index(table, &equals, owner)
 }
 
 // ------------------------------------------------------------------ 写语句
 
 fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
-    // 表级写锁：同表 DML 串行（页内容冲突要求），跨表 DML 并行
+    // 表级写锁：同表 DML 串行（页内容冲突要求）。
+    // 注意调用方已持引擎全局写锁，跨表并行当前并不成立（见 ConnSession 的说明）
     let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
     let _table_guard = table_guard.write().unwrap();
     let mut position: HashMap<String, usize> = HashMap::with_capacity(columns.len());
@@ -1776,6 +1888,10 @@ fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Resu
     }
 
     let snapshot = engine.scan(&stmt.table)?;
+    // UPDATE 全表物化：超限宁可报错，也不要把进程内存打满
+    if snapshot.len() > MAX_SCAN_ROWS {
+        return Err(scan_limit_error());
+    }
     let mut updated = 0usize;
 
     for (row_id, values) in snapshot {
@@ -1805,6 +1921,9 @@ fn exec_delete(engine: &mut Engine, stmt: &DeleteStmt, params: &[Value]) -> Resu
     let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
     let _table_guard = table_guard.write().unwrap();
     let snapshot = engine.scan(&stmt.table)?;
+    if snapshot.len() > MAX_SCAN_ROWS {
+        return Err(scan_limit_error());
+    }
     let mut deleted = 0usize;
 
     for (row_id, values) in snapshot {
@@ -1835,6 +1954,35 @@ fn is_literal_expr(expr: &Expr) -> bool {
     }
 }
 
+/// 列定义 → `Column`（CREATE TABLE 与 ALTER TABLE ADD COLUMN 共用）
+fn column_from_def(def: &ColumnDef, is_pk: bool, params: &[Value]) -> Result<Column> {
+    let ty = ColumnType::parse(&def.type_name)?;
+    let scale = ColumnType::decimal_scale_from_type(&def.type_name)?;
+
+    let mut column = Column::new(def.name.clone(), ty);
+    column.scale = scale;
+    column.primary_key = is_pk;
+    column.not_null = def.not_null || is_pk;
+    column.unique = def.unique;
+
+    if let Some(default_expr) = &def.default {
+        if !is_literal_expr(default_expr) {
+            return Err(DbError::syntax(format!(
+                "列 {} 的默认值必须是字面量（例如 '2026-01-01'、0、TRUE），不支持函数或列引用",
+                def.name
+            )));
+        }
+        let empty = RowContext::new(&[], Vec::new());
+        let raw = eval(default_expr, &empty, params)?;
+        column.default = if raw.is_null() {
+            None
+        } else {
+            Some(codec::coerce(ty, column.scale, &raw)?)
+        };
+    }
+    Ok(column)
+}
+
 fn exec_create_table(
     engine: &mut Engine,
     stmt: &CreateTableStmt,
@@ -1844,45 +1992,163 @@ fn exec_create_table(
         return Err(DbError::syntax("建表至少需要一列"));
     }
 
-    let empty = RowContext::new(&[], Vec::new());
     let mut columns = Vec::with_capacity(stmt.columns.len());
-
     for def in &stmt.columns {
-        let ty = ColumnType::parse(&def.type_name)?;
-        let scale = ColumnType::decimal_scale_from_type(&def.type_name)?;
         let is_pk = def.primary_key
             || stmt
                 .primary_key
                 .iter()
                 .any(|n| n.to_lowercase() == def.name.to_lowercase());
-
-        let mut column = Column::new(def.name.clone(), ty);
-        column.scale = scale;
-        column.primary_key = is_pk;
-        column.not_null = def.not_null || is_pk;
-        column.unique = def.unique;
-
-        if let Some(default_expr) = &def.default {
-            if !is_literal_expr(default_expr) {
-                return Err(DbError::syntax(format!(
-                    "列 {} 的默认值必须是字面量（例如 '2026-01-01'、0、TRUE），不支持函数或列引用",
-                    def.name
-                )));
-            }
-            let raw = eval(default_expr, &empty, params)?;
-            column.default = if raw.is_null() {
-                None
-            } else {
-                Some(codec::coerce(ty, column.scale, &raw)?)
-            };
-        }
-
-        columns.push(column);
+        columns.push(column_from_def(def, is_pk, params)?);
     }
 
     engine.create_table(&stmt.name, columns, stmt.if_not_exists)?;
     Ok(QueryResult::Ddl {
         message: format!("已创建表 \"{}\"", stmt.name),
+    })
+}
+
+/// 值 → catalog/重建表用的 JSON（DECIMAL 以文本表示，重建时再按标度解析回来）
+fn value_to_spec_json(value: &Value) -> Json {
+    match value {
+        Value::Null => Json::Null,
+        Value::Bool(b) => Json::Bool(*b),
+        Value::Int(n) => Json::Int(*n),
+        Value::Real(n) => Json::Num(*n),
+        Value::Decimal { v, scale } => Json::Str(codec::format_decimal(*v, *scale)),
+        Value::Text(s) => Json::Str(s.clone()),
+    }
+}
+
+/// 列 → 重建表的列规格。`source` 指向旧列名（改名时用；为空表示同名）
+fn column_to_spec(column: &Column, source: Option<&str>) -> Json {
+    let type_name = if column.ty == ColumnType::Decimal {
+        // rebuild_table 从类型串解析标度，所以必须带 (p,s)
+        format!("DECIMAL(38,{})", column.scale)
+    } else {
+        column.ty.as_str().to_string()
+    };
+
+    let mut fields = vec![
+        ("name".to_string(), Json::str(column.name.clone())),
+        ("type".to_string(), Json::str(type_name)),
+        ("primaryKey".to_string(), Json::Bool(column.primary_key)),
+        ("notNull".to_string(), Json::Bool(column.not_null)),
+        ("unique".to_string(), Json::Bool(column.unique)),
+    ];
+    if let Some(source) = source {
+        if !source.eq_ignore_ascii_case(&column.name) {
+            fields.push(("source".to_string(), Json::str(source.to_string())));
+        }
+    }
+    if let Some(default) = &column.default {
+        fields.push(("default".to_string(), value_to_spec_json(default)));
+    }
+    Json::Obj(fields)
+}
+
+/// ALTER TABLE：
+/// - `RENAME TO` 只改元数据（O(1)，不动数据）
+/// - 列级变更走「影子表重建」（`Engine::rebuild_table`）：数据完整保留，
+///   但表 id 会变、行号会重排、索引按列名迁移
+fn exec_alter_table(
+    engine: &mut Engine,
+    table_name: &str,
+    action: &AlterAction,
+    params: &[Value],
+) -> Result<QueryResult> {
+    if let AlterAction::RenameTable { to } = action {
+        engine.rename_table(table_name, to)?;
+        return Ok(QueryResult::Ddl {
+            message: format!("已将表 \"{}\" 重命名为 \"{}\"", table_name, to),
+        });
+    }
+
+    let columns = {
+        let table = engine.table(table_name)?;
+        table.columns.clone()
+    };
+    // (新列定义, 来源列名)
+    let mut specs: Vec<(Column, String)> = columns
+        .iter()
+        .map(|c| (c.clone(), c.name.clone()))
+        .collect();
+
+    let message = match action {
+        AlterAction::AddColumn(def) => {
+            let column = column_from_def(def, false, params)?;
+            if columns
+                .iter()
+                .any(|c| c.name.to_lowercase() == column.name.to_lowercase())
+            {
+                return Err(DbError::new(
+                    error::ALREADY_EXISTS,
+                    format!("列 \"{}\" 已存在", column.name),
+                ));
+            }
+            let name = column.name.clone();
+            specs.push((column, String::new()));
+            format!("已为表 \"{}\" 添加列 \"{}\"", table_name, name)
+        }
+        AlterAction::DropColumn { name } => {
+            let position = columns
+                .iter()
+                .position(|c| c.name.to_lowercase() == name.to_lowercase())
+                .ok_or_else(|| {
+                    DbError::not_found(format!("列 \"{}\" 不存在于表 \"{}\"", name, table_name))
+                })?;
+            if columns[position].primary_key {
+                return Err(DbError::syntax(
+                    "不能删除主键列（会丢掉行标识）：需要换主键请新建表再迁移数据",
+                ));
+            }
+            if columns.len() == 1 {
+                return Err(DbError::syntax("表至少要保留一列"));
+            }
+            specs.remove(position);
+            format!(
+                "已删除表 \"{}\" 的列 \"{}\"",
+                table_name, columns[position].name
+            )
+        }
+        AlterAction::RenameColumn { from, to } => {
+            let position = columns
+                .iter()
+                .position(|c| c.name.to_lowercase() == from.to_lowercase())
+                .ok_or_else(|| {
+                    DbError::not_found(format!("列 \"{}\" 不存在于表 \"{}\"", from, table_name))
+                })?;
+            if columns
+                .iter()
+                .any(|c| c.name.to_lowercase() == to.to_lowercase())
+            {
+                return Err(DbError::new(
+                    error::ALREADY_EXISTS,
+                    format!("列 \"{}\" 已存在", to),
+                ));
+            }
+            let old_name = specs[position].0.name.clone();
+            specs[position].0.name = to.clone();
+            specs[position].1 = old_name;
+            format!("已将列 \"{}\" 重命名为 \"{}\"", from, to)
+        }
+        AlterAction::RenameTable { .. } => unreachable!("RENAME TO 已在上方提前返回"),
+    };
+
+    let spec_json: Vec<Json> = specs
+        .iter()
+        .map(|(column, source)| {
+            let source = if source.is_empty() { None } else { Some(source.as_str()) };
+            column_to_spec(column, source)
+        })
+        .collect();
+
+    let outcome = engine.rebuild_table(table_name, &spec_json)?;
+    Ok(QueryResult::Ddl {
+        message: format!(
+            "{}（迁移 {} 行、恢复 {} 个索引）",
+            message, outcome.rows, outcome.indexes
+        ),
     })
 }
 
@@ -1912,6 +2178,8 @@ fn exec_explain(
                         };
                         rows.push(kv("表", table_name));
 
+                        // 报的访问方式必须与 select_base 的实际决策一致：
+                        // 等值索引 → 范围索引 → 全表扫描（旧版漏了范围索引）
                         let candidates = index_candidates(
                             &*engine,
                             name,
@@ -1920,16 +2188,33 @@ fn exec_explain(
                             Some(owner),
                         )?;
                         match candidates {
-                            Some(ids) => {
-                                rows.push(kv("访问方式", "索引查找".to_string()));
-                                rows.push(kv("扫描行数", ids.len().to_string()));
+                            Some(lookup) => {
+                                rows.push(kv("访问方式", lookup.label));
+                                rows.push(kv("扫描行数", lookup.ids.len().to_string()));
                             }
                             None => {
-                                rows.push(kv("访问方式", "全表扫描".to_string()));
-                                rows.push(kv("扫描行数", total.to_string()));
+                                match range_candidates(engine, name, select.where_clause.as_ref(), params)? {
+                                    Some(ids) => {
+                                        rows.push(kv(
+                                            "访问方式",
+                                            "范围索引查找（单列索引，边界已按列类型转换）".to_string(),
+                                        ));
+                                        rows.push(kv("扫描行数", ids.len().to_string()));
+                                    }
+                                    None => {
+                                        rows.push(kv("访问方式", "全表扫描".to_string()));
+                                        rows.push(kv("扫描行数", total.to_string()));
+                                    }
+                                }
                             }
                         }
                         rows.push(kv("表总行数", total.to_string()));
+                        if let Some(cap) = early_row_cap(select, params) {
+                            rows.push(kv(
+                                "LIMIT 下推",
+                                format!("无排序/分组/聚合，扫描最多凑够 {} 行即停", cap),
+                            ));
+                        }
                     }
                     TableSource::Join { kind, .. } => {
                         rows.push(kv("表", from.describe()));

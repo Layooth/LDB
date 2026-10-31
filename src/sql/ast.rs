@@ -6,6 +6,9 @@ pub enum Literal {
     Bool(bool),
     Int(i64),
     Real(f64),
+    /// 定标十进制：v = 数值 × 10^scale（不会由语法产生，只用于
+    /// `IN (SELECT ...)` 这类「运行期已求值的结果回填成字面量」的场景）
+    Decimal { v: i128, scale: u8 },
     Text(String),
 }
 
@@ -211,6 +214,23 @@ pub struct CreateIndexStmt {
     pub if_not_exists: bool,
 }
 
+/// ALTER TABLE 的动作
+#[derive(Debug, Clone)]
+pub enum AlterAction {
+    AddColumn(ColumnDef),
+    DropColumn {
+        name: String,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    /// 只改元数据（数据文件按表 id 组织，不搬迁）
+    RenameTable {
+        to: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum Statement {
     Select(SelectStmt),
@@ -237,6 +257,10 @@ pub enum Statement {
     Explain {
         statement: Box<Statement>,
     },
+    AlterTable {
+        table: String,
+        action: AlterAction,
+    },
 }
 
 impl Statement {
@@ -256,6 +280,7 @@ impl Statement {
             Statement::ShowTables => "show_tables",
             Statement::Describe { .. } => "describe",
             Statement::Explain { .. } => "explain",
+            Statement::AlterTable { .. } => "alter_table",
         }
     }
 

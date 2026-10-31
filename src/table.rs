@@ -197,6 +197,35 @@ pub fn scan_shared(store: &Store, table: &Table, owner: Option<u64>) -> Result<V
     Ok(rows)
 }
 
+/// 流式共享视图扫描：每解出一行回调一次，回调返回 Ok(false) 立即停止。
+///
+/// 给「没有排序/分组 + 带 LIMIT」的查询用：边扫边过滤，凑够
+/// offset+limit 行就停，不必把整表物化进内存。
+pub fn scan_shared_while<F>(
+    store: &Store,
+    table: &Table,
+    owner: Option<u64>,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(u32, Vec<Value>) -> Result<bool>,
+{
+    let pages = store.page_count_shared(table.id);
+    for page_no in 0..pages {
+        let page = store.read_shared(table.id, page_no, owner)?;
+        let count = pg::slot_count(&page);
+        for slot in 0..count {
+            if let Some(record) = pg::read_record(&page, slot) {
+                let values = codec::decode_row(&table.columns, &record)?;
+                if !visit(make_row_id(page_no, slot), values)? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 共享视图按 row_id 取行
 pub fn get_shared(
     store: &Store,
@@ -522,6 +551,34 @@ pub fn find_by_equality(table: &Table, column_name: &str, value: &Value) -> Opti
     }
 }
 
+/// 在指定索引上按完整 key 取 rowId（键不存在返回空）
+pub fn find_index_key(table: &Table, index_pos: usize, key: &str) -> Vec<u32> {
+    match table.indexes.get(index_pos).and_then(|ix| ix.map.get(key)) {
+        Some(list) => list.clone(),
+        None => Vec::new(),
+    }
+}
+
+/// 在指定索引上按 key 前缀取 rowId。
+///
+/// 复合索引的键是「各列编码 + \u{1}」拼起来的，前导列等值时整段前缀相同，
+/// BTreeMap 从下界顺序扫到不再是该前缀为止即可（命中数而非表行数）。
+pub fn find_by_prefix(table: &Table, index_pos: usize, prefix: &str) -> Vec<u32> {
+    let mut ids = Vec::new();
+    if let Some(index) = table.indexes.get(index_pos) {
+        for (key, list) in index
+            .map
+            .range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+        {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            ids.extend_from_slice(list);
+        }
+    }
+    ids
+}
+
 /// 范围扫描的边界（键已按 index_key 编码；None 表示该侧无界）
 pub struct RangeBounds {
     pub lower: Option<(String, bool)>, // (key, inclusive)
@@ -738,7 +795,7 @@ mod tests {
 
         let mut store = Store::open(&dir).unwrap();
         let def = store.catalog.tables[0].clone();
-        let mut table = Table::load(&mut store, &def).unwrap();
+        let table = Table::load(&mut store, &def).unwrap();
         assert_eq!(table.row_count, 20);
         let ids = find_by_equality(&table, "id", &Value::Int(5)).unwrap();
         assert_eq!(ids.len(), 1);

@@ -16,9 +16,13 @@ use crate::table::{self, Index, Table};
 pub struct Engine {
     pub store: Store,
     pub tables: Vec<Table>,
-    /// 每表一把写锁：DML 语句持有目标表的写锁 + 引擎的全局读锁，
-    /// 不同表的写语句可以并行，同表写语句串行（页内容冲突要求）。
-    /// 全局写锁只被提交临界区 / DDL / 事务控制持有。
+    /// 每表一把写锁：同表 DML 串行（页内容冲突要求）。
+    ///
+    /// 现状（与 mvcc-design.md §3.9 一致）：`ConnSession::execute` 对写语句
+    /// 整条持有引擎的 **全局写锁**（`executor` 的语句执行全程需要 `&mut Engine`），
+    /// 所以跨表写语句实际上也是串行的，这把表锁目前是冗余的第二道保险，
+    /// 留着是为了将来把语句执行改成「全局读锁 + 表锁 + 提交期短写锁」时不用再改这里。
+    /// 真正的并发收益在「事务级交错」：两个会话可以各持有一个开放事务而互不阻塞。
     table_locks: std::sync::Mutex<std::collections::HashMap<u32, std::sync::Arc<std::sync::RwLock<()>>>>,
 }
 
@@ -27,6 +31,13 @@ pub struct Engine {
 pub const INTERNAL_TXN_OWNER: u64 = 0;
 /// CLI 独占引擎（Session）的属主 id
 pub const EXCLUSIVE_TXN_OWNER: u64 = u64::MAX;
+
+/// 一次索引查找的结果：命中的 rowId + 人类可读的访问方式（EXPLAIN 直接复用，
+/// 保证「执行计划」与实际走的路一致）
+pub struct IndexLookup {
+    pub ids: Vec<u32>,
+    pub label: String,
+}
 
 impl Engine {
     pub fn open(dir: &Path) -> Result<Engine> {
@@ -284,6 +295,29 @@ impl Engine {
         Ok(())
     }
 
+    /// 表重命名：只改 catalog 与内存表名。
+    /// 数据文件按表 id（`data/tN.tbl`）组织，所以不需要搬迁数据。
+    pub fn rename_table(&mut self, from: &str, to: &str) -> Result<()> {
+        let trimmed = to.trim();
+        if trimmed.is_empty() {
+            return Err(DbError::syntax("表名不能为空"));
+        }
+        let position = self.table_index(from)?;
+        if self.table_index(trimmed).is_ok() {
+            return Err(DbError::new(
+                error::ALREADY_EXISTS,
+                format!("表 \"{}\" 已存在", trimmed),
+            ));
+        }
+        let id = self.tables[position].id;
+        self.tables[position].name = trimmed.to_string();
+        if let Some(def) = self.store.catalog.tables.iter_mut().find(|t| t.id == id) {
+            def.name = trimmed.to_string();
+        }
+        self.store.mark_catalog_dirty()?;
+        Ok(())
+    }
+
     pub fn create_index(
         &mut self,
         name: &str,
@@ -424,9 +458,7 @@ impl Engine {
         table::get_shared(&self.store, table, row_id, owner)
     }
 
-    /// 按等值条件查索引，返回 rowId 列表；没有可用索引返回 None。
-    /// owner 给定时合并该事务的索引 delta（读己之写：
-    /// 自己未提交的插入/删除在索引查询中同样可见/不可见）。
+    /// 单列等值查索引（`find_by_index` 的薄封装，供 JOIN 辅助与外部调用）
     pub fn find_by_equality(
         &self,
         table_name: &str,
@@ -434,45 +466,117 @@ impl Engine {
         value: &Value,
         owner: Option<u64>,
     ) -> Result<Option<Vec<u32>>> {
+        let equals = [(column_name.to_string(), value.clone())];
+        Ok(self
+            .find_by_index(table_name, &equals, owner)?
+            .map(|lookup| lookup.ids))
+    }
+
+    /// 按「列 = 常量」约束集合查索引：
+    /// 在所有索引中挑**前导列全部命中、且前缀最长**的那个，
+    /// 前缀覆盖全部索引列时做精确查找，否则做前缀区间查找（复合索引用得上）。
+    /// 没有可用索引返回 None（调用方回退全表扫描）。
+    ///
+    /// owner 给定时合并该事务的索引 delta（读己之写：
+    /// 自己未提交的插入/删除在索引查询中同样可见/不可见）。
+    pub fn find_by_index(
+        &self,
+        table_name: &str,
+        equals: &[(String, Value)],
+        owner: Option<u64>,
+    ) -> Result<Option<IndexLookup>> {
         let table = self.table(table_name)?;
-        let Some(ids_base) = table::find_by_equality(table, column_name, value) else {
+
+        // 列下标 → 常量（同名多条件取第一个；NULL 不参与索引）
+        let mut wanted: HashMap<usize, &Value> = HashMap::new();
+        for (name, value) in equals {
+            if value.is_null() {
+                continue;
+            }
+            if let Some(ci) = table.column_index(name) {
+                wanted.entry(ci).or_insert(value);
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+
+        // 选前缀最长者：k = 从第一列起连续命中的列数
+        let mut best: Option<(usize, usize)> = None;
+        for (pos, index) in table.indexes.iter().enumerate() {
+            let mut k = 0usize;
+            for ci in &index.columns {
+                if wanted.contains_key(ci) {
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            if k > 0 && best.map(|(_, best_k)| k > best_k).unwrap_or(true) {
+                best = Some((pos, k));
+            }
+        }
+        let Some((index_pos, k)) = best else {
             return Ok(None);
         };
-        let Some(o) = owner else {
-            return Ok(Some(ids_base));
+        let index = &table.indexes[index_pos];
+        let full = k == index.columns.len();
+
+        // 组装键：常量先按列类型转换（否则 TEXT '5' 与 INT 列对不上，
+        // 会静默返回空集）；转不了就不走索引，交给全表扫描报准确错误。
+        let mut parts: Vec<String> = Vec::with_capacity(k);
+        for ci in index.columns.iter().take(k) {
+            let column = &table.columns[*ci];
+            let Ok(value) = codec::coerce(column.ty, column.scale, wanted[ci]) else {
+                return Ok(None);
+            };
+            let Some(part) = codec::index_key(&value) else {
+                return Ok(None);
+            };
+            parts.push(part);
+        }
+        let key = parts.join("\u{1}");
+        // 完整键直接命中；部分键加分隔符做前缀区间
+        let prefix = if full {
+            key.clone()
+        } else {
+            format!("{}\u{1}", key)
         };
-        let mut ids = ids_base;
-        // 找到该列的单列索引位置，合并本事务 delta
-        let Some(ci) = table.column_index(column_name) else {
-            return Ok(Some(ids));
+
+        let mut ids = if full {
+            table::find_index_key(table, index_pos, &key)
+        } else {
+            table::find_by_prefix(table, index_pos, &prefix)
         };
-        let Some(index_pos) = table
-            .indexes
-            .iter()
-            .position(|ix| ix.columns.len() == 1 && ix.columns[0] == ci)
-        else {
-            return Ok(Some(ids));
-        };
-        let Some(key) = codec::index_key(value) else {
-            return Ok(Some(ids));
-        };
-        if let Some(txn) = self.store.txn_of(o) {
-            for op in &txn.index_ops {
-                let (op_table, op_pos, op_key, op_row, is_add) = match op {
-                    IndexOp::Add {
-                        table_id,
-                        index_pos,
-                        key,
-                        row_id,
-                    } => (*table_id, *index_pos, key, *row_id, true),
-                    IndexOp::Remove {
-                        table_id,
-                        index_pos,
-                        key,
-                        row_id,
-                    } => (*table_id, *index_pos, key, *row_id, false),
-                };
-                if op_table == table.id && op_pos == index_pos && op_key == &key {
+
+        if let Some(o) = owner {
+            if let Some(txn) = self.store.txn_of(o) {
+                for op in &txn.index_ops {
+                    let (op_table, op_pos, op_key, op_row, is_add) = match op {
+                        IndexOp::Add {
+                            table_id,
+                            index_pos,
+                            key,
+                            row_id,
+                        } => (*table_id, *index_pos, key, *row_id, true),
+                        IndexOp::Remove {
+                            table_id,
+                            index_pos,
+                            key,
+                            row_id,
+                        } => (*table_id, *index_pos, key, *row_id, false),
+                    };
+                    if op_table != table.id || op_pos != index_pos {
+                        continue;
+                    }
+                    let hit = if full {
+                        op_key == &key
+                    } else {
+                        op_key.starts_with(&prefix)
+                    };
+                    if !hit {
+                        continue;
+                    }
                     if is_add {
                         if !ids.contains(&op_row) {
                             ids.push(op_row);
@@ -483,7 +587,13 @@ impl Engine {
                 }
             }
         }
-        Ok(Some(ids))
+
+        let label = if full {
+            format!("索引查找（{}，{} 列）", index.name, k)
+        } else {
+            format!("复合索引前缀查找（{}，前 {} 列）", index.name, k)
+        };
+        Ok(Some(IndexLookup { ids, label }))
     }
 
     // ------------------------------------------------------------ 事务
@@ -517,14 +627,17 @@ impl Engine {
             ));
         }
 
+        // 索引 delta 与行数增量都必须在 store.commit 之前取快照：
+        // commit 成功会从事务表里移除该事务，之后再问就只剩空表。
         let ops = self.store.txn_index_ops(owner);
+        let row_deltas = self.store.txn_row_deltas(owner);
         let mut applied: Vec<IndexOp> = Vec::new();
         for op in &ops {
             if let IndexOp::Add {
                 table_id,
                 index_pos,
                 key,
-                ..
+                row_id,
             } = op
             {
                 if let Ok(pos) = self.table_index_by_id(*table_id) {
@@ -534,11 +647,15 @@ impl Engine {
                         .map(|ix| ix.unique)
                         .unwrap_or(false);
                     if unique {
+                        // 冲突 = 索引里已有**别的** row_id 占着这个键。
+                        // 不能只看「列表非空」：同一事务里 CREATE INDEX /
+                        // 重建表会经由 build_indexes 把本事务的行写进索引，
+                        // 提交时这批 delta 会再 Add 一次，只看非空会误报冲突。
                         let taken = self.tables[pos]
                             .indexes
                             .get(*index_pos)
                             .and_then(|ix| ix.map.get(key))
-                            .map(|list| !list.is_empty())
+                            .map(|list| list.iter().any(|existing| existing != row_id))
                             .unwrap_or(false);
                         if taken {
                             let column_names: Vec<String> = self.tables[pos]
@@ -567,7 +684,7 @@ impl Engine {
         match self.store.commit(owner) {
             Ok(()) => {
                 // 行数增量在提交成功后计入（语句期不改共享行数）
-                for (table_id, delta) in self.store.txn_row_deltas(owner) {
+                for (table_id, delta) in row_deltas {
                     if let Ok(pos) = self.table_index_by_id(table_id) {
                         let table = &mut self.tables[pos];
                         table.row_count = if delta >= 0 {

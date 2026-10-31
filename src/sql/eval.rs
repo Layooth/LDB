@@ -105,6 +105,10 @@ pub fn literal_to_value(literal: &Literal) -> Value {
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Int(n) => Value::Int(*n),
         Literal::Real(n) => Value::Real(*n),
+        Literal::Decimal { v, scale } => Value::Decimal {
+            v: *v,
+            scale: *scale,
+        },
         Literal::Text(s) => Value::Text(s.clone()),
     }
 }
@@ -344,20 +348,28 @@ pub fn apply_binary(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
             _ => Value::Null,
         }),
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-            Ok(compare_op(op, left, right))
+            compare_op(op, left, right)
         }
         _ => arith(op, left, right),
     }
 }
 
-fn compare_op(op: BinOp, left: &Value, right: &Value) -> Value {
+/// 比较运算。NULL 参与 → NULL（三值逻辑）；
+/// 非 NULL 但类型不可比 → 报 TYPE_ERROR。
+///
+/// 旧实现把「不可比」也返回 NULL，结果是 `WHERE id = '5'` 静默零行，
+/// 用户只会觉得「数据莫名查不到」。宁可明确报错让调用方加 CAST。
+fn compare_op(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
     if left.is_null() || right.is_null() {
-        return Value::Null;
+        return Ok(Value::Null);
     }
-    let ordering = match codec::compare(left, right) {
-        Some(o) => o,
-        None => return Value::Null,
-    };
+    let ordering = codec::compare(left, right).ok_or_else(|| {
+        DbError::type_error(format!(
+            "无法比较 {} 与 {}：类型不兼容，需要显式 CAST",
+            left.type_name(),
+            right.type_name()
+        ))
+    })?;
     let result = match op {
         BinOp::Eq => ordering == Ordering::Equal,
         BinOp::Ne => ordering != Ordering::Equal,
@@ -367,7 +379,7 @@ fn compare_op(op: BinOp, left: &Value, right: &Value) -> Value {
         BinOp::Ge => ordering != Ordering::Less,
         _ => false,
     };
-    Value::Bool(result)
+    Ok(Value::Bool(result))
 }
 
 /// 定标十进制四则运算：加/减对齐标度后整数运算（精确），

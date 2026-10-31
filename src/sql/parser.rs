@@ -199,6 +199,9 @@ impl Parser {
         if self.at_keyword("DROP") {
             return self.parse_drop();
         }
+        if self.at_keyword("ALTER") {
+            return self.parse_alter();
+        }
         if self.at_keyword("SHOW") {
             self.advance();
             self.expect_keyword("TABLES")?;
@@ -712,6 +715,52 @@ impl Parser {
             unique,
             default,
         })
+    }
+
+    /// `ALTER TABLE t ADD [COLUMN] ...| DROP [COLUMN] c | RENAME COLUMN a TO b | RENAME TO t2`
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword("ALTER")?;
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_ident()?;
+
+        if self.eat_keyword("ADD") {
+            let _ = self.eat_keyword("COLUMN");
+            let def = self.parse_column_def()?;
+            return Ok(Statement::AlterTable {
+                table,
+                action: AlterAction::AddColumn(def),
+            });
+        }
+        if self.eat_keyword("DROP") {
+            let _ = self.eat_keyword("COLUMN");
+            let name = self.expect_ident()?;
+            return Ok(Statement::AlterTable {
+                table,
+                action: AlterAction::DropColumn { name },
+            });
+        }
+        if self.eat_keyword("RENAME") {
+            if self.eat_keyword("TO") {
+                let to = self.expect_ident()?;
+                return Ok(Statement::AlterTable {
+                    table,
+                    action: AlterAction::RenameTable { to },
+                });
+            }
+            let _ = self.eat_keyword("COLUMN");
+            let from = self.expect_ident()?;
+            self.expect_keyword("TO")?;
+            let to = self.expect_ident()?;
+            return Ok(Statement::AlterTable {
+                table,
+                action: AlterAction::RenameColumn { from, to },
+            });
+        }
+
+        Err(DbError::syntax(
+            "ALTER TABLE 支持：ADD [COLUMN] 列定义 / DROP [COLUMN] 列名 / \
+             RENAME COLUMN 旧列 TO 新列 / RENAME TO 新表名",
+        ))
     }
 
     fn parse_drop(&mut self) -> Result<Statement> {

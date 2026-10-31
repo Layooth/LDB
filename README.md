@@ -18,16 +18,42 @@ LittleDB控制台.exe      安全启动器（生成 token → 拉起 littledb.ex
 ## 快速开始
 
 ```powershell
-# 双击 LittleDB控制台.exe：自动生成访问令牌、启动服务、打开控制台
-# 或者手动：
-littledb.exe serve .\data                 # 协议 7801 + 控制台 7802，并自动开浏览器
-littledb.exe serve .\data --token secret  # 启用 Bearer 认证
-littledb.exe sql .\data "SELECT * FROM t LIMIT 5"
-littledb.exe verify .\data                # 输出数据目录概览（表/列/索引/行数/恢复情况）
-littledb.exe demo .\tmp-demo              # 建演示库并验证读写
-littledb.exe dump .\data -o backup.sql    # 导出为 SQL 脚本（可进版本控制/能改）
-littledb.exe load .\new-data backup.sql   # 从脚本导入（--batch 200 控制每批事务）
+# 双击 dist\LittleDB控制台.exe：自动生成访问令牌、启动服务、打开控制台
+# 或者手动（先 cd 到 dist）：
+.\littledb.exe serve .\data               # 协议 7801 + 控制台 7802，并自动开浏览器
+.\littledb.exe serve .\data --token secret  # 启用 Bearer 认证
+.\littledb.exe sql .\data "SELECT * FROM t LIMIT 5"
+.\littledb.exe verify .\data              # 输出数据目录概览（表/列/索引/行数/恢复情况）
+.\littledb.exe demo .\tmp-demo            # 建演示库并验证读写
+.\littledb.exe dump .\data -o backup.sql  # 导出为 SQL 脚本（可进版本控制/能改）
+.\littledb.exe load .\new-data backup.sql # 从脚本导入（--batch 200 控制每批事务）
 ```
+
+### 目录结构
+
+```
+littledb-rust\
+├── dist\                          ← 运行层：拿这一目录就能在任何机器上跑
+│   ├── littledb.exe               服务本体（verify.ps1 自动部署到这里）
+│   ├── LittleDB控制台.exe          图形启动器（token 走环境变量传给服务）
+│   ├── .ldb-token                 启动器生成的令牌文件
+│   ├── web\                       控制台前端（单文件 index.html）
+│   └── data\                      数据目录（catalog.json + t<N>.tbl + *.wal）
+│
+└── littledb-rust-src\             ← 源码仓库（git）
+    ├── src\                       服务端源码（main/server/http/engine/table/store/wal/sql/...）
+    ├── web\index.html             控制台前端源码（部署时拷到 dist\web\）
+    ├── launcher\launcher.cs       图形启动器源码
+    ├── assets\                    图标资源
+    ├── sdk\                       JS / Python 客户端 SDK 与其集成测试、接入示例
+    ├── tests\storage.rs           集成测试
+    ├── tools\verify.ps1           一键门禁（测试→构建→部署到 dist→冒烟）
+    ├── tools\crash-test.ps1       强杀恢复验证
+    └── docs\                      设计文档
+```
+
+控制台前端改完要同步：`Copy-Item littledb-rust-src\web\index.html dist\web\`。
+启动器重新编译：`csc /nologo /optimize /out:dist\LittleDB控制台.exe littledb-rust-src\launcher\launcher.cs`。
 
 ### 配置、日志与后台运行
 

@@ -1350,6 +1350,17 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request, ke
 
 /// 从 exe 所在目录或当前目录向上找 web 目录
 pub fn find_web_dir() -> PathBuf {
+    // 部署布局优先：web 目录在 exe 旁边（dist\littledb.exe + dist\web\）。
+    // 不能只看工作目录——服务可能从任何目录被启动（计划任务/服务/别的终端）。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("web");
+            if candidate.join("index.html").is_file() {
+                return candidate;
+            }
+        }
+    }
+    // 源码树布局：从仓库内启动时按相对路径找
     let candidates = ["web", "../web", "../../web"];
     for candidate in candidates {
         let path = PathBuf::from(candidate);

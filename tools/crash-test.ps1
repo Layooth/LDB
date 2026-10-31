@@ -19,7 +19,7 @@ param(
 $ErrorActionPreference = "Stop"
 $src = Split-Path -Parent $PSScriptRoot
 $repo = Split-Path -Parent $src
-if (-not $Exe) { $Exe = Join-Path $repo "littledb.exe" }
+if (-not $Exe) { $Exe = Join-Path (Join-Path $repo "dist") "littledb.exe" }
 if (-not (Test-Path $Exe)) { throw "找不到 $Exe，请先构建" }
 
 function Step($text) { Write-Host "`n== $text ==" -ForegroundColor Cyan }

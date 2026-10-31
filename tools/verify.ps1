@@ -15,8 +15,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $src = Split-Path -Parent $PSScriptRoot      # littledb-rust-src
-$repo = Split-Path -Parent $src              # 仓库根（含 littledb.exe / web / data）
-$exe = Join-Path $repo "littledb.exe"
+$repo = Split-Path -Parent $src              # 仓库根
+$dist = Join-Path $repo "dist"               # 运行层目录（exe + web + data 都在这里）
+$exe = Join-Path $dist "littledb.exe"
 
 function Step($text) { Write-Host "`n== $text ==" -ForegroundColor Cyan }
 function Ok($text) { Write-Host "  [OK] $text" -ForegroundColor Green }
@@ -102,6 +103,7 @@ if (-not $SmokeOnly) {
 
     if (-not $SkipDeploy) {
         Step "3/4 部署"
+        New-Item -ItemType Directory -Path $dist -Force | Out-Null
         Copy-Item (Join-Path $src "target\release\littledb.exe") $exe -Force
         Ok "已更新 $exe"
     }

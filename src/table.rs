@@ -223,7 +223,15 @@ pub fn build_indexes(store: &mut Store, table: &mut Table) -> Result<()> {
     check_all_unique(table, &rows)?;
     table.row_count = rows.len() as u32;
     for (row_id, values) in &rows {
-        index_add(table, values, *row_id);
+        for (pos, key) in index_keys_of(table, values) {
+            if let Some(index) = table.indexes.get_mut(pos) {
+                index
+                    .map
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .push(*row_id);
+            }
+        }
     }
     table.free_pages = collect_free_pages(store, table)?;
     Ok(())
@@ -282,14 +290,13 @@ pub fn get(store: &mut Store, table: &Table, row_id: u32) -> Result<Option<Vec<V
     }
 }
 
-/// 应用/撤销索引操作（key 级）
+/// key 级索引应用（提交期把 delta 落到共享索引时使用；带去重）
 pub fn index_add_key(table: &mut Table, index_pos: usize, key: &str, row_id: u32) {
     if let Some(index) = table.indexes.get_mut(index_pos) {
-        index
-            .map
-            .entry(key.to_string())
-            .or_insert_with(Vec::new)
-            .push(row_id);
+        let list = index.map.entry(key.to_string()).or_insert_with(Vec::new);
+        if !list.contains(&row_id) {
+            list.push(row_id);
+        }
     }
 }
 
@@ -306,55 +313,46 @@ pub fn index_remove_key(table: &mut Table, index_pos: usize, key: &str, row_id: 
     }
 }
 
-/// 把行的索引键应用到共享索引，返回操作记录（供事务回滚/冲突撤销）。
-/// 记录必须与真实变更一一对应：no-op 不记录，否则撤销会制造幽灵条目。
-fn index_add(table: &mut Table, values: &[Value], row_id: u32) -> Vec<IndexOp> {
-    let mut ops = Vec::new();
-    for (pos, index) in table.indexes.iter_mut().enumerate() {
-        let picked: Vec<Value> = index.columns.iter().map(|i| values[*i].clone()).collect();
-        if let Some(key) = codec::index_key_of(&picked) {
-            let list = index.map.entry(key.clone()).or_insert_with(Vec::new);
-            if !list.contains(&row_id) {
-                list.push(row_id);
-                ops.push(IndexOp::Add {
-                    table_id: table.id,
-                    index_pos: pos,
-                    key,
-                    row_id,
-                });
-            }
-        }
-    }
-    ops
+/// 计算一行在所有索引上的 (index_pos, key)
+fn index_keys_of(table: &Table, values: &[Value]) -> Vec<(usize, String)> {
+    table
+        .indexes
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, index)| {
+            let picked: Vec<Value> = index.columns.iter().map(|i| values[*i].clone()).collect();
+            codec::index_key_of(&picked).map(|key| (pos, key))
+        })
+        .collect()
 }
 
-fn index_remove(table: &mut Table, values: &[Value], row_id: u32) -> Vec<IndexOp> {
-    let mut ops = Vec::new();
-    for (pos, index) in table.indexes.iter_mut().enumerate() {
-        let picked: Vec<Value> = index.columns.iter().map(|i| values[*i].clone()).collect();
-        if let Some(key) = codec::index_key_of(&picked) {
-            let mut empty = false;
-            let mut removed = false;
-            if let Some(list) = index.map.get_mut(&key) {
-                let before = list.len();
-                list.retain(|id| *id != row_id);
-                removed = list.len() != before;
-                empty = list.is_empty();
+/// P3 延迟索引：语句期【不】更新共享索引，只把 delta 记进事务，
+/// 提交时由 Engine 在临界区内统一应用并做唯一约束检查。
+fn record_index_delta(
+    store: &mut Store,
+    table: &Table,
+    keys: &[(usize, String)],
+    row_id: u32,
+    add: bool,
+) {
+    for (pos, key) in keys {
+        let op = if add {
+            IndexOp::Add {
+                table_id: table.id,
+                index_pos: *pos,
+                key: key.clone(),
+                row_id,
             }
-            if empty {
-                index.map.remove(&key);
+        } else {
+            IndexOp::Remove {
+                table_id: table.id,
+                index_pos: *pos,
+                key: key.clone(),
+                row_id,
             }
-            if removed {
-                ops.push(IndexOp::Remove {
-                    table_id: table.id,
-                    index_pos: pos,
-                    key,
-                    row_id,
-                });
-            }
-        }
+        };
+        store.record_index_op(op);
     }
-    ops
 }
 
 fn check_not_null(table: &Table, values: &[Value]) -> Result<()> {
@@ -371,35 +369,6 @@ fn check_not_null(table: &Table, values: &[Value]) -> Result<()> {
                 "列 \"{}\" 不允许为 NULL",
                 column.name
             )));
-        }
-    }
-    Ok(())
-}
-
-fn check_unique(table: &Table, values: &[Value], skip_row: Option<u32>) -> Result<()> {
-    for index in &table.indexes {
-        if !index.unique {
-            continue;
-        }
-        let picked: Vec<Value> = index.columns.iter().map(|i| values[*i].clone()).collect();
-        let key = match codec::index_key_of(&picked) {
-            Some(k) => k,
-            None => continue, // NULL 不参与唯一性判断
-        };
-        if let Some(list) = index.map.get(&key) {
-            for id in list {
-                if Some(*id) != skip_row {
-                    let column_names: Vec<String> = index
-                        .columns
-                        .iter()
-                        .map(|i| table.columns[*i].name.clone())
-                        .collect();
-                    return Err(DbError::constraint(format!(
-                        "唯一约束冲突：{} 上已存在相同的值",
-                        column_names.join(", ")
-                    )));
-                }
-            }
         }
     }
     Ok(())
@@ -492,13 +461,11 @@ fn delete_physical(store: &mut Store, table: &mut Table, row_id: u32) -> Result<
 pub fn insert(store: &mut Store, table: &mut Table, values: Vec<Value>) -> Result<u32> {
     check_not_null(table, &values)?;
     let record = codec::encode_row(&table.columns, &values)?;
-    check_unique(table, &values, None)?;
+    let keys = index_keys_of(table, &values);
     let row_id = insert_physical(store, table, &record)?;
-    for op in index_add(table, &values, row_id) {
-        store.record_index_op(op);
-    }
+    // P3：唯一约束延迟到提交期检查；索引 delta 只记账不应用
+    record_index_delta(store, table, &keys, row_id, true);
     store.record_row_delta(table.id, 1);
-    table.row_count += 1;
     Ok(row_id)
 }
 
@@ -507,14 +474,11 @@ pub fn delete(store: &mut Store, table: &mut Table, row_id: u32) -> Result<bool>
         Some(v) => v,
         None => return Ok(false),
     };
-    let ops = index_remove(table, &values, row_id);
+    let keys = index_keys_of(table, &values);
     let removed = delete_physical(store, table, row_id)?;
     if removed {
-        for op in ops {
-            store.record_index_op(op);
-        }
+        record_index_delta(store, table, &keys, row_id, false);
         store.record_row_delta(table.id, -1);
-        table.row_count = table.row_count.saturating_sub(1);
     }
     Ok(removed)
 }
@@ -532,45 +496,20 @@ pub fn update(
     check_not_null(table, &values)?;
     let record = codec::encode_row(&table.columns, &values)?;
 
-    let remove_ops = index_remove(table, &old, row_id);
-    if let Err(err) = check_unique(table, &values, Some(row_id)) {
-        for op in remove_ops {
-            index_add_key(table, op_index_pos(&op), op_key(&op), row_id);
-        }
-        return Err(err);
-    }
+    let old_keys = index_keys_of(table, &old);
+    let new_keys = index_keys_of(table, &values);
 
     if !delete_physical(store, table, row_id)? {
-        for op in remove_ops {
-            index_add_key(table, op_index_pos(&op), op_key(&op), row_id);
-        }
         return Ok(None);
     }
-    table.row_count = table.row_count.saturating_sub(1);
-
+    // delta 顺序：先删旧键后加新键（提交期按序应用，净零变化自然成立）
+    record_index_delta(store, table, &old_keys, row_id, false);
     // 走到这里记录长度已经校验过，insert_physical 失败的概率极低；
     // 真失败就交给上层回滚整个事务，不做半吊子的就地恢复。
     let new_row_id = insert_physical(store, table, &record)?;
-
-    let add_ops = index_add(table, &values, new_row_id);
-    for op in remove_ops.iter().chain(add_ops.iter()) {
-        store.record_index_op(op.clone());
-    }
-    // 删 + 插，行数净变化为 0
-    table.row_count += 1;
+    record_index_delta(store, table, &new_keys, new_row_id, true);
+    // 删 + 插，行数净变化为 0（delta 相互抵消）
     Ok(Some(new_row_id))
-}
-
-fn op_index_pos(op: &IndexOp) -> usize {
-    match op {
-        IndexOp::Add { index_pos, .. } | IndexOp::Remove { index_pos, .. } => *index_pos,
-    }
-}
-
-fn op_key(op: &IndexOp) -> &str {
-    match op {
-        IndexOp::Add { key, .. } | IndexOp::Remove { key, .. } => key,
-    }
 }
 
 /// 按等值条件查索引，返回 rowId 列表；没有可用索引返回 None
@@ -654,31 +593,8 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_conflict() {
-        let dir = temp_dir("b");
-        let mut store = Store::open(&dir).unwrap();
-        let mut table = sample_table(&mut store);
-        store.begin(0).unwrap();
-        insert(
-            &mut store,
-            &mut table,
-            vec![Value::Int(1), Value::Text("a".to_string()), Value::Int(0)],
-        )
-        .unwrap();
-        let err = insert(
-            &mut store,
-            &mut table,
-            vec![Value::Int(1), Value::Text("b".to_string()), Value::Int(0)],
-        )
-        .unwrap_err();
-        assert_eq!(err.code, error::CONSTRAINT);
-        store.rollback(0);
-        store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unique_column_enforced() {
+    fn unique_delta_recorded_not_applied() {
+        // P3：语句期不检查唯一约束（延迟到提交期），delta 只记账不进共享索引
         let dir = temp_dir("c");
         let mut store = Store::open(&dir).unwrap();
         let mut table = sample_table(&mut store);
@@ -689,13 +605,14 @@ mod tests {
             vec![Value::Int(1), Value::Text("dup".to_string()), Value::Int(0)],
         )
         .unwrap();
-        let err = insert(
+        insert(
             &mut store,
             &mut table,
             vec![Value::Int(2), Value::Text("dup".to_string()), Value::Int(0)],
         )
-        .unwrap_err();
-        assert_eq!(err.code, error::CONSTRAINT);
+        .unwrap();
+        // 共享索引里没有这些键（delta 未应用）
+        assert!(table.indexes.iter().all(|ix| ix.map.is_empty()));
         store.rollback(0);
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -727,16 +644,20 @@ mod tests {
 
         store.begin(0).unwrap();
         for i in 0..50 {
-            insert(
-                &mut store,
-                &mut table,
-                vec![
-                    Value::Int(i),
-                    Value::Text(format!("p{}", i)),
-                    Value::Int(i * 2),
-                ],
-            )
-            .unwrap();
+            let values = vec![
+                Value::Int(i),
+                Value::Text(format!("p{}", i)),
+                Value::Int(i * 2),
+            ];
+            let record = codec::encode_row(&table.columns, &values).unwrap();
+            let row_id = insert_physical(&mut store, &mut table, &record).unwrap();
+            // 模拟提交期索引应用（真实路径在 Engine::commit）
+            for (pos, key) in index_keys_of(&table, &values) {
+                if let Some(index) = table.indexes.get_mut(pos) {
+                    index.map.entry(key).or_insert_with(Vec::new).push(row_id);
+                }
+            }
+            table.row_count += 1;
         }
         store.commit(0).unwrap();
 
@@ -758,16 +679,19 @@ mod tests {
             store.begin(0).unwrap();
             store.mark_catalog_dirty().unwrap();
             for i in 0..20 {
-                insert(
-                    &mut store,
-                    &mut table,
-                    vec![
-                        Value::Int(i),
-                        Value::Text(format!("u{}", i)),
-                        Value::Int(i),
-                    ],
-                )
-                .unwrap();
+                let values = vec![
+                    Value::Int(i),
+                    Value::Text(format!("u{}", i)),
+                    Value::Int(i),
+                ];
+                let record = codec::encode_row(&table.columns, &values).unwrap();
+                let row_id = insert_physical(&mut store, &mut table, &record).unwrap();
+                for (pos, key) in index_keys_of(&table, &values) {
+                    if let Some(index) = table.indexes.get_mut(pos) {
+                        index.map.entry(key).or_insert_with(Vec::new).push(row_id);
+                    }
+                }
+                table.row_count += 1;
             }
             store.commit(0).unwrap();
             store.close().unwrap();
@@ -780,15 +704,6 @@ mod tests {
         let ids = find_by_equality(&table, "id", &Value::Int(5)).unwrap();
         assert_eq!(ids.len(), 1);
 
-        store.begin(0).unwrap();
-        let err = insert(
-            &mut store,
-            &mut table,
-            vec![Value::Int(5), Value::Text("dup".to_string()), Value::Int(0)],
-        )
-        .unwrap_err();
-        assert_eq!(err.code, error::CONSTRAINT);
-        store.rollback(0);
         store.close().unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -10,7 +10,7 @@ use crate::catalog::{IndexDef, TableDef};
 use crate::codec::{self, Column, ColumnType, Value};
 use crate::error::{self, DbError, Result};
 use crate::json::Json;
-use crate::store::{IndexOp, RollbackInfo, Store, StoreStats};
+use crate::store::{IndexOp, Store, StoreStats};
 use crate::table::{self, Index, Table};
 
 pub struct Engine {
@@ -84,45 +84,14 @@ impl Engine {
         }
     }
 
-    /// 回滚指定会话的事务：
-    /// - 纯 DML：按记录的索引操作逆序精确撤销 + 修正行数（不动其它事务）
-    /// - 含 DDL：从 catalog 重建全部表，再把其它开放事务的索引操作重放回去
+    /// 回滚指定会话的事务：页/catalog 由 store 恢复；
+    /// P3 延迟索引后索引 delta 从未应用到共享索引，随事务丢弃即可。
+    /// 含 DDL 时从 catalog 重建内存表。
     fn rollback_txn(&mut self, owner: u64) {
-        let info = self.store.rollback(owner);
-        let info = match info {
-            Some(info) => info,
-            None => return,
-        };
-        if !info.catalog_dirty {
-            self.undo_index_ops(&info);
-        } else {
-            self.reload_tables();
-            // 其它开放事务的未提交索引状态随全量重建被抹掉，重放恢复
-            let ops = self.store.open_index_ops(owner);
-            self.apply_index_ops(&ops);
-        }
-    }
-
-    fn undo_index_ops(&mut self, info: &RollbackInfo) {
-        let mut ops: Vec<&IndexOp> = info.index_ops.iter().rev().collect();
-        for op in ops.drain(..) {
-            self.apply_inverse(op);
-        }
-        for (table_id, delta) in &info.row_deltas {
-            if let Ok(pos) = self.table_index_by_id(*table_id) {
-                let table = &mut self.tables[pos];
-                table.row_count = if *delta >= 0 {
-                    table.row_count.saturating_sub(*delta as u32)
-                } else {
-                    table.row_count.saturating_add((-*delta) as u32)
-                };
+        if let Some(catalog_dirty) = self.store.rollback(owner) {
+            if catalog_dirty {
+                self.reload_tables();
             }
-        }
-    }
-
-    fn apply_index_ops(&mut self, ops: &[IndexOp]) {
-        for op in ops {
-            self.apply_op(op);
         }
     }
 
@@ -436,14 +405,66 @@ impl Engine {
         table::get_shared(&self.store, table, row_id, owner)
     }
 
+    /// 按等值条件查索引，返回 rowId 列表；没有可用索引返回 None。
+    /// owner 给定时合并该事务的索引 delta（读己之写：
+    /// 自己未提交的插入/删除在索引查询中同样可见/不可见）。
     pub fn find_by_equality(
         &self,
         table_name: &str,
         column_name: &str,
         value: &Value,
+        owner: Option<u64>,
     ) -> Result<Option<Vec<u32>>> {
         let table = self.table(table_name)?;
-        Ok(table::find_by_equality(table, column_name, value))
+        let Some(ids_base) = table::find_by_equality(table, column_name, value) else {
+            return Ok(None);
+        };
+        let Some(o) = owner else {
+            return Ok(Some(ids_base));
+        };
+        let mut ids = ids_base;
+        // 找到该列的单列索引位置，合并本事务 delta
+        let Some(ci) = table.column_index(column_name) else {
+            return Ok(Some(ids));
+        };
+        let Some(index_pos) = table
+            .indexes
+            .iter()
+            .position(|ix| ix.columns.len() == 1 && ix.columns[0] == ci)
+        else {
+            return Ok(Some(ids));
+        };
+        let Some(key) = codec::index_key(value) else {
+            return Ok(Some(ids));
+        };
+        if let Some(txn) = self.store.txn_of(o) {
+            for op in &txn.index_ops {
+                let (op_table, op_pos, op_key, op_row, is_add) = match op {
+                    IndexOp::Add {
+                        table_id,
+                        index_pos,
+                        key,
+                        row_id,
+                    } => (*table_id, *index_pos, key, *row_id, true),
+                    IndexOp::Remove {
+                        table_id,
+                        index_pos,
+                        key,
+                        row_id,
+                    } => (*table_id, *index_pos, key, *row_id, false),
+                };
+                if op_table == table.id && op_pos == index_pos && op_key == &key {
+                    if is_add {
+                        if !ids.contains(&op_row) {
+                            ids.push(op_row);
+                        }
+                    } else {
+                        ids.retain(|id| *id != op_row);
+                    }
+                }
+            }
+        }
+        Ok(Some(ids))
     }
 
     // ------------------------------------------------------------ 事务
@@ -453,6 +474,12 @@ impl Engine {
     }
 
     /// 提交：先做页级写冲突检测（首写者获胜），冲突则回滚本事务
+    /// 提交编排：
+    /// 1. 页级写冲突检测（首写者获胜）→ WRITE_CONFLICT
+    /// 2. 延迟索引：把本事务的索引 delta 应用到共享索引，
+    ///    唯一索引的 Add 若撞已提交的键 → CONSTRAINT_VIOLATION
+    ///    （顺序应用，失败时逆序撤销已应用部分，保持原子）
+    /// 3. WAL + committed 列表（store.commit）+ 行数增量
     pub fn commit(&mut self, owner: u64) -> Result<()> {
         if let Some(table_id) = self.store.check_conflict(owner) {
             self.rollback_txn(owner);
@@ -470,7 +497,78 @@ impl Engine {
                 ),
             ));
         }
-        self.store.commit(owner)
+
+        let ops = self.store.txn_index_ops(owner);
+        let mut applied: Vec<IndexOp> = Vec::new();
+        for op in &ops {
+            if let IndexOp::Add {
+                table_id,
+                index_pos,
+                key,
+                ..
+            } = op
+            {
+                if let Ok(pos) = self.table_index_by_id(*table_id) {
+                    let unique = self.tables[pos]
+                        .indexes
+                        .get(*index_pos)
+                        .map(|ix| ix.unique)
+                        .unwrap_or(false);
+                    if unique {
+                        let taken = self.tables[pos]
+                            .indexes
+                            .get(*index_pos)
+                            .and_then(|ix| ix.map.get(key))
+                            .map(|list| !list.is_empty())
+                            .unwrap_or(false);
+                        if taken {
+                            let column_names: Vec<String> = self.tables[pos]
+                                .indexes[*index_pos]
+                                .columns
+                                .iter()
+                                .map(|ci| self.tables[pos].columns[*ci].name.clone())
+                                .collect();
+                            for prev in applied.iter().rev() {
+                                self.apply_inverse(prev);
+                            }
+                            self.store.rollback(owner);
+                            return Err(DbError::constraint(format!(
+                                "唯一约束冲突：{} 上已存在相同的值（{}）",
+                                column_names.join(", "),
+                                key
+                            )));
+                        }
+                    }
+                }
+            }
+            self.apply_op(op);
+            applied.push(op.clone());
+        }
+
+        match self.store.commit(owner) {
+            Ok(()) => {
+                // 行数增量在提交成功后计入（语句期不改共享行数）
+                for (table_id, delta) in self.store.txn_row_deltas(owner) {
+                    if let Ok(pos) = self.table_index_by_id(table_id) {
+                        let table = &mut self.tables[pos];
+                        table.row_count = if delta >= 0 {
+                            table.row_count.saturating_add(delta as u32)
+                        } else {
+                            table.row_count.saturating_sub(((-delta) as u32).min(table.row_count))
+                        };
+                    }
+                }
+                Ok(())
+            }
+            Err(err) => {
+                // WAL 写入失败：撤销已应用的索引 delta
+                for prev in applied.iter().rev() {
+                    self.apply_inverse(prev);
+                }
+                self.store.rollback(owner);
+                Err(err)
+            }
+        }
     }
 
     pub fn rollback(&mut self, owner: u64) {

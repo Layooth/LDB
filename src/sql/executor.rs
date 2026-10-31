@@ -684,7 +684,7 @@ fn run_read_only(
                 indexes,
             })
         }
-        Statement::Explain { statement } => exec_explain(engine, statement, params),
+        Statement::Explain { statement } => exec_explain(engine, statement, params, owner),
         _ => Err(DbError::internal("run_read_only 只接受只读语句")),
     }
 }
@@ -842,7 +842,7 @@ fn select_base(
                     offset: 0,
                 });
                 let candidates =
-                    index_candidates(engine, name, where_clause.as_ref(), params)?;
+                    index_candidates(engine, name, where_clause.as_ref(), params, owner)?;
                 match candidates {
                     Some(ids) => {
                         for id in ids {
@@ -1157,7 +1157,7 @@ fn join_frame(
                         let mut matched = false;
                         if !key.is_null() {
                             if let Some(ids) = engine
-                                .find_by_equality(&assist.table_name, &assist.column_name, &key)?
+                                .find_by_equality(&assist.table_name, &assist.column_name, &key, owner)?
                             {
                                 for id in ids {
                                     if let Some(rvals) =
@@ -1419,6 +1419,7 @@ fn index_candidates(
     table: &str,
     where_clause: Option<&Expr>,
     params: &[Value],
+    owner: Option<u64>,
 ) -> Result<Option<Vec<u32>>> {
     let expr = match where_clause {
         Some(e) => e,
@@ -1446,7 +1447,9 @@ fn index_candidates(
                     let constant = eval(right, &empty, params);
                     if let Ok(value) = constant {
                         if !value.is_null() {
-                            if let Some(ids) = engine.find_by_equality(table, name, &value)? {
+                            if let Some(ids) =
+                                engine.find_by_equality(table, name, &value, owner)?
+{
                                 return Ok(Some(ids));
                             }
                         }
@@ -1656,6 +1659,7 @@ fn exec_explain(
     engine: &Engine,
     statement: &Statement,
     params: &[Value],
+    owner: u64,
 ) -> Result<QueryResult> {
     let mut rows: Vec<Vec<Value>> = Vec::new();
     rows.push(kv("语句", statement.kind_name().to_uppercase()));
@@ -1676,6 +1680,7 @@ fn exec_explain(
                             name,
                             select.where_clause.as_ref(),
                             params,
+                            Some(owner),
                         )?;
                         match candidates {
                             Some(ids) => {

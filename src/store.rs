@@ -140,7 +140,7 @@ pub struct TableFile {
     pub pages: u32,
 }
 
-struct Txn {
+pub struct Txn {
     id: i64,
     /// 事务开始时的提交序号（快照）：之后提交的内容对本事务不可见
     snapshot: u64,
@@ -149,7 +149,8 @@ struct Txn {
     catalog_dirty: bool,
     drops: Vec<u32>,
     page_count_before: HashMap<u32, u32>,
-    index_ops: Vec<IndexOp>,
+    /// 延迟索引 delta：语句期记账，提交时由 Engine 统一应用
+    pub index_ops: Vec<IndexOp>,
     row_deltas: HashMap<u32, i64>,
 }
 
@@ -512,18 +513,25 @@ impl Store {
         }
     }
 
-    /// 其它开放事务（排除 owner）的索引操作快照
-    pub fn open_index_ops(&self, exclude_owner: u64) -> Vec<IndexOp> {
-        let mut ops = Vec::new();
-        let mut keys: Vec<&u64> = self.txns.keys().collect();
-        keys.sort();
-        for key in keys {
-            if *key == exclude_owner {
-                continue;
-            }
-            ops.extend(self.txns[key].index_ops.iter().cloned());
-        }
-        ops
+    /// 指定会话的开放事务（读己之写的 delta 合并用）
+    pub fn txn_of(&self, owner: u64) -> Option<&Txn> {
+        self.txns.get(&owner)
+    }
+
+    /// 指定会话事务的索引 delta 快照（提交期应用用）
+    pub fn txn_index_ops(&self, owner: u64) -> Vec<IndexOp> {
+        self.txns
+            .get(&owner)
+            .map(|t| t.index_ops.clone())
+            .unwrap_or_default()
+    }
+
+    /// 指定会话事务的行数增量快照
+    pub fn txn_row_deltas(&self, owner: u64) -> HashMap<u32, i64> {
+        self.txns
+            .get(&owner)
+            .map(|t| t.row_deltas.clone())
+            .unwrap_or_default()
     }
 
     /// 最老活跃快照：checkpoint 只能落盘 seq <= watermark 的已提交页，
@@ -655,23 +663,20 @@ impl Store {
         Ok(())
     }
 
-    /// 回滚指定会话的事务，返回撤销信息（None = 该会话没有开放事务）。
-    /// 页与 catalog 的恢复在 discard_txn 内完成；
-    /// 索引与行数的撤销由引擎用返回的信息执行。
-    pub fn rollback(&mut self, owner: u64) -> Option<RollbackInfo> {
+    /// 回滚指定会话的事务（None = 该会话没有开放事务）。
+    /// P3 延迟索引后，索引 delta 从未应用到共享索引——直接随事务丢弃；
+    /// 页与 catalog 的恢复在 discard_txn 内完成。
+    /// 返回是否含 catalog 变更（引擎据此决定是否重建内存表）。
+    pub fn rollback(&mut self, owner: u64) -> Option<bool> {
         let txn = self.txns.remove(&owner)?;
         if self.txns.is_empty() {
             self.txn_owner = None;
         } else if self.txn_owner == Some(owner) {
             self.txn_owner = None;
         }
-        let info = RollbackInfo {
-            index_ops: txn.index_ops.clone(),
-            row_deltas: txn.row_deltas.clone(),
-            catalog_dirty: txn.catalog_dirty,
-        };
+        let catalog_dirty = txn.catalog_dirty;
         self.discard_txn(&txn);
-        Some(info)
+        Some(catalog_dirty)
     }
 
     fn discard_txn(&mut self, txn: &Txn) {

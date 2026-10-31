@@ -53,7 +53,7 @@ fn crud_and_reopen() {
         let rows = engine.scan("players").unwrap();
         assert_eq!(rows.len(), 20);
 
-        let ids = engine.find_by_equality("players", "id", &Value::Int(7)).unwrap();
+        let ids = engine.find_by_equality("players", "id", &Value::Int(7), None).unwrap();
         assert_eq!(ids.as_ref().map(|v| v.len()), Some(1));
         let row = engine.get("players", ids.unwrap()[0]).unwrap().unwrap();
         assert_eq!(row[1], Value::Text("p7".to_string()));
@@ -174,10 +174,10 @@ fn update_replaces_row_and_keeps_index_consistent() {
         })
         .unwrap();
 
-    let ids = engine.find_by_equality("players", "name", &Value::Text("new".to_string())).unwrap();
+    let ids = engine.find_by_equality("players", "name", &Value::Text("new".to_string()), None).unwrap();
     assert_eq!(ids.as_ref().map(|v| v.len()), Some(1));
     assert!(engine
-        .find_by_equality("players", "name", &Value::Text("old".to_string()))
+        .find_by_equality("players", "name", &Value::Text("old".to_string()), None)
         .unwrap()
         .map(|v| v.is_empty())
         .unwrap_or(false));

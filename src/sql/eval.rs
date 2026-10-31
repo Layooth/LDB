@@ -209,11 +209,14 @@ pub fn eval(expr: &Expr, ctx: &RowContext, params: &[Value]) -> Result<Value> {
 
         Expr::Column { name, table } => ctx.field(table.as_deref(), name).cloned(),
 
-        // EXISTS 要执行子查询，而 eval 手里没有引擎：
-        // 执行器在逐行求值前会用 resolve_exists 把它换成布尔字面量。
-        // 走到这里说明写在了不支持的位置（例如 SELECT 列表/ORDER BY）。
+        // EXISTS / 标量子查询都要执行子查询，而 eval 手里没有引擎：
+        // 执行器在逐行求值前会用 resolve_subqueries 把它们换成字面量。
+        // 走到这里说明写在了不支持的位置（GROUP BY / HAVING / LIMIT 等）。
         Expr::Exists { .. } => Err(DbError::syntax(
-            "EXISTS 只能用在 WHERE 或 JOIN ... ON 条件里（暂不支持 SELECT 列表、ORDER BY、HAVING）",
+            "EXISTS 只能用在 WHERE、JOIN ... ON 或 SELECT 列表里（暂不支持 GROUP BY / HAVING / ORDER BY）",
+        )),
+        Expr::ScalarSubquery { .. } => Err(DbError::syntax(
+            "标量子查询只能用在 WHERE、JOIN ... ON 或 SELECT 列表里（暂不支持 GROUP BY / HAVING / LIMIT）",
         )),
 
         Expr::Unary { op, operand } => {

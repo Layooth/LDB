@@ -1195,9 +1195,30 @@ fn select_base(
                 continue;
             }
         }
+        // 组内第一行作为「当前行」：投影/排序键里的子查询（EXISTS、标量）以它为外层上下文。
+        // 无 GROUP BY 时每组就是一行；有 GROUP BY 的相关子查询属于边缘用法，取第一行。
+        let resolve_here = |engine: &Engine,
+                            expr: &Expr,
+                            group: &[RowContext]|
+         -> Result<Expr> {
+            match group.first() {
+                Some(ctx) => {
+                    resolve_subquery_exprs(engine, expr, ctx, params, committed_only, owner)
+                }
+                // 空组（聚合聚合空表）：没有行就没有外层列可用
+                None => Ok(expr.clone()),
+            }
+        };
+
         let mut values = Vec::with_capacity(projections.len());
         for projection in &projections {
-            values.push(eval_in_group(projection, group, params)?);
+            let value = if expr_has_subquery(projection) {
+                let resolved = resolve_here(engine, projection, group)?;
+                eval_in_group(&resolved, group, params)?
+            } else {
+                eval_in_group(projection, group, params)?
+            };
+            values.push(value);
         }
         let mut sort_keys = Vec::with_capacity(stmt.order_by.len());
         for order in &stmt.order_by {
@@ -1207,7 +1228,13 @@ fn select_base(
                 sort_keys.push(values[slot].clone());
                 continue;
             }
-            sort_keys.push(eval_in_group(&order.expr, group, params)?);
+            let key = if expr_has_subquery(&order.expr) {
+                let resolved = resolve_here(engine, &order.expr, group)?;
+                eval_in_group(&resolved, group, params)?
+            } else {
+                eval_in_group(&order.expr, group, params)?
+            };
+            sort_keys.push(key);
         }
         output.push((values, sort_keys));
     }
@@ -1331,6 +1358,8 @@ fn infer_expr_type(expr: &Expr, plans: &[TablePlan]) -> String {
             }
         }
         Expr::Param(_) => "UNKNOWN".to_string(),
+        // 标量子查询的类型要跑一遍才知道；不猜
+        Expr::ScalarSubquery { .. } => "UNKNOWN".to_string(),
     }
 }
 
@@ -1749,23 +1778,71 @@ fn find_join_assist(
 }
 
 /// 表达式里是否含 EXISTS（含就得走「先解析、再求值」的慢路径）
-fn expr_has_exists(expr: &Expr) -> bool {
+fn expr_has_subquery(expr: &Expr) -> bool {
     match expr {
-        Expr::Exists { .. } => true,
-        Expr::Binary { left, right, .. } => expr_has_exists(left) || expr_has_exists(right),
-        Expr::Unary { operand, .. } => expr_has_exists(operand),
-        Expr::IsNull { expr, .. } => expr_has_exists(expr),
+        // EXISTS 与标量子查询都要在执行期跑子查询
+        Expr::Exists { .. } | Expr::ScalarSubquery { .. } => true,
+        Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        Expr::Unary { operand, .. } => expr_has_subquery(operand),
+        Expr::IsNull { expr, .. } => expr_has_subquery(expr),
         Expr::InList { expr, list, .. } => {
-            expr_has_exists(expr) || list.iter().any(expr_has_exists)
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
         }
-        Expr::InSubquery { expr, .. } => expr_has_exists(expr),
-        Expr::Cast { expr, .. } => expr_has_exists(expr),
+        Expr::InSubquery { expr, .. } => expr_has_subquery(expr),
+        Expr::Cast { expr, .. } => expr_has_subquery(expr),
         Expr::Between {
             expr, low, high, ..
-        } => expr_has_exists(expr) || expr_has_exists(low) || expr_has_exists(high),
-        Expr::Like { expr, pattern, .. } => expr_has_exists(expr) || expr_has_exists(pattern),
-        Expr::Function { args, .. } => args.iter().any(expr_has_exists),
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
+        Expr::Function { args, .. } => args.iter().any(expr_has_subquery),
         _ => false,
+    }
+}
+
+/// SQL 值 → 字面量表达式（把子查询结果内联回表达式树）
+fn literal_of(value: &Value) -> Literal {
+    match value {
+        Value::Null => Literal::Null,
+        Value::Bool(b) => Literal::Bool(*b),
+        Value::Int(n) => Literal::Int(*n),
+        Value::Real(n) => Literal::Real(*n),
+        Value::Decimal { v, scale } => Literal::Decimal {
+            v: *v,
+            scale: *scale,
+        },
+        Value::Text(s) => Literal::Text(s.clone()),
+    }
+}
+
+/// 标量子查询求值：必须一行一列；无行 → NULL。
+fn scalar_subquery_value(
+    engine: &Engine,
+    query: &SelectStmt,
+    ctx: &RowContext,
+    params: &[Value],
+    committed_only: bool,
+    owner: Option<u64>,
+) -> Result<Value> {
+    let outer = std::rc::Rc::new(ctx.clone());
+    let (columns, _, rows) =
+        run_subquery(engine, query, params, committed_only, owner, Some(outer))?;
+    if columns.len() != 1 {
+        return Err(DbError::syntax(format!(
+            "标量子查询只能返回 1 列，实际返回 {} 列",
+            columns.len()
+        )));
+    }
+    match rows.len() {
+        0 => Ok(Value::Null),
+        1 => Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next())
+            .unwrap_or(Value::Null)),
+        n => Err(DbError::syntax(format!(
+            "标量子查询返回了 {} 行，只能返回 1 行：请加 LIMIT 1 或改用聚合",
+            n
+        ))),
     }
 }
 
@@ -1773,7 +1850,9 @@ fn expr_has_exists(expr: &Expr) -> bool {
 ///
 /// `eval` 拿不到引擎、也没法在求值中途执行查询，所以在这里预处理：
 /// **当前行**被当作子查询的外层上下文传进去，相关子查询就是这么实现的。
-fn resolve_exists(
+/// （与上面的 `resolve_subqueries` 区分：这个是**带行上下文**的逐行版本，
+/// 处理 EXISTS 与标量子查询；上面那个只处理非关联的 `IN (SELECT ...)`。）
+fn resolve_subquery_exprs(
     engine: &Engine,
     expr: &Expr,
     ctx: &RowContext,
@@ -1781,13 +1860,18 @@ fn resolve_exists(
     committed_only: bool,
     owner: Option<u64>,
 ) -> Result<Expr> {
-    let resolve = |inner: &Expr| resolve_exists(engine, inner, ctx, params, committed_only, owner);
+    let resolve =
+        |inner: &Expr| resolve_subquery_exprs(engine, inner, ctx, params, committed_only, owner);
     Ok(match expr {
         Expr::Exists { query } => {
             let outer = std::rc::Rc::new(ctx.clone());
             let (_, _, rows) =
                 run_subquery(engine, query, params, committed_only, owner, Some(outer))?;
             Expr::Literal(Literal::Bool(!rows.is_empty()))
+        }
+        Expr::ScalarSubquery { query } => {
+            let value = scalar_subquery_value(engine, query, ctx, params, committed_only, owner)?;
+            Expr::Literal(literal_of(&value))
         }
         Expr::Binary { op, left, right } => Expr::Binary {
             op: *op,
@@ -1861,10 +1945,11 @@ fn eval_condition(
     committed_only: bool,
     owner: Option<u64>,
 ) -> Result<Value> {
-    if !expr_has_exists(expr) {
+    if !expr_has_subquery(expr) {
         return eval(expr, ctx, params);
     }
-    let resolved = resolve_exists(engine, expr, ctx, params, committed_only, owner)?;
+    let resolved =
+        resolve_subquery_exprs(engine, expr, ctx, params, committed_only, owner)?;
     eval(&resolved, ctx, params)
 }
 

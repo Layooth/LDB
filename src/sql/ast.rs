@@ -68,8 +68,10 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
-    /// `EXISTS (SELECT ...)`：执行前会被解析成布尔字面量（见 `resolve_exists`）
+    /// `EXISTS (SELECT ...)`：执行前会被解析成布尔字面量（见 `resolve_subqueries`）
     Exists { query: Box<SelectStmt> },
+    /// `(SELECT ...)`：标量子查询，必须只返回一行一列（无行 → NULL）
+    ScalarSubquery { query: Box<SelectStmt> },
     /// `expr IN (SELECT ...)`：执行期被解析成 InList（非关联子查询）
     InSubquery {
         expr: Box<Expr>,

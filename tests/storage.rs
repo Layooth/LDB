@@ -2122,6 +2122,100 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 标量子查询：投影、WHERE 比较、相关子查询、空结果与错误路径
+#[test]
+fn scalar_subquery() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("scalar");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE s (id INT PRIMARY KEY, tag TEXT, v INT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO s VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',7),(5,'c',1)",
+            &[],
+        )
+        .unwrap();
+
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 非关联：投影里当常量用
+    assert_eq!(
+        rows(&mut session, "SELECT (SELECT MAX(v) FROM s) AS biggest"),
+        vec![vec![Value::Int(20)]]
+    );
+    // WHERE 里比较（AVG 是 REAL，8.6）
+    assert_eq!(
+        rows(&mut session, "SELECT id FROM s WHERE v > (SELECT AVG(v) FROM s) ORDER BY id"),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+    // 相关：每行统计同 tag 行数
+    assert_eq!(
+        rows(
+            &mut session,
+            "SELECT id, (SELECT COUNT(*) FROM s y WHERE y.tag = s.tag) AS n FROM s ORDER BY id"
+        ),
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Int(3), Value::Int(2)],
+            vec![Value::Int(4), Value::Int(2)],
+            vec![Value::Int(5), Value::Int(1)],
+        ]
+    );
+    // 空结果 → NULL（不是错误）
+    assert_eq!(
+        rows(&mut session, "SELECT (SELECT v FROM s WHERE 1 = 0)"),
+        vec![vec![Value::Null]]
+    );
+    // 嵌在算术和 CTE 里都行
+    assert_eq!(
+        rows(
+            &mut session,
+            "SELECT (SELECT MAX(v) FROM s) - (SELECT MIN(v) FROM s) AS span"
+        ),
+        vec![vec![Value::Int(19)]]
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT (WITH x AS (SELECT v FROM s) SELECT SUM(v) FROM x)"),
+        vec![vec![Value::Int(43)]]
+    );
+
+    // 写语句的 WHERE 也支持
+    match session
+        .execute(
+            "UPDATE s SET v = 0 WHERE v = (SELECT MIN(v) FROM s)",
+            &[],
+        )
+        .unwrap()
+    {
+        QueryResult::Update { updated } => assert_eq!(updated, 1),
+        other => panic!("期望 UPDATE，得到 {:?}", other),
+    }
+
+    // 错误路径：多行 / 多列
+    let err = session
+        .execute("SELECT (SELECT v FROM s)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    assert!(err.message.contains("1 行"), "{}", err.message);
+    let err = session
+        .execute("SELECT (SELECT id, v FROM s WHERE id = 1)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    assert!(err.message.contains("1 列"), "{}", err.message);
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// INSERT ... SELECT：列映射、聚合结果、自引用的原子性
 #[test]
 fn insert_from_select() {
@@ -2733,12 +2827,55 @@ fn exists_and_correlated_subquery() {
         0
     );
 
-    // EXISTS 出现在投影里 → 明确报错，而不是莫名 NOT_FOUND
+    // EXISTS 出现在 SELECT 列表：支持（逐行解析成布尔）
+    match session
+        .execute("SELECT id, EXISTS (SELECT 1 FROM s y WHERE y.tag = s.tag) AS has_same_tag FROM s ORDER BY id", &[])
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Bool(true)],
+                vec![Value::Int(2), Value::Bool(true)],
+                vec![Value::Int(3), Value::Bool(true)],
+                vec![Value::Int(4), Value::Bool(true)],
+                vec![Value::Int(5), Value::Bool(true)],
+            ],
+            "自己和自己同 tag，恒为真"
+        ),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // 关联版：排除自己之后同 tag 还有更大的 v
+    match session
+        .execute(
+            "SELECT id, EXISTS (SELECT 1 FROM s y WHERE y.tag = s.tag AND y.v > s.v) AS has_bigger \
+             FROM s ORDER BY id",
+            &[],
+        )
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Bool(true)],
+                vec![Value::Int(2), Value::Bool(false)],
+                vec![Value::Int(3), Value::Bool(true)],
+                vec![Value::Int(4), Value::Bool(false)],
+                vec![Value::Int(5), Value::Bool(false)],
+            ]
+        ),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // HAVING 里仍然不支持（HAVING 走聚合求值，没有行上下文）
     let err = session
-        .execute("SELECT EXISTS (SELECT 1 FROM s) FROM s", &[])
+        .execute(
+            "SELECT COUNT(*) FROM s HAVING EXISTS (SELECT 1 FROM s)",
+            &[],
+        )
         .unwrap_err();
     assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
-    assert!(err.message.contains("WHERE"), "{}", err.message);
+    assert!(err.message.contains("HAVING"), "{}", err.message);
 
     session.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);

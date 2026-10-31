@@ -190,7 +190,7 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 |---|---|
 | DDL | `CREATE TABLE`（列级 PK/NOT NULL/UNIQUE/DEFAULT/**AUTO_INCREMENT**、表级 PK、IF NOT EXISTS）、`DROP TABLE`、`CREATE/DROP [UNIQUE] INDEX`、`ALTER TABLE`（`ADD [COLUMN]` / `DROP [COLUMN]` / `RENAME COLUMN a TO b` / `RENAME TO c`） |
 | DML | `INSERT INTO t [(列)] VALUES (...),(...)`、`INSERT INTO t [(列)] SELECT ...`、`INSERT ... ON CONFLICT [(列)] DO UPDATE SET ... / DO NOTHING`（UPSERT，可用 `EXCLUDED.列` 引用待插入行）、`UPDATE ... SET ... [WHERE]`、`DELETE FROM ... [WHERE]`、`TRUNCATE [TABLE] t` |
-| 查询 | `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`/`UNION [ALL]`、`INNER/LEFT/CROSS JOIN`（左深树，嵌套循环）、`IN (SELECT ...)`（非关联单列）、**派生表** `FROM (SELECT ...) AS t`、**CTE** `WITH x AS (...) SELECT ... FROM x`、**`EXISTS` / `NOT EXISTS`**（支持相关子查询） |
+| 查询 | `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`/`UNION [ALL]`、`INNER/LEFT/CROSS JOIN`（左深树，嵌套循环）、`IN (SELECT ...)`（非关联单列）、**派生表** `FROM (SELECT ...) AS t`、**CTE** `WITH x AS (...) SELECT ... FROM x`、**`EXISTS` / `NOT EXISTS`**（支持相关子查询）、**标量子查询** `(SELECT ...)` |
 | 事务 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` |
 | 元命令 | `SHOW TABLES`、`DESCRIBE t`、`EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` |
 | 表达式 | 算术、比较、`AND/OR/NOT`、`IS [NOT] NULL`、`IN (...)`、`BETWEEN`、`LIKE`、`CAST(x AS 类型)`、`?` 参数 |
@@ -198,7 +198,10 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | 日期时间 | `DATE_ADD(d, n, unit)` / `DATE_SUB(d, n, unit)`（unit: `day/week/hour/minute/second/month/year`）、`DATEDIFF(a, b)`、`YEAR MONTH DAY HOUR MINUTE SECOND`、`TO_DATE(d)`、`DATE_FORMAT(d, '%Y-%m-%d %H:%M:%S')` |
 | JSON | `JSON_EXTRACT(j, '$.a.b[0]')`、`JSON_TYPE(j)`、`JSON_VALID(j)`、`JSON_ARRAY_LENGTH(j)` |
 
-**不支持**：`RIGHT/FULL JOIN`、标量子查询、`ANY/ALL`、窗口函数、视图/触发器/序列。
+**不支持**：`RIGHT/FULL JOIN`、`ANY/ALL`、窗口函数、视图/触发器/序列。
+标量子查询 `(SELECT ...)` 必须返回**一行一列**：无行 → `NULL`，多行/多列 → 明确报错
+（提示加 `LIMIT 1` 或改用聚合）；可用在 `WHERE`、`JOIN ... ON`、`SELECT` 列表与
+`UPDATE/DELETE` 的 `WHERE` 里，支持相关子查询（外层行作为内层上下文）。
 `ALTER TABLE` 的列变更通过「影子表重建」实现：**表 id 会变、行号会重排、数据完整保留**，
 索引按列名迁移。
 

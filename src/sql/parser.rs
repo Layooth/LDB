@@ -1207,6 +1207,14 @@ impl Parser {
             TokenKind::Punct => {
                 if token.text == "(" {
                     self.advance();
+                    // `(SELECT ...)` = 标量子查询（只返回一行一列）
+                    if self.at_keyword("SELECT") || self.at_keyword("WITH") {
+                        let query = self.parse_select_body()?;
+                        self.expect_punct(")")?;
+                        return Ok(Expr::ScalarSubquery {
+                            query: Box::new(query),
+                        });
+                    }
                     let inner = self.parse_expr()?;
                     self.expect_punct(")")?;
                     return Ok(inner);

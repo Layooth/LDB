@@ -1165,6 +1165,101 @@ fn range_index_scan() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 锁中毒不能让整个服务不可用：旧实现里 `unwrap()` 会把一次 panic
+/// 放大成「之后每个请求都 500」
+#[test]
+fn lock_poisoning_does_not_brick_service() {
+    use littledb::sql::executor::ConnSession;
+    use littledb::sql::QueryResult;
+    use std::sync::{Arc, RwLock};
+
+    let dir = temp_dir("poison");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        setup(&mut engine).unwrap();
+        engine.close().unwrap();
+    }
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+
+    // 持写锁时 panic → 锁进入中毒状态
+    let poisoner = Arc::clone(&engine);
+    let join = std::thread::spawn(move || {
+        let _guard = poisoner.write().unwrap();
+        panic!("故意制造锁中毒（测试）");
+    });
+    assert!(join.join().is_err(), "线程应 panic");
+    assert!(engine.read().is_err(), "锁应处于中毒状态");
+
+    // 之后依然能读、能写、能提交
+    let mut session = ConnSession::new(Arc::clone(&engine));
+    match session.execute("SELECT COUNT(*) FROM players", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(0)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    session
+        .execute("INSERT INTO players VALUES (1,'after-poison',0)", &[])
+        .unwrap();
+    match session.execute("SELECT COUNT(*) FROM players", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    drop(session);
+
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(engine.scan("players").unwrap().len(), 1, "写入应已持久化");
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 删除只打标记、不改 freeOffset：不整理页内死空间的话，
+/// 反复「插入-删除」会让表文件一路涨（旧实现里 compact_page 是死代码）
+#[test]
+fn deleted_space_is_reclaimed() {
+    let dir = temp_dir("reclaim");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+
+    for round in 0..30 {
+        engine
+            .write(|e| -> Result<()> {
+                for i in 0..50 {
+                    e.insert(
+                        "players",
+                        vec![
+                            Value::Int(round * 100 + i),
+                            Value::Text(format!("n{}-{}", round, i)),
+                            Value::Int(0),
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        engine
+            .write(|e| -> Result<()> {
+                let rows = e.scan("players")?;
+                for (row_id, _) in rows {
+                    e.delete("players", row_id)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let stats = engine.stats();
+    // 不回收时每轮 50 行记录（≈31B/行）都会永久占位，30 轮要十几页；
+    // 回收后只剩 slot 目录（6B/行）的增长，约 3 页
+    assert!(
+        stats.pages <= 4,
+        "删除后的空间应被复用，实际 {} 页",
+        stats.pages
+    );
+    assert_eq!(engine.scan("players").unwrap().len(), 0);
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// EXPLAIN 必须反映真实决策：范围索引 / 复合索引前缀 / LIMIT 下推
 #[test]
 fn explain_matches_real_access_path() {

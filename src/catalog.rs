@@ -145,15 +145,7 @@ impl Catalog {
     /// tmp 必须先 fsync：WAL 截断后 catalog 是唯一凭证，
     /// 掉电时 rename 到位的文件不能是空/半截内容。
     pub fn save(&self, path: &Path) -> Result<()> {
-        let text = self.to_json().to_string();
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = fs::File::create(&tmp)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, path)?;
-        Ok(())
+        write_atomic(path, &self.to_json().to_string())
     }
 
     pub fn to_json(&self) -> Json {
@@ -215,6 +207,21 @@ impl Catalog {
             ("tables".to_string(), Json::Arr(tables)),
         ])
     }
+}
+
+/// 原子写任意 catalog 文本（tmp + fsync + rename）。
+///
+/// 恢复路径用：WAL 里的 catalog 记录是一段 JSON 文本，不经过 `Catalog` 结构，
+/// 但同样不能用 `fs::write` 裸写——恢复中途掉电会留下半截 catalog。
+pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn parse_table(value: &Json) -> Result<TableDef> {

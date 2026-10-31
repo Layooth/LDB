@@ -22,6 +22,31 @@ use super::eval::{
 use super::parser::Parser;
 use super::AGGREGATES;
 
+/// 引擎读锁：锁中毒时沿用内部数据而不是 panic。
+///
+/// 中毒只发生在「持锁线程 panic」之后，此时数据本身仍是自洽的
+/// （写路径都是临界区内完成、失败即回滚）；为了一个线程的 panic
+/// 让整个服务不可用，代价远大于收益。
+fn engine_read(engine: &RwLock<Engine>) -> std::sync::RwLockReadGuard<'_, Engine> {
+    engine
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 表级写锁：同上，中毒不扩散
+fn table_write(guard: &RwLock<()>) -> std::sync::RwLockWriteGuard<'_, ()> {
+    guard
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 引擎写锁：同上，中毒不扩散
+fn engine_write(engine: &RwLock<Engine>) -> std::sync::RwLockWriteGuard<'_, Engine> {
+    engine
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ------------------------------------------------------------------ 结果
 
 #[derive(Debug, Clone)]
@@ -469,10 +494,7 @@ impl ConnSession {
 
         if needs_write {
             let (outcome, barrier, seq) = {
-                let mut guard = self
-                    .engine
-                    .write()
-                    .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+                let mut guard = engine_write(&self.engine);
                 let mut results = Vec::new();
                 for stmt in &statements {
                     let r = execute_on(
@@ -488,15 +510,12 @@ impl ConnSession {
                 let seq = guard.store.last_commit_seq();
                 (QueryResult::Batch { results }, barrier, seq)
             };
-            if self.engine.read().unwrap().store.durable_commits() {
+            if engine_read(&self.engine).store.durable_commits() {
                 barrier.wait_for(seq)?;
             }
             Ok(outcome)
         } else {
-            let guard = self
-                .engine
-                .read()
-                .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+            let guard = engine_read(&self.engine);
             let committed_only = guard.store.in_txn();
             let mut results = Vec::new();
             for stmt in &statements {
@@ -517,9 +536,9 @@ impl ConnSession {
 
     pub fn close(&mut self) {
         if self.in_txn {
-            if let Ok(mut guard) = self.engine.write() {
-                guard.rollback(self.session_id);
-            }
+            // 中毒也要回滚：否则未提交事务会一直挂在 store.txns 里
+            let mut guard = engine_write(&self.engine);
+            guard.rollback(self.session_id);
             self.in_txn = false;
         }
     }
@@ -1808,7 +1827,7 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
     // 表级写锁：同表 DML 串行（页内容冲突要求）。
     // 注意调用方已持引擎全局写锁，跨表并行当前并不成立（见 ConnSession 的说明）
     let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
-    let _table_guard = table_guard.write().unwrap();
+    let _table_guard = table_write(&table_guard);
     let mut position: HashMap<String, usize> = HashMap::with_capacity(columns.len());
     for (i, column) in columns.iter().enumerate() {
         position.insert(column.name.to_lowercase(), i);
@@ -1868,7 +1887,7 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
 fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
     let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
-    let _table_guard = table_guard.write().unwrap();
+    let _table_guard = table_write(&table_guard);
     let mut position: HashMap<String, usize> = HashMap::with_capacity(columns.len());
     for (i, column) in columns.iter().enumerate() {
         position.insert(column.name.to_lowercase(), i);
@@ -1919,7 +1938,7 @@ fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Resu
 fn exec_delete(engine: &mut Engine, stmt: &DeleteStmt, params: &[Value]) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
     let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
-    let _table_guard = table_guard.write().unwrap();
+    let _table_guard = table_write(&table_guard);
     let snapshot = engine.scan(&stmt.table)?;
     if snapshot.len() > MAX_SCAN_ROWS {
         return Err(scan_limit_error());

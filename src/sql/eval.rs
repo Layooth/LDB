@@ -303,7 +303,7 @@ pub fn eval(expr: &Expr, ctx: &RowContext, params: &[Value]) -> Result<Value> {
             }
             let text = value.as_text();
             let pattern_text = pattern_value.as_text();
-            let matched = like_match(&text, &pattern_text);
+            let matched = like_match(&text, &pattern_text)?;
             Ok(Value::Bool(if *negated { !matched } else { matched }))
         }
     }
@@ -389,11 +389,17 @@ fn decimal_arith(op: BinOp, av: i128, ascale: u8, bv: i128, bscale: u8) -> Resul
     // 加/减/取模：对齐到较大标度后整数运算
     if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mod) {
         let scale = ascale.max(bscale);
+        let a_factor = 10i128
+            .checked_pow((scale - ascale) as u32)
+            .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
+        let b_factor = 10i128
+            .checked_pow((scale - bscale) as u32)
+            .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
         let a = av
-            .checked_mul(10i128.pow((scale - ascale) as u32))
+            .checked_mul(a_factor)
             .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
         let b = bv
-            .checked_mul(10i128.pow((scale - bscale) as u32))
+            .checked_mul(b_factor)
             .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
         let v = match op {
             BinOp::Add => a.checked_add(b),
@@ -415,10 +421,18 @@ fn decimal_arith(op: BinOp, av: i128, ascale: u8, bv: i128, bscale: u8) -> Resul
         let v = av
             .checked_mul(bv)
             .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
-        return Ok(Value::Decimal {
-            v,
-            scale: ascale + bscale,
-        });
+        // 标度是 u8：直接相加会溢出；同时不能超过列的标度上限
+        let scale = ascale.checked_add(bscale).ok_or_else(|| {
+            DbError::type_error("DECIMAL 乘法结果标度溢出（两个操作数标度都过大）")
+        })?;
+        if scale > crate::codec::DECIMAL_MAX_SCALE {
+            return Err(DbError::type_error(format!(
+                "DECIMAL 乘法结果标度 {} 超过上限 {}，请先用 ROUND/CAST 收敛",
+                scale,
+                crate::codec::DECIMAL_MAX_SCALE
+            )));
+        }
+        return Ok(Value::Decimal { v, scale });
     }
 
     // 除：结果标度取较大者（截断），v = av · 10^(bscale - ascale + scale) / bv
@@ -520,19 +534,38 @@ fn arith(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
     }
 }
 
+/// LIKE 回溯步数上限。
+///
+/// 双指针回溯的内存是 O(1)，但「多个 % 交叉回溯」的最坏时间是 O(n·m)：
+/// 2MB 请求体足以构造出 10^12 量级的比较次数（CPU 慢查询 / 拖垮服务）。
+/// 超过预算直接报错，而不是让查询跑到天荒地老。
+const MAX_LIKE_STEPS: usize = 5_000_000;
+
 /// `%` 匹配任意长度，`_` 匹配单个字符。
 ///
-/// 贪心双指针回溯匹配：时间 O(n+m)、内存 O(1)。
+/// 贪心双指针回溯匹配：常规情况 O(n+m)、内存 O(1)。
 /// 之前的 O(n·m) DP 表在「长文本 × 长模式」下会分配巨量内存
 /// （2MB 请求即可要求约 1TB），必须避免。
-pub fn like_match(text: &str, pattern: &str) -> bool {
+pub fn like_match(text: &str, pattern: &str) -> Result<bool> {
     let text: Vec<char> = text.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
     let (mut i, mut j) = (0usize, 0usize);
     // 最近一个 '%' 及其当前尝试匹配到的 text 位置，失配时从它回溯
     let mut star: Option<(usize, usize)> = None;
+    let mut steps = 0usize;
 
     while i < text.len() {
+        steps += 1;
+        if steps > MAX_LIKE_STEPS {
+            return Err(DbError::new(
+                crate::error::LIMIT,
+                format!(
+                    "LIKE 匹配规模过大（文本 {} 字符 × 模式 {} 字符），请缩短文本或改用更具体的前缀",
+                    text.len(),
+                    pattern.len()
+                ),
+            ));
+        }
         if j < pattern.len() && (pattern[j] == '_' || pattern[j] == text[i]) {
             i += 1;
             j += 1;
@@ -545,13 +578,13 @@ pub fn like_match(text: &str, pattern: &str) -> bool {
             i = star_i + 1;
             star = Some((star_j, star_i + 1));
         } else {
-            return false;
+            return Ok(false);
         }
     }
     while j < pattern.len() && pattern[j] == '%' {
         j += 1;
     }
-    j == pattern.len()
+    Ok(j == pattern.len())
 }
 
 fn eval_scalar(
@@ -601,8 +634,17 @@ fn eval_scalar(
             let value = eval(&args[0], ctx, params)?;
             match value {
                 Value::Null => Ok(Value::Null),
-                Value::Int(n) => Ok(Value::Int(n.abs())),
+                // i64::MIN 没有对应的正数：debug 会 panic、release 会静默回绕成负数，
+                // 两种情况都不可接受，直接报错
+                Value::Int(n) => n
+                    .checked_abs()
+                    .map(Value::Int)
+                    .ok_or_else(|| DbError::type_error("ABS 结果超出 INT 范围（绝对值溢出）")),
                 Value::Real(n) => Ok(Value::Real(n.abs())),
+                Value::Decimal { v, scale } => v
+                    .checked_abs()
+                    .map(|abs| Value::Decimal { v: abs, scale })
+                    .ok_or_else(|| DbError::type_error("ABS 结果超出 DECIMAL 范围")),
                 other => Err(DbError::type_error(format!(
                     "ABS 需要数字，实际是 \"{}\"",
                     other.as_text()
@@ -619,13 +661,28 @@ fn eval_scalar(
             }
             let digits = if args.len() == 2 {
                 let d = eval(&args[1], ctx, params)?;
-                d.as_f64().unwrap_or(0.0) as i32
+                if d.is_null() {
+                    return Ok(Value::Null);
+                }
+                d.as_f64().map(|n| n as i32).unwrap_or(0)
             } else {
                 0
             };
+            // 位数必须限制：10f64.powi(400) = inf、powi(-400) = 0，
+            // 会让结果变成 inf/NaN 并写进结果集
+            const MAX_ROUND_DIGITS: i32 = 30;
+            if !(-MAX_ROUND_DIGITS..=MAX_ROUND_DIGITS).contains(&digits) {
+                return Err(DbError::type_error(format!(
+                    "ROUND 的小数位数必须在 {}..={} 之间，实际是 {}",
+                    -MAX_ROUND_DIGITS, MAX_ROUND_DIGITS, digits
+                )));
+            }
             let number = value
                 .as_f64()
                 .ok_or_else(|| DbError::type_error("ROUND 需要数字"))?;
+            if !number.is_finite() {
+                return Err(DbError::type_error("ROUND 需要有限数字"));
+            }
             let factor = 10f64.powi(digits);
             let rounded = (number * factor).round() / factor;
             if rounded.fract() == 0.0 && rounded.abs() < 9007199254740992.0 {
@@ -850,13 +907,14 @@ mod tests {
 
     #[test]
     fn like_patterns() {
-        assert!(like_match("alice", "a%"));
-        assert!(like_match("alice", "%ice"));
-        assert!(like_match("ace", "a_e"));
-        assert!(!like_match("alice", "a_e"), "_ 只匹配单个字符");
-        assert!(like_match("alice", "%"));
-        assert!(!like_match("alice", "b%"));
-        assert!(like_match("中文测试", "中文%"));
+        let m = |text: &str, pattern: &str| like_match(text, pattern).unwrap();
+        assert!(m("alice", "a%"));
+        assert!(m("alice", "%ice"));
+        assert!(m("ace", "a_e"));
+        assert!(!m("alice", "a_e"), "_ 只匹配单个字符");
+        assert!(m("alice", "%"));
+        assert!(!m("alice", "b%"));
+        assert!(m("中文测试", "中文%"));
     }
 
     #[test]
@@ -987,7 +1045,7 @@ mod tests {
         ];
         for (text, pattern, expected) in cases {
             assert_eq!(
-                like_match(text, pattern),
+                like_match(text, pattern).unwrap(),
                 expected,
                 "'{}' LIKE '{}'",
                 text,
@@ -995,8 +1053,30 @@ mod tests {
             );
         }
         // 多个 % 交叉回溯的对抗样例
-        assert!(like_match("aaab", "a%a%a%b"));
-        assert!(!like_match("aaab", "a%a%a%c"));
+        assert!(like_match("aaab", "a%a%a%b").unwrap());
+        assert!(!like_match("aaab", "a%a%a%c").unwrap());
+    }
+
+    /// 对抗样例：`%aaaa…ab` 对长串 a 是 O(n·m) 量级
+    /// （每次回溯都要重扫整段模式），必须撞上步数预算并快速报错
+    #[test]
+    fn like_backtracking_is_budgeted() {
+        let text = "a".repeat(50_000);
+        let pattern = format!("%{}b", "a".repeat(2_000));
+        let start = std::time::Instant::now();
+        let outcome = like_match(&text, &pattern);
+        assert_eq!(
+            outcome.as_ref().err().map(|e| e.code),
+            Some(crate::error::LIMIT),
+            "应撞上步数预算并报 LIMIT_EXCEEDED"
+        );
+        assert!(
+            start.elapsed().as_millis() < 2_000,
+            "应在预算内快速返回，实际 {:?}",
+            start.elapsed()
+        );
+        // 同样规模但可快速判定的模式不受影响
+        assert!(like_match(&text, "%aaaa%").unwrap());
     }
 
     #[test]
@@ -1006,7 +1086,7 @@ mod tests {
         let text = "a".repeat(200_000);
         let pattern = "%".to_string() + &"a".repeat(199_999);
         let start = std::time::Instant::now();
-        assert!(like_match(&text, &pattern));
+        assert!(like_match(&text, &pattern).unwrap());
         assert!(start.elapsed().as_millis() < 1000, "应远快于 1 秒");
     }
 
@@ -1034,6 +1114,45 @@ mod tests {
         }
         assert_eq!(eval_int("SELECT -9223372036854775807 - 1"), Value::Int(i64::MIN));
         assert_eq!(eval_int("SELECT 3 * 4"), Value::Int(12));
+    }
+
+    /// 标量函数的边界：一律报类型错误，不允许 panic / 回绕 / inf
+    #[test]
+    fn scalar_edge_cases_are_rejected() {
+        fn eval_expr(sql: &str) -> Result<Value> {
+            match Parser::parse(sql)? {
+                crate::sql::Statement::Select(select) => {
+                    eval(&select.items[0].expr, &RowContext::new(&[], Vec::new()), &[])
+                }
+                other => panic!("期望 SELECT，得到 {:?}", other),
+            }
+        }
+
+        // ABS(i64::MIN)：没有对应的正数（旧实现 debug panic / release 回绕成负数）
+        let err = eval_expr("SELECT ABS(CAST('-9223372036854775808' AS INT))").unwrap_err();
+        assert_eq!(err.code, crate::error::TYPE, "{}", err.message);
+
+        // ROUND 位数过大：10f64.powi(400) = inf，会把 inf/NaN 写进结果
+        let err = eval_expr("SELECT ROUND(1.5, 400)").unwrap_err();
+        assert_eq!(err.code, crate::error::TYPE, "{}", err.message);
+        let err = eval_expr("SELECT ROUND(1.5, -400)").unwrap_err();
+        assert_eq!(err.code, crate::error::TYPE, "{}", err.message);
+        match eval_expr("SELECT ROUND(1.2345, 2)").unwrap() {
+            Value::Real(n) => assert!((n - 1.23).abs() < 1e-9, "{}", n),
+            other => panic!("期望 REAL，得到 {:?}", other),
+        }
+
+        // DECIMAL 乘法标度 9 + 9 = 18 > 上限 9：必须报错而不是溢出
+        let err = eval_expr(
+            "SELECT CAST('1.000000000' AS DECIMAL(20,9)) * CAST('2.000000000' AS DECIMAL(20,9))",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::TYPE, "{}", err.message);
+        // 小标度乘法仍然精确
+        assert_eq!(
+            eval_expr("SELECT CAST('1.25' AS DECIMAL(10,2)) * CAST('2' AS DECIMAL(10,0))").unwrap(),
+            Value::Decimal { v: 250, scale: 2 }
+        );
     }
 
     #[test]

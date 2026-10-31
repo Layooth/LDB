@@ -14,6 +14,11 @@ use crate::store::{IndexOp, Store};
 /// 页内剩余空间低于此值时不再作为插入候选（避免碎片化）
 const FREE_PAGE_MIN: i32 = 128;
 
+/// 页内死空间超过此值就整理回收。
+/// 删除只打标记、不动 freeOffset，不整理的话反复「插入-删除」的页
+/// 会一直显示「没空间」，表文件只能一路涨到 256MB 上限。
+const RECLAIM_MIN_BYTES: usize = 512;
+
 /// row_id = (page_no << 16) | slot，page_no 只有 16 位可用，
 /// 超过上限后 row_id 会与前面的页冲突（静默数据损坏），必须显式拒绝。
 pub const MAX_PAGES_PER_TABLE: u32 = 65535;
@@ -429,6 +434,17 @@ fn insert_physical(store: &mut Store, table: &mut Table, record: &[u8]) -> Resul
                 return Ok(make_row_id(page_no, slot));
             }
             None => {
+                // 页可能只是被死空间占满：整理一次再试，仍失败才放弃
+                if pg::dead_space(&page) >= RECLAIM_MIN_BYTES && pg::compact_page(&mut page) {
+                    if let Some(slot) = pg::insert_record(&mut page, record) {
+                        let space = pg::free_space(&page);
+                        store.dirty_page(table.id, page_no, page)?;
+                        if space < FREE_PAGE_MIN {
+                            table.free_pages.remove(&page_no);
+                        }
+                        return Ok(make_row_id(page_no, slot));
+                    }
+                }
                 table.free_pages.remove(&page_no);
             }
         }
@@ -484,7 +500,25 @@ fn delete_physical(store: &mut Store, table: &mut Table, row_id: u32) -> Result<
     }
     store.dirty_page(table.id, page_no, page)?;
     table.free_pages.insert(page_no);
+    // 死空间够多就顺手整理：否则这一页会「看起来满、实际半空」，
+    // 后续插入只能不断分配新页（UPDATE 也走这条路径）
+    reclaim_page_space(store, table.id, page_no)?;
     Ok(true)
+}
+
+/// 回收单页的死空间。
+///
+/// `compact_page` 保留 slot 编号，所以活跃行的 rowId 不变（索引不用改）；
+/// 整理结果作为本事务的脏页写回，回滚时随之丢弃，不会影响已提交数据。
+fn reclaim_page_space(store: &mut Store, table_id: u32, page_no: u32) -> Result<()> {
+    let mut page = store.read_page(table_id, page_no)?;
+    if pg::dead_space(&page) < RECLAIM_MIN_BYTES {
+        return Ok(());
+    }
+    if pg::compact_page(&mut page) {
+        store.dirty_page(table_id, page_no, page)?;
+    }
+    Ok(())
 }
 
 pub fn insert(store: &mut Store, table: &mut Table, values: Vec<Value>) -> Result<u32> {

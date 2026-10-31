@@ -66,6 +66,22 @@ pub fn free_space(page: &Page) -> i32 {
     free_offset(page) as i32 - (HEADER_SIZE as i32 + slot_count(page) as i32 * SLOT_SIZE as i32)
 }
 
+/// 页内死空间：已删除记录仍然占着的字节数，也就是 `compact_page` 能回收的量。
+///
+/// 删除只打标记、不动 `freeOffset`，所以 `free_space` 完全看不出来——
+/// 反复「插入-删除」的页会一直显示「没空间」，只能不断分配新页。
+pub fn dead_space(page: &Page) -> usize {
+    let count = slot_count(page);
+    let mut dead = 0usize;
+    for slot in 0..count {
+        let pos = slot_pos(slot);
+        if page[pos + 4] & FLAG_DELETED != 0 {
+            dead += read_u16(page, pos + 2) as usize;
+        }
+    }
+    dead
+}
+
 fn slot_pos(slot: u16) -> usize {
     HEADER_SIZE + slot as usize * SLOT_SIZE
 }

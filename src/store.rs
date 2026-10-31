@@ -53,9 +53,17 @@ impl CommitBarrier {
         }
     }
 
+    /// 状态锁：中毒时沿用内部状态，而不是让整个数据库不可用
+    /// （屏障状态就是两个序号 + 一个错误串，持锁线程 panic 不会让它不自洽）
+    fn lock(&self) -> std::sync::MutexGuard<'_, BarrierState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// 提交线程发布「已写入 OS 缓存」的新序号
     fn publish(&self, seq: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         if seq > state.last_written {
             state.last_written = seq;
         }
@@ -65,7 +73,7 @@ impl CommitBarrier {
 
     /// 后台线程确认 fsync 覆盖到 seq（保守：只标记它醒来时看到的快照）
     fn mark_synced(&self, seq: u64, err: Option<String>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         if err.is_some() {
             state.error = err;
         }
@@ -80,7 +88,7 @@ impl CommitBarrier {
     /// 带超时兜底，避免极端丢通知时永久挂起。
     pub fn wait_for(&self, seq: u64) -> Result<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         loop {
             if let Some(err) = &state.error {
                 return Err(crate::error::DbError::internal(format!(
@@ -103,37 +111,40 @@ impl CommitBarrier {
             let (guard, _) = self
                 .cv
                 .wait_timeout(state, Duration::from_millis(200))
-                .unwrap();
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = guard;
         }
     }
 
     /// 等待全部已写入的提交落盘（checkpoint / close 前 drain）
     fn wait_all(&self) -> Result<()> {
-        let seq = self.state.lock().unwrap().last_written;
+        let seq = self.lock().last_written;
         self.wait_for(seq)
     }
 
     fn error(&self) -> Option<String> {
-        self.state.lock().unwrap().error.clone()
+        self.lock().error.clone()
     }
 
     fn shutdown(&self) {
-        self.state.lock().unwrap().shutting_down = true;
+        self.lock().shutting_down = true;
         self.cv.notify_all();
     }
 
     /// 后台线程：阻塞直到有新工作或关闭；返回 (快照序号, 是否关闭中)
     fn wait_for_work(&self, synced_upto: u64) -> (u64, bool) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         while state.last_written == synced_upto && !state.shutting_down {
-            state = self.cv.wait(state).unwrap();
+            state = self
+                .cv
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         (state.last_written, state.shutting_down)
     }
 
     fn drained(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.lock();
         state.last_synced >= state.last_written
     }
 }
@@ -395,7 +406,8 @@ impl Store {
                 self.write_page_raw(*table_id, *page_no, data)?;
             }
             WalRecord::Catalog { json, .. } => {
-                fs::write(&self.catalog_path, json.as_bytes())?;
+                // 恢复也要原子写：重放中途掉电不能留下半截 catalog
+                crate::catalog::write_atomic(&self.catalog_path, json)?;
             }
             WalRecord::Commit { .. } => {}
         }

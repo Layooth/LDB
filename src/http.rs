@@ -674,11 +674,26 @@ fn new_session_id() -> String {
     id
 }
 
-fn health(state: &HttpState) -> Result<Json> {
-    let engine = state
+/// 引擎读锁：锁中毒时沿用内部数据。
+/// 中毒只发生在「持锁线程 panic」之后，数据本身自洽；为一个请求线程的
+/// panic 让整个服务持续返回 500 不划算。
+fn read_engine(state: &HttpState) -> std::sync::RwLockReadGuard<'_, Engine> {
+    state
         .engine
         .read()
-        .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 引擎写锁：同上
+fn write_engine(state: &HttpState) -> std::sync::RwLockWriteGuard<'_, Engine> {
+    state
+        .engine
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn health(state: &HttpState) -> Result<Json> {
+    let engine = read_engine(state);
     let stats = engine.store.stats();
     let total_rows: u64 = engine.tables.iter().map(|t| t.row_count as u64).sum();
 
@@ -734,10 +749,7 @@ fn health(state: &HttpState) -> Result<Json> {
 }
 
 fn list_tables(state: &HttpState) -> Result<Json> {
-    let engine = state
-        .engine
-        .read()
-        .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+    let engine = read_engine(state);
 
     let names = engine.table_names();
     let mut items = Vec::with_capacity(names.len());
@@ -762,10 +774,7 @@ fn list_tables(state: &HttpState) -> Result<Json> {
 }
 
 fn schema(state: &HttpState) -> Result<Json> {
-    let engine = state
-        .engine
-        .read()
-        .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+    let engine = read_engine(state);
 
     let mut items = Vec::new();
     for table in &engine.tables {
@@ -878,10 +887,7 @@ fn table_rows(
         .max(0);
 
     {
-        let engine = state
-            .engine
-            .read()
-            .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+        let engine = read_engine(state);
         if engine.table(&name).is_err() {
             return Err(DbError::not_found(format!("表 \"{}\" 不存在", name)));
         }
@@ -900,10 +906,7 @@ fn table_rows(
     };
 
     let (total, schema_json) = {
-        let engine = state
-            .engine
-            .read()
-            .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+        let engine = read_engine(state);
         let table = engine.table(&name)?;
         (table.row_count, describe_table(table))
     };
@@ -943,17 +946,8 @@ fn alter_table(
         _ => return Err(DbError::syntax("缺少数组字段 columns")),
     };
 
-    let durable = {
-        let engine = state
-            .engine
-            .read()
-            .map_err(|_| DbError::internal("数据库锁状态异常"))?;
-        engine.store.durable_commits()
-    };
-    let mut engine = state
-        .engine
-        .write()
-        .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+    let durable = { read_engine(state).store.durable_commits() };
+    let mut engine = write_engine(state);
     engine.ensure_ddl_exclusive(crate::engine::INTERNAL_TXN_OWNER)?;
 
     // 重建是「删表 + 建表 + 逐行写回」，必须在单个事务里完成

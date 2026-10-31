@@ -683,7 +683,7 @@ fn run_with_engine(
 ) -> Result<QueryResult> {
     match statement {
         Statement::Select(select) => {
-            exec_select(engine, select, params, committed_only, Some(owner))
+            exec_select(engine, select, params, committed_only, Some(owner), None)
         }
         Statement::Insert(insert) => exec_insert(engine, insert, params, owner),
         Statement::Update(update) => exec_update(engine, update, params, owner),
@@ -748,7 +748,7 @@ fn run_read_only(
 ) -> Result<QueryResult> {
     match statement {
         Statement::Select(select) => {
-            exec_select(engine, select, params, committed_only, Some(owner))
+            exec_select(engine, select, params, committed_only, Some(owner), None)
         }
         Statement::ShowTables => {
             let mut tables = Vec::new();
@@ -897,7 +897,7 @@ fn resolve_subqueries(
             negated,
         } => {
             let inner = resolve_subqueries(engine, expr, params, committed_only, owner)?;
-            let result = exec_select(engine, query, params, committed_only, owner)?;
+            let result = exec_select(engine, query, params, committed_only, owner, None)?;
             let values = match result {
                 QueryResult::Select {
                     columns, rows, ..
@@ -1000,6 +1000,7 @@ fn select_base(
     params: &[Value],
     committed_only: bool,
     owner: Option<u64>,
+    outer: Option<std::rc::Rc<RowContext>>,
 ) -> Result<(Vec<String>, Vec<String>, Vec<(Vec<Value>, Vec<Value>)>)> {
     // ---------------------------------------------------------------- 行来源
     // 先解析 WHERE 里的子查询（索引候选与行过滤都用转换后的条件）
@@ -1056,9 +1057,17 @@ fn select_base(
                                 table,
                                 owner,
                                 |_row_id, values| {
-                                    let row = RowContext::from_tables(&sources, values);
+                                    let row = RowContext::from_tables(&sources, values)
+                                        .with_parent(outer.clone());
                                     if let Some(where_clause) = &where_clause {
-                                        if !matches(&eval(where_clause, &row, params)?) {
+                                        if !matches(&eval_condition(
+                                            engine,
+                                            where_clause,
+                                            &row,
+                                            params,
+                                            committed_only,
+                                            owner,
+                                        )?) {
                                             return Ok(true);
                                         }
                                     }
@@ -1082,7 +1091,8 @@ fn select_base(
             }
             // JOIN 树，或 committed_only 的单表（绕开含未提交键的索引）
             source => {
-                let (p, rows) = join_frame(engine, source, committed_only, params, owner)?;
+                let (p, rows) =
+                    join_frame(engine, source, committed_only, params, owner, outer.clone())?;
                 plans = p;
                 raw_rows = rows;
             }
@@ -1096,7 +1106,7 @@ fn select_base(
         Some(rows) => rows,
         None => raw_rows
             .into_iter()
-            .map(|values| RowContext::from_tables(&sources, values))
+            .map(|values| RowContext::from_tables(&sources, values).with_parent(outer.clone()))
             .collect(),
     };
 
@@ -1106,7 +1116,7 @@ fn select_base(
         if !where_applied {
             let mut kept = Vec::with_capacity(rows.len());
             for row in rows {
-                let value = eval(where_clause, &row, params)?;
+                let value = eval_condition(engine, where_clause, &row, params, committed_only, owner)?;
                 if matches(&value) {
                     kept.push(row);
                 }
@@ -1269,7 +1279,11 @@ fn infer_expr_type(expr: &Expr, plans: &[TablePlan]) -> String {
                 }
             }
         },
-        Expr::IsNull { .. } | Expr::InList { .. } | Expr::InSubquery { .. } | Expr::Like { .. }
+        Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Like { .. }
+        | Expr::Exists { .. }
         | Expr::Between { .. } => "BOOL".to_string(),
         Expr::Function { name, args, .. } => {
             let upper = name.to_uppercase();
@@ -1340,19 +1354,20 @@ pub(crate) fn exec_select(
     params: &[Value],
     committed_only: bool,
     owner: Option<u64>,
+    outer: Option<std::rc::Rc<RowContext>>,
 ) -> Result<QueryResult> {
     // CTE 先展开成派生表（展开后 ctes 为空，不会再递归）
     if !stmt.ctes.is_empty() {
         let expanded = expand_ctes(stmt)?;
-        return exec_select(engine, &expanded, params, committed_only, owner);
+        return exec_select(engine, &expanded, params, committed_only, owner, outer);
     }
 
     let (columns, mut types, mut pairs) =
-        select_base(engine, stmt, params, committed_only, owner)?;
+        select_base(engine, stmt, params, committed_only, owner, outer.clone())?;
 
     if let Some((kind, right)) = &stmt.union {
         let (rcolumns, rtypes, mut rpairs) =
-            select_base(engine, right, params, committed_only, owner)?;
+            select_base(engine, right, params, committed_only, owner, outer)?;
         if rcolumns.len() != columns.len() {
             return Err(DbError::syntax(format!(
                 "UNION 两侧列数不一致：左侧 {} 列，右侧 {} 列",
@@ -1446,6 +1461,7 @@ fn join_frame(
     committed_only: bool,
     params: &[Value],
     owner: Option<u64>,
+    outer: Option<std::rc::Rc<RowContext>>,
 ) -> Result<(Vec<TablePlan>, Vec<Vec<Value>>)> {
     match source {
         TableSource::Table { name, alias } => {
@@ -1466,7 +1482,7 @@ fn join_frame(
         // 空 table_name 就是「不是真表」的标记（索引辅助等路径靠它识别）。
         TableSource::Derived { query, alias } => {
             let (columns, types, rows) =
-                run_subquery(engine, query, params, committed_only, owner)?;
+                run_subquery(engine, query, params, committed_only, owner, outer.clone())?;
             let cols: Vec<Column> = columns
                 .iter()
                 .zip(types.iter())
@@ -1492,8 +1508,10 @@ fn join_frame(
             kind,
             on,
         } => {
-            let (lplans, lrows) = join_frame(engine, left, committed_only, params, owner)?;
-            let (rplans, rrows) = join_frame(engine, right, committed_only, params, owner)?;
+            let (lplans, lrows) =
+                join_frame(engine, left, committed_only, params, owner, outer.clone())?;
+            let (rplans, rrows) =
+                join_frame(engine, right, committed_only, params, owner, outer.clone())?;
             let left_width: usize = lplans.iter().map(|p| p.columns.len()).sum();
             let total_width = left_width + rplans.iter().map(|p| p.columns.len()).sum::<usize>();
 
@@ -1532,8 +1550,16 @@ fn join_frame(
                                         // ON 可能还带其它条件，候选行统一再过滤
                                         if let Some(on_expr) = on {
                                             let ctx =
-                                                RowContext::from_tables(&sources, combined.clone());
-                                            if !matches(&eval(on_expr, &ctx, params)?) {
+                                                RowContext::from_tables(&sources, combined.clone())
+                                                    .with_parent(outer.clone());
+                                            if !matches(&eval_condition(
+                                                engine,
+                                                on_expr,
+                                                &ctx,
+                                                params,
+                                                committed_only,
+                                                owner,
+                                            )?) {
                                                 continue;
                                             }
                                         }
@@ -1566,8 +1592,16 @@ fn join_frame(
                             let combined = concat_rows(lrow, rrow);
                             let pass = match on {
                                 Some(on_expr) => {
-                                    let ctx = RowContext::from_tables(&sources, combined.clone());
-                                    matches(&eval(on_expr, &ctx, params)?)
+                                    let ctx = RowContext::from_tables(&sources, combined.clone())
+                                        .with_parent(outer.clone());
+                                    matches(&eval_condition(
+                                        engine,
+                                        on_expr,
+                                        &ctx,
+                                        params,
+                                        committed_only,
+                                        owner,
+                                    )?)
                                 }
                                 None => true,
                             };
@@ -1688,6 +1722,126 @@ fn find_join_assist(
     Ok(None)
 }
 
+/// 表达式里是否含 EXISTS（含就得走「先解析、再求值」的慢路径）
+fn expr_has_exists(expr: &Expr) -> bool {
+    match expr {
+        Expr::Exists { .. } => true,
+        Expr::Binary { left, right, .. } => expr_has_exists(left) || expr_has_exists(right),
+        Expr::Unary { operand, .. } => expr_has_exists(operand),
+        Expr::IsNull { expr, .. } => expr_has_exists(expr),
+        Expr::InList { expr, list, .. } => {
+            expr_has_exists(expr) || list.iter().any(expr_has_exists)
+        }
+        Expr::InSubquery { expr, .. } => expr_has_exists(expr),
+        Expr::Cast { expr, .. } => expr_has_exists(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_exists(expr) || expr_has_exists(low) || expr_has_exists(high),
+        Expr::Like { expr, pattern, .. } => expr_has_exists(expr) || expr_has_exists(pattern),
+        Expr::Function { args, .. } => args.iter().any(expr_has_exists),
+        _ => false,
+    }
+}
+
+/// 把 EXISTS 子查询就地求值成布尔字面量。
+///
+/// `eval` 拿不到引擎、也没法在求值中途执行查询，所以在这里预处理：
+/// **当前行**被当作子查询的外层上下文传进去，相关子查询就是这么实现的。
+fn resolve_exists(
+    engine: &Engine,
+    expr: &Expr,
+    ctx: &RowContext,
+    params: &[Value],
+    committed_only: bool,
+    owner: Option<u64>,
+) -> Result<Expr> {
+    let resolve = |inner: &Expr| resolve_exists(engine, inner, ctx, params, committed_only, owner);
+    Ok(match expr {
+        Expr::Exists { query } => {
+            let outer = std::rc::Rc::new(ctx.clone());
+            let (_, _, rows) =
+                run_subquery(engine, query, params, committed_only, owner, Some(outer))?;
+            Expr::Literal(Literal::Bool(!rows.is_empty()))
+        }
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(resolve(left)?),
+            right: Box::new(resolve(right)?),
+        },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op: *op,
+            operand: Box::new(resolve(operand)?),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(resolve(expr)?),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(resolve(expr)?),
+            list: list.iter().map(&resolve).collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(resolve(expr)?),
+            low: Box::new(resolve(low)?),
+            high: Box::new(resolve(high)?),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(resolve(expr)?),
+            pattern: Box::new(resolve(pattern)?),
+            negated: *negated,
+        },
+        Expr::Cast { expr, ty, scale } => Expr::Cast {
+            expr: Box::new(resolve(expr)?),
+            ty: *ty,
+            scale: *scale,
+        },
+        Expr::Function {
+            name,
+            args,
+            distinct,
+            star,
+        } => Expr::Function {
+            name: name.clone(),
+            args: args.iter().map(&resolve).collect::<Result<Vec<_>>>()?,
+            distinct: *distinct,
+            star: *star,
+        },
+        // 其它形态（列、字面量、参数、IN 子查询……）与 EXISTS 无关，原样保留
+        other => other.clone(),
+    })
+}
+
+/// 条件求值：含 EXISTS 时先按当前行解析成布尔，再走普通求值。
+fn eval_condition(
+    engine: &Engine,
+    expr: &Expr,
+    ctx: &RowContext,
+    params: &[Value],
+    committed_only: bool,
+    owner: Option<u64>,
+) -> Result<Value> {
+    if !expr_has_exists(expr) {
+        return eval(expr, ctx, params);
+    }
+    let resolved = resolve_exists(engine, expr, ctx, params, committed_only, owner)?;
+    eval(&resolved, ctx, params)
+}
+
 /// 把 CTE 引用展开成派生表。
 ///
 /// CTE 只在本语句内可见，所以展开比在执行器里维护命名空间简单得多：
@@ -1757,8 +1911,9 @@ fn run_subquery(
     params: &[Value],
     committed_only: bool,
     owner: Option<u64>,
+    outer: Option<std::rc::Rc<RowContext>>,
 ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
-    match exec_select(engine, stmt, params, committed_only, owner)? {
+    match exec_select(engine, stmt, params, committed_only, owner, outer)? {
         QueryResult::Select {
             columns,
             types,
@@ -1991,8 +2146,11 @@ fn extract_range_columns(
                 if let Expr::Column { name, .. } = expr.as_ref() {
                     let mut entry = out.entry(name.clone()).or_default();
                     let empty = RowContext::new(&[], Vec::new());
-                    let lo = eval(low, &empty, params)?;
-                    let hi = eval(high, &empty, params)?;
+                    // 求值失败 = 不是常量（例如相关子查询里引用了外层列），跳过这条约束
+                    let (Ok(lo), Ok(hi)) = (eval(low, &empty, params), eval(high, &empty, params))
+                    else {
+                        continue;
+                    };
                     if !lo.is_null() && !hi.is_null() {
                         merge_lower(&mut entry, lo, true);
                         merge_upper(&mut entry, hi, true);
@@ -2025,7 +2183,10 @@ fn extract_range_columns(
                     _ => continue,
                 };
                 if let Expr::Column { name, .. } = column_expr {
-                    let bound = eval(operand, &empty, params)?;
+                    // 求值失败 = 不是常量（相关子查询会引用外层列），跳过这条约束
+                    let Ok(bound) = eval(operand, &empty, params) else {
+                        continue;
+                    };
                     if bound.is_null() {
                         continue;
                     }
@@ -2371,7 +2532,8 @@ fn exec_update(
     for (row_id, values) in rows {
         let ctx = RowContext::new(&columns, values.clone());
         if let Some(where_clause) = &where_clause {
-            let value = eval(where_clause, &ctx, params)?;
+            // 写语句的 WHERE 也支持 EXISTS（相关子查询会用当前行作外层上下文）
+            let value = eval_condition(engine, where_clause, &ctx, params, false, Some(owner))?;
             if !matches(&value) {
                 continue;
             }
@@ -2428,7 +2590,8 @@ fn exec_delete(
     for (row_id, values) in rows {
         if let Some(where_clause) = &where_clause {
             let ctx = RowContext::new(&columns, values);
-            let value = eval(where_clause, &ctx, params)?;
+            // 写语句的 WHERE 也支持 EXISTS（相关子查询会用当前行作外层上下文）
+            let value = eval_condition(engine, where_clause, &ctx, params, false, Some(owner))?;
             if !matches(&value) {
                 continue;
             }

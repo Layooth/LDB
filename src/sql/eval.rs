@@ -20,6 +20,8 @@ pub struct RowContext {
     ambiguous: std::collections::HashSet<String>,
     /// 本行涉及的表别名（小写）
     aliases: Vec<String>,
+    /// 外层查询的行（相关子查询用）：本层找不到的列向外层找
+    parent: Option<std::rc::Rc<RowContext>>,
 }
 
 impl RowContext {
@@ -36,7 +38,14 @@ impl RowContext {
             qualified: HashMap::new(),
             ambiguous: std::collections::HashSet::new(),
             aliases: Vec::new(),
+            parent: None,
         }
+    }
+
+    /// 挂上外层行（相关子查询）：本地找不到的列会向外层解析。
+    pub fn with_parent(mut self, parent: Option<std::rc::Rc<RowContext>>) -> RowContext {
+        self.parent = parent;
+        self
     }
 
     /// JOIN 组合行：sources = [(别名, 列定义, 在 values 中的起始下标)]
@@ -66,6 +75,7 @@ impl RowContext {
             qualified,
             ambiguous,
             aliases,
+            parent: None,
         }
     }
 
@@ -87,23 +97,30 @@ impl RowContext {
         ctx
     }
 
-    /// qualifier：`u.name` 里的 `u`；单表行传 None
+    /// qualifier：`u.name` 里的 `u`；单表行传 None。
+    ///
+    /// 相关子查询：本层找不到时向外层（`parent`）继续找——
+    /// 标准语义是「内层优先」，所以本地命中就直接返回，不会因为外层同名而报歧义。
     pub fn field(&self, qualifier: Option<&str>, name: &str) -> Result<&Value> {
         let name_lc = name.to_lowercase();
         if let Some(qualifier) = qualifier {
             let q_lc = qualifier.to_lowercase();
-            if !self.aliases.iter().any(|a| *a == q_lc) {
+            if let Some(value) = self.qualified.get(&format!("{}.{}", q_lc, name_lc)) {
+                return Ok(value);
+            }
+            if self.aliases.iter().any(|a| *a == q_lc) {
                 return Err(DbError::not_found(format!(
-                    "表或别名 \"{}\" 不在本次查询中",
-                    qualifier
+                    "列 \"{}.{}\" 不存在",
+                    qualifier, name
                 )));
             }
-            return self
-                .qualified
-                .get(&format!("{}.{}", q_lc, name_lc))
-                .ok_or_else(|| {
-                    DbError::not_found(format!("列 \"{}.{}\" 不存在", qualifier, name))
-                });
+            if let Some(parent) = &self.parent {
+                return parent.field(Some(qualifier), name);
+            }
+            return Err(DbError::not_found(format!(
+                "表或别名 \"{}\" 不在本次查询中",
+                qualifier
+            )));
         }
         if self.ambiguous.contains(&name_lc) {
             return Err(DbError::syntax(format!(
@@ -111,9 +128,13 @@ impl RowContext {
                 name
             )));
         }
-        self.fields
-            .get(&name_lc)
-            .ok_or_else(|| DbError::not_found(format!("列 \"{}\" 不存在", name)))
+        if let Some(value) = self.fields.get(&name_lc) {
+            return Ok(value);
+        }
+        if let Some(parent) = &self.parent {
+            return parent.field(None, name);
+        }
+        Err(DbError::not_found(format!("列 \"{}\" 不存在", name)))
     }
 }
 
@@ -187,6 +208,13 @@ pub fn eval(expr: &Expr, ctx: &RowContext, params: &[Value]) -> Result<Value> {
             .ok_or_else(|| DbError::syntax(format!("缺少第 {} 个参数", index + 1))),
 
         Expr::Column { name, table } => ctx.field(table.as_deref(), name).cloned(),
+
+        // EXISTS 要执行子查询，而 eval 手里没有引擎：
+        // 执行器在逐行求值前会用 resolve_exists 把它换成布尔字面量。
+        // 走到这里说明写在了不支持的位置（例如 SELECT 列表/ORDER BY）。
+        Expr::Exists { .. } => Err(DbError::syntax(
+            "EXISTS 只能用在 WHERE 或 JOIN ... ON 条件里（暂不支持 SELECT 列表、ORDER BY、HAVING）",
+        )),
 
         Expr::Unary { op, operand } => {
             let value = eval(operand, ctx, params)?;
@@ -1179,7 +1207,8 @@ mod tests {
         let stmt = Parser::parse("SELECT 9007199254740993").unwrap();
         let result = match stmt {
             crate::sql::Statement::Select(select) => {
-                crate::sql::executor::exec_select(&test_engine(), &select, &[], false, None).unwrap()
+                crate::sql::executor::exec_select(&test_engine(), &select, &[], false, None, None)
+                    .unwrap()
             }
             other => panic!("期望 SELECT，得到 {:?}", other),
         };

@@ -2122,6 +2122,103 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// EXISTS / NOT EXISTS，含相关子查询（引用外层列）
+#[test]
+fn exists_and_correlated_subquery() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("exists");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE s (id INT PRIMARY KEY, tag TEXT, v INT)", &[])
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO s VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',7),(5,'c',1)",
+            &[],
+        )
+        .unwrap();
+
+    let ids = |session: &mut Session, sql: &str| -> Vec<i64> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| match &row[0] {
+                    Value::Int(n) => *n,
+                    other => panic!("期望 INT，得到 {:?}", other),
+                })
+                .collect(),
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 非关联：子查询为真 → 全表命中；为假 → 一行不命中
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM s WHERE EXISTS (SELECT 1 FROM s WHERE v > 15) ORDER BY id"),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert!(
+        ids(
+            &mut session,
+            "SELECT id FROM s WHERE EXISTS (SELECT 1 FROM s WHERE v > 999)"
+        )
+        .is_empty()
+    );
+
+    // 关联：同 tag 里存在更大的 v
+    assert_eq!(
+        ids(
+            &mut session,
+            "SELECT id FROM s x WHERE EXISTS \
+             (SELECT 1 FROM s y WHERE y.tag = x.tag AND y.v > x.v) ORDER BY id"
+        ),
+        vec![1, 3]
+    );
+    // NOT EXISTS 是补集
+    assert_eq!(
+        ids(
+            &mut session,
+            "SELECT id FROM s x WHERE NOT EXISTS \
+             (SELECT 1 FROM s y WHERE y.tag = x.tag AND y.v > x.v) ORDER BY id"
+        ),
+        vec![2, 4, 5]
+    );
+    // 与其它条件组合（EXISTS 只是 WHERE 的一部分）
+    assert_eq!(
+        ids(
+            &mut session,
+            "SELECT id FROM s x WHERE x.v > 5 AND EXISTS \
+             (SELECT 1 FROM s y WHERE y.tag = x.tag AND y.v > x.v) ORDER BY id"
+        ),
+        vec![1]
+    );
+
+    // 写语句的 WHERE 也支持（同一条解析路径）
+    assert_eq!(
+        match session
+            .execute(
+                "DELETE FROM s WHERE EXISTS (SELECT 1 FROM s y WHERE y.v > 900)",
+                &[]
+            )
+            .unwrap()
+        {
+            QueryResult::Delete { deleted } => deleted,
+            other => panic!("期望 DELETE，得到 {:?}", other),
+        },
+        0
+    );
+
+    // EXISTS 出现在投影里 → 明确报错，而不是莫名 NOT_FOUND
+    let err = session
+        .execute("SELECT EXISTS (SELECT 1 FROM s) FROM s", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    assert!(err.message.contains("WHERE"), "{}", err.message);
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// CTE（WITH）：只在当前语句可见，可链式引用、可重复引用
 #[test]
 fn cte_with_clause() {

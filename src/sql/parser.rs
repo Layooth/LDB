@@ -1230,6 +1230,16 @@ impl Parser {
                     self.advance();
                     Ok(Expr::Literal(Literal::Null))
                 }
+                // EXISTS (SELECT ...)
+                "EXISTS" => {
+                    self.advance();
+                    self.expect_punct("(")?;
+                    let query = self.parse_select_body()?;
+                    self.expect_punct(")")?;
+                    Ok(Expr::Exists {
+                        query: Box::new(query),
+                    })
+                }
                 // UPSERT 的 `EXCLUDED.列`：引用「本次想插入的那一行」
                 "EXCLUDED" => {
                     self.advance();

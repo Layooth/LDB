@@ -317,59 +317,197 @@ HTTP 的 `/api/sql` 语义完全一致（客户端可据此做兼容）。
 | `SESSION_BUSY` | 503 | 同一 `X-Session-Id` 还有请求在执行，等待超时（带 `Retry-After`） |
 | `INTERNAL_ERROR` | 400 | 内部错误（含待恢复状态） |
 
-### JS 客户端 SDK
+## 客户端接入（各语言）
 
-`sdk/littledb.js`：零依赖，浏览器（`window.LittleDB.createClient`）与 Node 18+ 通用。
+所有客户端都走同一个 HTTP 端点。先记住这几条**语言无关**的约定，后面每种语言都一样：
+
+| 约定 | 说明 |
+|---|---|
+| 端点 | `POST /api/sql`，body：`{"sql": "...", "params": [...]}`（`?` 占位） |
+| 认证 | 请求头 `Authorization: Bearer <token>`（未配 token 则不需要） |
+| 会话 | 响应头 `X-Session-Id`，**后续请求原样带回**即可让 `BEGIN` 的事务跨请求延续 |
+| 响应 | 成功 `{"ok":true,"result":{...}}`；失败 `{"ok":false,"error":{"code","message"}}` |
+| select 结果 | `{type:"select", columns, types, rows, rowCount}`，`types` 与列一一对应 |
+| insert 结果 | `{type:"insert", inserted, updated, skipped, ids, lastId}`（自增 id 直接拿） |
+| 错误 → 状态码 | `AUTH_FAILED`→401、`NOT_FOUND`→404、`WRITE_CONFLICT`→409、`RATE_LIMITED`→429、`SESSION_BUSY`→503、其余 400；429/503 带 `Retry-After` |
+| 值的形态 | `DECIMAL` 是**字符串**（不过浮点）；`INT/REAL/BOOL` 是 JSON 数值/布尔；日期时间是文本 |
+
+其它 REST 端点：`GET /api/health`（健康，免认证）、`GET /api/schema`（全表结构，含 DECIMAL 标度）、
+`GET /api/tables`、`GET /api/tables/<名>?limit&offset`（分页取行）、`DELETE /api/tables/<名>`（删表）。
+
+### Node.js / 浏览器（SDK）
+
+`sdk/littledb.js`：零依赖，Node 18+ 与浏览器（`window.LittleDB.createClient`）通用。
+完整可运行的示例见 `sdk/demo-app.js`。
 
 ```js
-const { createClient } = require('./sdk/littledb.js');
-const db = createClient('http://127.0.0.1:7802', { token: '...' });
+const { createClient } = require('./littledb.js');
+const db = createClient('http://127.0.0.1:7802', { token: 'dev-token' });
 
-await db.sql('CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, price DECIMAL(10,2))');
+// 建表（启动时跑一次，IF NOT EXISTS 幂等）
+await db.sql(`CREATE TABLE IF NOT EXISTS tasks (
+    id INT PRIMARY KEY AUTO_INCREMENT, title TEXT NOT NULL,
+    price DECIMAL(10,2), status TEXT DEFAULT 'todo')`);
 
-const ins = await db.insert('t', [{ name: 'a', price: '1.50' }]);   // {inserted, ids, lastId}
-const rows = await db.rows('SELECT id, name, price FROM t');        // [{id, name, price:'1.50'}]
-const { types } = await db.query('SELECT id, price FROM t');        // ['INT','DECIMAL']
+// 插入 → 直接拿回自增 id
+const a = await db.insert('tasks', [{ title: '写周报', price: '19.99' }]);
+// → { inserted: 1, ids: [1], lastId: 1 }
 
-await db.upsert('t', [{ id: 1, name: 'a2' }], ['id'], ['name']);    // ON CONFLICT DO UPDATE
-await db.transaction(async () => {                                  // 抛错自动 ROLLBACK
-  await db.sql("INSERT INTO t (name) VALUES ('c')");
+// 查询 → 行字典；要列类型用 query()
+await db.rows('SELECT id, title, price FROM tasks ORDER BY id');
+(await db.query('SELECT id, price FROM tasks')).types;   // ['INT', 'DECIMAL']
+
+// UPSERT：按主键有则更新（只改指定列）
+await db.upsert('tasks', [{ id: 1, title: '改' }], ['id'], ['title']);
+
+// 事务：抛错自动 ROLLBACK（回调里必须用同一个 db）
+await db.transaction(async () => {
+  await db.sql('INSERT INTO tasks (title) VALUES (?)', ['b']);
 });
+
+// 分页 / 元数据 / 删表
+const page = await db.table('tasks', { limit: 20, offset: 0 });  // total/objects/schema
+await db.schema();  await db.dropTable('tasks');
 ```
 
-封装掉的东西：`X-Session-Id` 自动续传（事务跨请求）、错误码映射到
-`LittleDBError#code / #status / #retryAfterMs`、`DECIMAL` 保持字符串、
-`insert`/`upsert` 自动拼 `?` 参数、`transaction()` 失败自动回滚（可配 `{retries}` 重试写冲突）。
+SDK 封装掉的：会话头自动续传、错误 → `LittleDBError#code/#status/#retryAfterMs`、
+`insert/upsert` 自动拼参数、事务失败回滚（`{retries}` 可重试写冲突）。
+测试：`node sdk/test.js`（需 `LDB_BASE`/`LDB_TOKEN` 环境变量）。
 
-测试：`LDB_BASE=http://127.0.0.1:7802 LDB_TOKEN=xxx node sdk/test.js`（`tools/verify.ps1` 已包含这一项）。
+### Python（SDK）
 
-### Python 客户端 SDK
-
-`sdk/littledb.py`：只用标准库（Python 3.8+），能力与 JS 版对齐。
+`sdk/littledb.py`：只用标准库（3.8+），能力与 JS 版对齐。
 
 ```python
 from littledb import connect
+import datetime, decimal
 
-db = connect("http://127.0.0.1:7802", token="...")
+db = connect("http://127.0.0.1:7802", token="dev-token")
 
-db.sql("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, price DECIMAL(10,2))")
+db.sql("CREATE TABLE IF NOT EXISTS tasks (id INT PRIMARY KEY AUTO_INCREMENT,"
+       " title TEXT NOT NULL, price DECIMAL(10,2), at DATETIME)")
 
-ins = db.insert("t", [{"name": "a", "price": "1.50"}])   # ins.ids == [1], ins.last_id == 1
-rows = db.rows("SELECT id, name, price FROM t")          # [{'id': 1, 'name': 'a', 'price': '1.50'}]
-types = db.query("SELECT id, price FROM t").types        # ['INT', 'DECIMAL']
+ins = db.insert("tasks", [{"title": "写周报",
+                           "price": decimal.Decimal("19.99"),
+                           "at": datetime.datetime(2026, 11, 1, 9, 0, 0)}])
+print(ins.ids, ins.last_id)            # [1] 1
 
-db.upsert("t", [{"id": 1, "name": "a2"}], ["id"], ["name"])
+rows = db.rows("SELECT id, title, price FROM tasks")   # DECIMAL 是字符串
+print(db.query("SELECT id, price FROM tasks").types)   # ['INT', 'DECIMAL']
 
-with db.transaction():                                   # 抛异常自动 ROLLBACK
-    db.sql("INSERT INTO t (name) VALUES ('b')")
+db.upsert("tasks", [{"id": 1, "title": "改"}], ["id"], ["title"])
 
-db.transaction(lambda c: c.sql("INSERT INTO t (name) VALUES ('c')"), retries=2)
+with db.transaction():                  # 抛异常自动 ROLLBACK
+    db.sql("INSERT INTO tasks (title) VALUES (?)", ["b"])
+
+db.transaction(lambda c: c.sql("INSERT INTO tasks (title) VALUES ('c')"), retries=2)
 ```
 
-`datetime`/`date`/`Decimal` 参数会自动转成服务端接受的文本（不经过浮点）；
-错误抛 `LittleDBError`（`.code` / `.status` / `.retry_after` / `.retryable`）。
+`datetime`/`date`/`Decimal` 参数自动转成服务端接受的文本；错误抛
+`LittleDBError`（`.code` / `.status` / `.retry_after` / `.retryable`）。
+测试：`python sdk/test_littledb.py`（同样读 `LDB_BASE`/`LDB_TOKEN`）。
 
-测试：`LDB_BASE=... LDB_TOKEN=... python sdk/test_littledb.py`（`tools/verify.ps1` 已包含）。
+### 原生 HTTP：curl / PowerShell
+
+不想带 SDK（或写脚本、连 CI）时直接打端点：
+
+```bash
+# 执行 SQL
+curl -s http://127.0.0.1:7802/api/sql \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"sql":"INSERT INTO tasks (title) VALUES (?)","params":["curl 插入"]}'
+# → {"ok":true,"result":{"type":"insert","inserted":1,"ids":[4],"lastId":4,...}}
+
+# 事务 = 同一个 X-Session-Id 里 BEGIN ... COMMIT
+SID=$(curl -s -D - -o /dev/null http://127.0.0.1:7802/api/health | grep -i x-session-id | tr -d '\r' | cut -d' ' -f2)
+curl -s http://127.0.0.1:7802/api/sql -H "Authorization: Bearer dev-token" -H "X-Session-Id: $SID" \
+  -d '{"sql":"BEGIN"}'
+curl -s http://127.0.0.1:7802/api/sql -H "Authorization: Bearer dev-token" -H "X-Session-Id: $SID" \
+  -d '{"sql":"INSERT INTO tasks (title) VALUES ('\''tx'\'')"}'
+curl -s http://127.0.0.1:7802/api/sql -H "Authorization: Bearer dev-token" -H "X-Session-Id: $SID" \
+  -d '{"sql":"COMMIT"}'
+```
+
+```powershell
+$h = @{ Authorization = "Bearer dev-token" }
+$r = Invoke-RestMethod -Uri "http://127.0.0.1:7802/api/sql" -Method Post `
+     -Headers $h -ContentType "application/json" `
+     -Body '{"sql":"SELECT id, price FROM tasks ORDER BY id"}'
+$r.result.rows          # [[1, '19.99'], ...]
+$r.result.types         # ['INT', 'DECIMAL']
+```
+
+### 其它语言：照 HTTP 约定直接调
+
+任何能发 HTTP + JSON 的语言都能用；下面是最小示例（生产使用建议照
+`sdk/littledb.js` 的做法把会话头与错误处理封一层，代码不到一百行）：
+
+**Java（11+ HttpClient）**
+
+```java
+HttpClient http = HttpClient.newHttpClient();
+var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:7802/api/sql"))
+    .header("Authorization", "Bearer dev-token")
+    .header("Content-Type", "application/json")
+    .POST(HttpRequest.BodyPublishers.ofString(
+        "{\"sql\":\"SELECT id, price FROM tasks\",\"params\":[]}"))
+    .build();
+var response = http.send(request, HttpResponse.BodyHandlers.ofString());
+// response.headers().firstValue("X-Session-Id") → 事务要回传的会话 id
+// response.body() → {"ok":true,"result":{...}}
+```
+
+**C#（HttpClient）**
+
+```csharp
+using var http = new HttpClient();
+http.DefaultRequestHeaders.Add("Authorization", "Bearer dev-token");
+var content = new StringContent(
+    "{\"sql\":\"SELECT id, price FROM tasks\",\"params\":[]}",
+    Encoding.UTF8, "application/json");
+var response = await http.PostAsync("http://127.0.0.1:7802/api/sql", content);
+if (response.Headers.TryGetValues("X-Session-Id", out var sid)) { /* 存起来 */ }
+var body = await response.Content.ReadAsStringAsync();   // {"ok":true,"result":{...}}
+```
+
+**Go（net/http）**
+
+```go
+req, _ := http.NewRequest("POST", "http://127.0.0.1:7802/api/sql",
+    strings.NewReader(`{"sql":"SELECT 1 AS one","params":[]}`))
+req.Header.Set("Authorization", "Bearer dev-token")
+req.Header.Set("Content-Type", "application/json")
+resp, err := http.DefaultClient.Do(req)
+// sid := resp.Header.Get("X-Session-Id")
+// json.Unmarshal(body, &payload)  → payload["result"]
+```
+
+**PHP（curl 扩展）**
+
+```php
+$ch = curl_init('http://127.0.0.1:7802/api/sql');
+curl_setopt_array($ch, [
+    CURLOPT_POST => true,
+    CURLOPT_HTTPHEADER => ['Authorization: Bearer dev-token', 'Content-Type: application/json'],
+    CURLOPT_POSTFIELDS => '{"sql":"SELECT 1 AS one","params":[]}',
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_HEADERFUNCTION => function ($ch, $line) {   // 记下 X-Session-Id
+        if (stripos($line, 'x-session-id:') === 0) { $GLOBALS['sid'] = trim(explode(':', $line)[1]); }
+        return strlen($line);
+    },
+]);
+$payload = json_decode(curl_exec($ch), true);   // $payload['result']
+```
+
+### 接入核对表（最容易踩的几处）
+
+1. **DECIMAL 是字符串**：算钱别用浮点，客户端直接按字符串展示或用 `Decimal` 类型；
+2. **事务必须带同一个 `X-Session-Id`**：不带的话每条语句是独立自动提交；
+3. **错误先看 `error.code` 再看 HTTP 状态**：`WRITE_CONFLICT`/`RATE_LIMITED`/`SESSION_BUSY`
+   都是「等会儿重试」，响应里有 `Retry-After`；
+4. **改表结构用 `ALTER TABLE`**：列变更走影子表重建，数据保留但表 id 会变（应用无感知）；
+5. **大结果用 `LIMIT`/分页**：结果整体物化，单帧上限 16MB。
 
 ## 限制一览
 

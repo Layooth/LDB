@@ -1011,3 +1011,90 @@ fn incremental_checkpoint_drains_over_multiple_calls() {
     engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Tier2：不同表的并发写真正并行（吞吐显著高于同表串行）
+#[test]
+fn concurrent_writes_to_different_tables_scale() {
+    use littledb::sql::executor::ConnSession;
+    use littledb::sql::QueryResult;
+    use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
+
+    let dir = temp_dir("parwrite");
+    {
+        let mut engine = Engine::open(&dir).unwrap();
+        setup(&mut engine).unwrap();
+        engine
+            .write(|e| -> Result<()> {
+                e.create_table("notes", vec![Column::new("id", ColumnType::Int)], false)
+            })
+            .unwrap();
+        engine.close().unwrap();
+    }
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+
+    // 4 会话 × 200 行：2 个写 players，2 个写 notes（不同表 → 并行）
+    let t0 = Instant::now();
+    let mut handles = Vec::new();
+    for tid in 0..4 {
+        let engine = Arc::clone(&engine);
+        handles.push(std::thread::spawn(move || {
+            let mut s = ConnSession::new(engine);
+            for i in 0..200 {
+                let sql = if tid % 2 == 0 {
+                    format!("INSERT INTO players VALUES ({}, 'p{}-{}', 0)", tid * 1000 + i, tid, i)
+                } else {
+                    format!("INSERT INTO notes VALUES ({})", tid * 1000 + i)
+                };
+                s.execute(&sql, &[]).unwrap_or_else(|e| panic!("并发写失败: {}", e));
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let multi_elapsed = t0.elapsed();
+
+    let mut check = ConnSession::new(Arc::clone(&engine));
+    match check.execute("SELECT COUNT(*) FROM players", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(400)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    match check.execute("SELECT COUNT(*) FROM notes", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(400)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // 对照：同样的 400 行全部写同一张表（表锁串行）
+    let t0 = Instant::now();
+    let mut handles = Vec::new();
+    for tid in 0..4 {
+        let engine = Arc::clone(&engine);
+        handles.push(std::thread::spawn(move || {
+            let mut s = ConnSession::new(engine);
+            for i in 0..200 {
+                s.execute(
+                    &format!("INSERT INTO notes VALUES ({})", 10000 + tid * 1000 + i),
+                    &[],
+                )
+                .unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let same_elapsed = t0.elapsed();
+
+    println!(
+        "multi-table(2 tables): {:?}, same-table: {:?}",
+        multi_elapsed, same_elapsed
+    );
+    let _ = Duration::from_secs(0);
+
+    drop(check);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1473,6 +1473,9 @@ fn index_candidates(
 
 fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
+    // 表级写锁：同表 DML 串行（页内容冲突要求），跨表 DML 并行
+    let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
+    let _table_guard = table_guard.write().unwrap();
     let mut position: HashMap<String, usize> = HashMap::with_capacity(columns.len());
     for (i, column) in columns.iter().enumerate() {
         position.insert(column.name.to_lowercase(), i);
@@ -1531,6 +1534,8 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
 
 fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
+    let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
+    let _table_guard = table_guard.write().unwrap();
     let mut position: HashMap<String, usize> = HashMap::with_capacity(columns.len());
     for (i, column) in columns.iter().enumerate() {
         position.insert(column.name.to_lowercase(), i);
@@ -1576,6 +1581,8 @@ fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Resu
 
 fn exec_delete(engine: &mut Engine, stmt: &DeleteStmt, params: &[Value]) -> Result<QueryResult> {
     let columns = engine.table(&stmt.table)?.columns.clone();
+    let table_guard = engine.table_lock(engine.table(&stmt.table)?.id);
+    let _table_guard = table_guard.write().unwrap();
     let snapshot = engine.scan(&stmt.table)?;
     let mut deleted = 0usize;
 

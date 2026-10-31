@@ -16,6 +16,10 @@ use crate::table::{self, Index, Table};
 pub struct Engine {
     pub store: Store,
     pub tables: Vec<Table>,
+    /// 每表一把写锁：DML 语句持有目标表的写锁 + 引擎的全局读锁，
+    /// 不同表的写语句可以并行，同表写语句串行（页内容冲突要求）。
+    /// 全局写锁只被提交临界区 / DDL / 事务控制持有。
+    table_locks: std::sync::Mutex<std::collections::HashMap<u32, std::sync::Arc<std::sync::RwLock<()>>>>,
 }
 
 /// 引擎内部隐式事务（engine.write）的属主 id；
@@ -32,7 +36,11 @@ impl Engine {
         for def in &defs {
             tables.push(Table::load(&mut store, def)?);
         }
-        Ok(Engine { store, tables })
+        Ok(Engine {
+            store,
+            tables,
+            table_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     pub fn table_index(&self, name: &str) -> Result<usize> {
@@ -50,6 +58,17 @@ impl Engine {
 
     pub fn table_names(&self) -> Vec<String> {
         self.tables.iter().map(|t| t.name.clone()).collect()
+    }
+
+    /// 获取指定表的 DML 写锁（惰性创建）
+    pub fn table_lock(&self, table_id: u32) -> std::sync::Arc<std::sync::RwLock<()>> {
+        let mut map = self
+            .table_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(table_id)
+            .or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(())))
+            .clone()
     }
 
     /// 在一个事务里执行写操作，出错自动回滚（内部属主）

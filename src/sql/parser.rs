@@ -206,6 +206,12 @@ impl Parser {
         if self.at_keyword("ALTER") {
             return self.parse_alter();
         }
+        if self.at_keyword("TRUNCATE") {
+            self.advance();
+            let _ = self.eat_keyword("TABLE");
+            let table = self.expect_ident()?;
+            return Ok(Statement::Truncate { table });
+        }
         if self.at_keyword("SHOW") {
             self.advance();
             self.expect_keyword("TABLES")?;
@@ -584,8 +590,33 @@ impl Parser {
             None
         };
 
-        self.expect_keyword("VALUES")?;
+        // 数据来源：`VALUES (...)` 或 `SELECT ...`
         let mut values = Vec::new();
+        let source_is_select = if self.eat_keyword("VALUES") {
+            false
+        } else if self.at_keyword("SELECT") || self.at_keyword("WITH") {
+            true
+        } else {
+            return Err(DbError::syntax(
+                "INSERT 后面要跟 VALUES (...) 或 SELECT ...（例如 INSERT INTO t (a) SELECT b FROM u）",
+            ));
+        };
+
+        if source_is_select {
+            let query = self.parse_select_body()?;
+            if self.at_keyword("ON") {
+                return Err(DbError::syntax(
+                    "INSERT ... SELECT 暂不支持 ON CONFLICT：先 SELECT 出来再逐行 UPSERT",
+                ));
+            }
+            return Ok(Statement::Insert(InsertStmt {
+                table,
+                columns,
+                source: InsertSource::Select(Box::new(query)),
+                on_conflict: None,
+            }));
+        }
+
         loop {
             self.expect_punct("(")?;
             let mut row = Vec::new();
@@ -649,7 +680,7 @@ impl Parser {
         Ok(Statement::Insert(InsertStmt {
             table,
             columns,
-            values,
+            source: InsertSource::Values(values),
             on_conflict,
         }))
     }
@@ -1421,7 +1452,10 @@ mod tests {
             Statement::Insert(insert) => {
                 assert_eq!(insert.table, "t");
                 assert_eq!(insert.columns.as_ref().unwrap().len(), 2);
-                assert_eq!(insert.values.len(), 2);
+                match &insert.source {
+                    InsertSource::Values(rows) => assert_eq!(rows.len(), 2),
+                    other => panic!("期望 VALUES，得到 {:?}", other),
+                }
             }
             other => panic!("期望 INSERT，得到 {:?}", other),
         }

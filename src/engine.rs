@@ -508,6 +508,44 @@ impl Engine {
         }
     }
 
+    /// 清空表数据：表结构、索引定义都保留（索引内容清空），自增游标归零。
+    ///
+    /// 实现上是**逐行删除**而不是重建文件：页内死空间会就地回收，
+    /// 而且完全走既有事务路径（回滚后数据能回来，WAL 重放也一致）。
+    /// 只收集 row_id（4 字节/行），不物化整行，所以不受查询行数上限限制。
+    pub fn truncate(&mut self, table_name: &str) -> Result<u64> {
+        let position = self.table_index(table_name)?;
+        let table_id = self.tables[position].id;
+
+        let mut ids: Vec<u32> = Vec::new();
+        {
+            let table = &self.tables[position];
+            table::scan_shared_while(&self.store, table, None, |row_id, _values| {
+                ids.push(row_id);
+                Ok(true)
+            })?;
+        }
+
+        let mut removed = 0u64;
+        for row_id in ids {
+            if table::delete(&mut self.store, &mut self.tables[position], row_id)? {
+                removed += 1;
+            }
+        }
+
+        if let Some(def) = self
+            .store
+            .catalog
+            .tables
+            .iter_mut()
+            .find(|def| def.id == table_id)
+        {
+            def.next_auto_id = 1;
+        }
+        self.store.mark_catalog_dirty()?;
+        Ok(removed)
+    }
+
     pub fn delete(&mut self, table_name: &str, row_id: u32) -> Result<bool> {
         let position = self.table_index(table_name)?;
         table::delete(&mut self.store, &mut self.tables[position], row_id)

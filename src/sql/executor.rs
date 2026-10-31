@@ -728,6 +728,7 @@ fn run_with_engine(
             engine.ensure_ddl_exclusive(owner)?;
             exec_alter_table(engine, table, action, params)
         }
+        Statement::Truncate { table } => exec_truncate(engine, table),
         Statement::ShowTables | Statement::Describe { .. } | Statement::Explain { .. } => {
             run_read_only(engine, statement, params, committed_only, owner)
         }
@@ -2378,27 +2379,62 @@ fn exec_insert(
     // 自增列分配出来的值（没有自增列时为空）
     let mut ids: Vec<i64> = Vec::new();
 
-    for row_exprs in &stmt.values {
-        if row_exprs.len() != target.len() {
-            return Err(DbError::syntax(format!(
-                "列数不匹配：期望 {} 个值，实际给了 {}",
-                target.len(),
-                row_exprs.len()
-            )));
-        }
-
-        let mut values: Vec<Value> = Vec::with_capacity(columns.len());
-        for column in &columns {
-            values.push(match &column.default {
+    // 一行「只有默认值」的底板：没写的列取默认值（没默认值就是 NULL）
+    let default_row = |columns: &[Column]| -> Vec<Value> {
+        columns
+            .iter()
+            .map(|column| match &column.default {
                 Some(default) => default.clone(),
                 None => Value::Null,
-            });
-        }
+            })
+            .collect()
+    };
 
-        for (slot, expr) in target.iter().zip(row_exprs.iter()) {
-            let raw = eval(expr, &empty, params)?;
-            values[*slot] = codec::coerce(columns[*slot].ty, columns[*slot].scale, &raw)?;
+    // 统一成「待插入的行」：VALUES 就地求值；SELECT 先跑查询（整体物化，受行数上限保护）
+    let mut source_rows: Vec<Vec<Value>> = Vec::new();
+    match &stmt.source {
+        InsertSource::Values(rows) => {
+            for row_exprs in rows {
+                if row_exprs.len() != target.len() {
+                    return Err(DbError::syntax(format!(
+                        "列数不匹配：期望 {} 个值，实际给了 {}",
+                        target.len(),
+                        row_exprs.len()
+                    )));
+                }
+                let mut values = default_row(&columns);
+                for (slot, expr) in target.iter().zip(row_exprs.iter()) {
+                    let raw = eval(expr, &empty, params)?;
+                    values[*slot] =
+                        codec::coerce(columns[*slot].ty, columns[*slot].scale, &raw)?;
+                }
+                source_rows.push(values);
+            }
         }
+        InsertSource::Select(query) => {
+            let (_, _, rows) =
+                run_subquery(&*engine, query, params, false, Some(owner), None)?;
+            if rows.len() > MAX_SCAN_ROWS {
+                return Err(scan_limit_error());
+            }
+            for row in rows {
+                if row.len() != target.len() {
+                    return Err(DbError::syntax(format!(
+                        "INSERT ... SELECT 的列数不匹配：目标 {} 列，查询返回 {} 列",
+                        target.len(),
+                        row.len()
+                    )));
+                }
+                let mut values = default_row(&columns);
+                for (slot, raw) in target.iter().zip(row.iter()) {
+                    values[*slot] = codec::coerce(columns[*slot].ty, columns[*slot].scale, raw)?;
+                }
+                source_rows.push(values);
+            }
+        }
+    }
+
+    for values in source_rows {
 
         // ---------------------------------------------------------- UPSERT
         // 冲突判定走索引（主键 / 唯一索引 / 前导列索引）：命中则更新或跳过。
@@ -2876,6 +2912,16 @@ fn kv(key: &str, value: String) -> Vec<Value> {
     vec![Value::Text(key.to_string()), Value::Text(value)]
 }
 
+/// `TRUNCATE [TABLE] t`：清空数据、保留表结构与索引定义、自增游标归零。
+fn exec_truncate(engine: &mut Engine, table: &str) -> Result<QueryResult> {
+    let table_guard = engine.table_lock(engine.table(table)?.id);
+    let _table_guard = table_write(&table_guard);
+    let removed = engine.truncate(table)?;
+    Ok(QueryResult::Ddl {
+        message: format!("已清空表 \"{}\"（删除 {} 行），表结构与索引保留", table, removed),
+    })
+}
+
 fn exec_explain(
     engine: &Engine,
     statement: &Statement,
@@ -3037,7 +3083,31 @@ fn exec_explain(
         Statement::Insert(insert) => {
             rows.push(kv("表", insert.table.clone()));
             rows.push(kv("访问方式", "追加写入（查找可用页）".to_string()));
-            rows.push(kv("写入行数", insert.values.len().to_string()));
+            match &insert.source {
+                InsertSource::Values(rows_in) => {
+                    rows.push(kv("写入行数", rows_in.len().to_string()))
+                }
+                InsertSource::Select(query) => {
+                    rows.push(kv("写入方式", "INSERT ... SELECT".to_string()));
+                    rows.push(kv(
+                        "说明",
+                        format!(
+                            "先物化子查询（{} 个投影列），再逐行写入；受 {} 行上限保护",
+                            query.items.len(),
+                            MAX_SCAN_ROWS
+                        ),
+                    ));
+                }
+            }
+        }
+        Statement::Truncate { table } => {
+            let total = engine.table(table).map(|t| t.row_count).unwrap_or(0);
+            rows.push(kv("表", table.clone()));
+            rows.push(kv("访问方式", "逐行删除并保留表结构".to_string()));
+            rows.push(kv(
+                "说明",
+                format!("约 {} 行；自增游标归零，索引随之清空", total),
+            ));
         }
         Statement::Update(update) => {
             rows.push(kv("表", update.table.clone()));

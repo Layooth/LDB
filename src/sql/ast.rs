@@ -188,9 +188,18 @@ pub struct SelectStmt {
 pub struct InsertStmt {
     pub table: String,
     pub columns: Option<Vec<String>>,
-    pub values: Vec<Vec<Expr>>,
+    pub source: InsertSource,
     /// `ON CONFLICT ...`（UPSERT）；None = 普通插入
     pub on_conflict: Option<OnConflict>,
+}
+
+/// INSERT 的数据来源
+#[derive(Debug, Clone)]
+pub enum InsertSource {
+    /// `INSERT ... VALUES (...),(...)`
+    Values(Vec<Vec<Expr>>),
+    /// `INSERT ... SELECT ...`（行由查询产生，按列顺序对应）
+    Select(Box<SelectStmt>),
 }
 
 /// `ON CONFLICT` 的动作
@@ -298,6 +307,10 @@ pub enum Statement {
         table: String,
         action: AlterAction,
     },
+    /// `TRUNCATE [TABLE] t`：清空数据，保留表结构与索引，自增游标归零
+    Truncate {
+        table: String,
+    },
 }
 
 impl Statement {
@@ -318,6 +331,7 @@ impl Statement {
             Statement::Describe { .. } => "describe",
             Statement::Explain { .. } => "explain",
             Statement::AlterTable { .. } => "alter_table",
+            Statement::Truncate { .. } => "truncate",
         }
     }
 

@@ -2122,6 +2122,215 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// INSERT ... SELECT：列映射、聚合结果、自引用的原子性
+#[test]
+fn insert_from_select() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("insertselect");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute(
+            "CREATE TABLE src (id INT PRIMARY KEY AUTO_INCREMENT, v INT, tag TEXT)",
+            &[],
+        )
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO src (v, tag) VALUES (1,'a'),(2,'a'),(3,'b')",
+            &[],
+        )
+        .unwrap();
+    session
+        .execute(
+            "CREATE TABLE dst (id INT PRIMARY KEY AUTO_INCREMENT, v INT, tag TEXT NOT NULL DEFAULT 'x')",
+            &[],
+        )
+        .unwrap();
+
+    let rows = |session: &mut Session, sql: &str| -> Vec<Vec<Value>> {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+    let inserted = |session: &mut Session, sql: &str| -> usize {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Insert { inserted, .. } => inserted,
+            other => panic!("期望 INSERT，得到 {:?}", other),
+        }
+    };
+
+    // 带 WHERE + 列映射；目标表没写的列取默认值
+    assert_eq!(
+        inserted(
+            &mut session,
+            "INSERT INTO dst (v) SELECT v FROM src WHERE tag = 'a'"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT id, v, tag FROM dst ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(1), Value::Text("x".into())],
+            vec![Value::Int(2), Value::Int(2), Value::Text("x".into())],
+        ]
+    );
+
+    // 聚合查询的行也能写进去
+    assert_eq!(
+        inserted(
+            &mut session,
+            "INSERT INTO dst (v, tag) SELECT SUM(v), 'total' FROM src"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT v, tag FROM dst WHERE tag = 'total'"),
+        vec![vec![Value::Int(6), Value::Text("total".into())]]
+    );
+
+    // 自引用：INSERT INTO t SELECT ... FROM t（先物化再写，不会边读边写乱套）
+    session
+        .execute("CREATE TABLE dup (id INT PRIMARY KEY AUTO_INCREMENT, v INT)", &[])
+        .unwrap();
+    session
+        .execute("INSERT INTO dup (v) VALUES (1),(2),(3)", &[])
+        .unwrap();
+    assert_eq!(
+        inserted(&mut session, "INSERT INTO dup (v) SELECT v FROM dup"),
+        3
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT COUNT(*) FROM dup"),
+        vec![vec![Value::Int(6)]],
+        "原来 3 行 + 复制 3 行"
+    );
+    assert_eq!(
+        rows(&mut session, "SELECT DISTINCT v FROM dup ORDER BY v"),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+        ],
+        "复制出来的 id 是新的，值不变"
+    );
+
+    // 列数不匹配 → 明确报错，且不插入任何行
+    let err = session
+        .execute("INSERT INTO dst (v) SELECT v, tag FROM src", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    assert!(err.message.contains("列数不匹配"), "{}", err.message);
+    assert_eq!(
+        rows(&mut session, "SELECT COUNT(*) FROM dst"),
+        vec![vec![Value::Int(3)]],
+        "失败的语句不应写入任何行"
+    );
+
+    // 组合 ON CONFLICT：暂不支持，但要说得清楚
+    let err = session
+        .execute(
+            "INSERT INTO dst (v) SELECT v FROM src ON CONFLICT (id) DO NOTHING",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, "SYNTAX_ERROR", "{}", err.message);
+    assert!(err.message.contains("ON CONFLICT"), "{}", err.message);
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TRUNCATE：清空数据、保留结构与索引、自增归零、可回滚
+#[test]
+fn truncate_keeps_schema_and_resets_auto_id() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("truncate");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute(
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT)",
+            &[],
+        )
+        .unwrap();
+    session.execute("CREATE INDEX ix_name ON t(name)", &[]).unwrap();
+    session
+        .execute(
+            "INSERT INTO t (name) VALUES ('a'),('b'),('c')",
+            &[],
+        )
+        .unwrap();
+
+    // 清空
+    match session.execute("TRUNCATE TABLE t", &[]).unwrap() {
+        QueryResult::Ddl { message } => assert!(message.contains("3 行"), "{}", message),
+        other => panic!("期望 DDL，得到 {:?}", other),
+    }
+    let count = |session: &mut Session| -> Value {
+        match session.execute("SELECT COUNT(*) FROM t", &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows[0][0].clone(),
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+    assert_eq!(count(&mut session), Value::Int(0));
+
+    // 结构与索引都还在
+    match session.execute("DESCRIBE t", &[]).unwrap() {
+        QueryResult::Describe {
+            columns, indexes, ..
+        } => {
+            assert_eq!(columns.len(), 2, "列定义应保留");
+            assert!(
+                indexes.iter().any(|ix| ix.name == "ix_name"),
+                "显式索引应保留：{:?}",
+                indexes.iter().map(|ix| ix.name.clone()).collect::<Vec<_>>()
+            );
+        }
+        other => panic!("期望 DESCRIBE，得到 {:?}", other),
+    }
+
+    // 自增游标归零：下一行是 1
+    match session
+        .execute("INSERT INTO t (name) VALUES ('again')", &[])
+        .unwrap()
+    {
+        QueryResult::Insert { ids, .. } => assert_eq!(ids, vec![1], "TRUNCATE 后自增应从头开始"),
+        other => panic!("期望 INSERT，得到 {:?}", other),
+    }
+
+    // 索引仍然可用（能查到刚插入的行）
+    match session
+        .execute("SELECT id FROM t WHERE name = 'again'", &[])
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // 可回滚：TRUNCATE 在事务里回滚后数据回来
+    session.execute("BEGIN", &[]).unwrap();
+    session.execute("TRUNCATE TABLE t", &[]).unwrap();
+    assert_eq!(count(&mut session), Value::Int(0));
+    session.execute("ROLLBACK", &[]).unwrap();
+    assert_eq!(count(&mut session), Value::Int(1), "回滚后数据应恢复");
+
+    // 不存在的表
+    let err = session.execute("TRUNCATE TABLE nope_xyz", &[]).unwrap_err();
+    assert_eq!(err.code, "NOT_FOUND", "{}", err.message);
+
+    session.close().unwrap();
+    // 重开后仍然是清空后的状态（1 行）
+    let mut reopened = Session::open(&dir).unwrap();
+    match reopened.execute("SELECT COUNT(*) FROM t", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    reopened.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// ORDER BY 可以用投影别名（含聚合列），且不影响按源表列排序
 #[test]
 fn order_by_projection_alias() {

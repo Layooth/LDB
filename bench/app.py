@@ -33,7 +33,11 @@ EXE = os.environ.get(
     os.path.abspath(os.path.join(HERE, "..", "..", "dist", "littledb.exe")),
 )
 UI_FILE = os.path.join(HERE, "index.html")
-DATA_DIR = os.path.join(HERE, "data")
+# 测试数据是运行产物，放运行层（与 dist 平级），不进源码树；可用 BENCH_DATA_DIR 覆盖
+DATA_DIR = os.environ.get(
+    "BENCH_DATA_DIR",
+    os.path.abspath(os.path.join(HERE, "..", "..", "bench-data")),
+)
 TABLE = "bench"
 
 # ------------------------------------------------------------------ 全局状态
@@ -101,7 +105,7 @@ def start_db(sync: str) -> str:
             with state_lock:
                 state["db_url"] = base
                 state["db_pid"] = db_proc.pid
-            log(f"数据库就绪：{base}（数据目录 bench\\data）")
+            log(f"数据库就绪：{base}（数据目录 {DATA_DIR}）")
             return base
         except Exception:
             if db_proc.poll() is not None:
@@ -389,7 +393,7 @@ def main() -> int:
     print("=" * 62)
     print("  LittleDB 性能测试台")
     print(f"  界面地址 : {url}")
-    print(f"  数据目录 : {DATA_DIR}")
+    print(f"  数据目录 : {DATA_DIR}（运行产物，不在源码树里；可用 BENCH_DATA_DIR 覆盖）")
     print(f"  数据库   : {EXE}")
     print("  关闭本窗口（或 Ctrl+C）会自动停止数据库子进程")
     print("=" * 62)

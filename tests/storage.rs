@@ -1165,6 +1165,125 @@ fn range_index_scan() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------- HTTP 层
+
+/// 起一个真实 HTTP 服务实例（随机端口），用于协议级用例
+fn start_http(dir: &std::path::Path) -> u16 {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, RwLock};
+
+    let engine = Arc::new(RwLock::new(Engine::open(dir).unwrap()));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let state = littledb::http::HttpState::new(
+        engine,
+        None,
+        littledb::http::find_web_dir(),
+        Arc::new(AtomicUsize::new(0)),
+        8,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    std::thread::spawn(move || {
+        let _ = littledb::http::serve(state, "127.0.0.1", port);
+    });
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    port
+}
+
+fn http_roundtrip(port: u16, request: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// 畸形请求必须显式报错，而不是「静默当空 body 执行」或「直接重置连接」
+#[test]
+fn http_rejects_malformed_requests() {
+    let dir = temp_dir("httpbad");
+    let port = start_http(&dir);
+
+    // chunked：不支持，必须 411 而不是把请求体当空
+    let response = http_roundtrip(
+        port,
+        "POST /api/sql HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 411"), "{}", response);
+    assert!(response.contains("LENGTH_REQUIRED"), "{}", response);
+
+    // 非法 Content-Length
+    let response = http_roundtrip(
+        port,
+        "POST /api/sql HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Length: -5\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "{}", response);
+
+    // 重复的关键头部（请求走私手法）
+    let response = http_roundtrip(
+        port,
+        "POST /api/sql HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "{}", response);
+
+    // 正常请求仍然工作
+    let body = r#"{"sql":"SELECT 1 AS ok"}"#;
+    let response = http_roundtrip(
+        port,
+        &format!(
+            "POST /api/sql HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{}", response);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 静态文件：只有根路径映射 index.html，其余缺失文件必须 404
+#[test]
+fn http_static_404_instead_of_html_fallback() {
+    let dir = temp_dir("httpstatic");
+    let port = start_http(&dir);
+
+    let response = http_roundtrip(
+        port,
+        "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{}", response);
+    assert!(response.contains("<!DOCTYPE html>"), "首页应是控制台");
+
+    let response = http_roundtrip(
+        port,
+        "GET /missing.js HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "缺失静态文件不应回退成 HTML：{}",
+        response
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 锁中毒不能让整个服务不可用：旧实现里 `unwrap()` 会把一次 panic
 /// 放大成「之后每个请求都 500」
 #[test]

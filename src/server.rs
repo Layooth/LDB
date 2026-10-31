@@ -129,6 +129,7 @@ impl Server {
         for incoming in listener.incoming() {
             match incoming {
                 Ok(stream) => {
+                    let mut stream = stream;
                     let engine = Arc::clone(&self.engine);
                     let options = self.options.clone();
                     let active = Arc::clone(&self.active);
@@ -137,17 +138,51 @@ impl Server {
                     let rejected = Arc::clone(&self.rejected);
                     let connections = Arc::clone(&self.connections);
 
-                    // 大栈：SQL 解析/JSON 解析的递归即使有深度上限，
-                    // 也按"最坏情况"给足余量，避免栈溢出直接 abort 进程
+                    // 先 CAS 预约名额再 spawn（线程内自增会被并发 accept 超卖）
+                    let mut current = active.load(Ordering::SeqCst);
+                    let mut reserved = false;
+                    while current < options.max_connections {
+                        match active.compare_exchange(
+                            current,
+                            current + 1,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => {
+                                reserved = true;
+                                break;
+                            }
+                            Err(actual) => current = actual,
+                        }
+                    }
+                    if !reserved {
+                        rejected.fetch_add(1, Ordering::SeqCst);
+                        let payload = error_frame(
+                            Json::Null,
+                            error::LIMIT,
+                            &format!(
+                                "连接数已达上限（{}），请稍后重试",
+                                options.max_connections
+                            ),
+                        );
+                        send(&mut stream, &payload);
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+
+                    // 栈按解析器闸门给：MAX_EXPR_DEPTH=64、MAX_TOKENS=2万，2MB 足够
+                    let slot = Arc::clone(&active);
                     let spawn = thread::Builder::new()
-                        .stack_size(8 * 1024 * 1024)
+                        .stack_size(2 * 1024 * 1024)
                         .spawn(move || {
                             handle_connection(
-                                stream, engine, options, active, queries, slow, rejected,
-                                connections,
+                                stream, engine, options, queries, slow, connections,
                             );
+                            slot.fetch_sub(1, Ordering::SeqCst);
                         });
                     if spawn.is_err() {
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        rejected.fetch_add(1, Ordering::SeqCst);
                         eprintln!("[LittleDB] 接受连接失败：线程创建失败");
                     }
                 }
@@ -160,31 +195,16 @@ impl Server {
     }
 }
 
+/// 连接名额已在 accept 循环里用 CAS 预约，这里只负责会话本身。
 #[allow(clippy::too_many_arguments)]
 fn handle_connection(
     mut stream: TcpStream,
     engine: Arc<RwLock<Engine>>,
     options: ServerOptions,
-    active: Arc<AtomicUsize>,
     queries: Arc<AtomicUsize>,
     slow_queries: Arc<AtomicUsize>,
-    rejected: Arc<AtomicUsize>,
     connections: Arc<AtomicUsize>,
 ) {
-    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-    if current > options.max_connections {
-        active.fetch_sub(1, Ordering::SeqCst);
-        rejected.fetch_add(1, Ordering::SeqCst);
-        let payload = error_frame(
-            Json::Null,
-            error::LIMIT,
-            &format!("连接数已达上限（{}），请稍后重试", options.max_connections),
-        );
-        send(&mut stream, &payload);
-        let _ = stream.shutdown(Shutdown::Both);
-        return;
-    }
-
     connections.fetch_add(1, Ordering::SeqCst);
     let _ = stream.set_nodelay(true);
     // 协议连接的读超时：客户端 5 分钟没有任何字节就断开。
@@ -236,7 +256,6 @@ fn handle_connection(
 
     session.close();
     let _ = stream.shutdown(Shutdown::Both);
-    active.fetch_sub(1, Ordering::SeqCst);
 }
 
 fn welcome_frame(authenticated: bool) -> Json {

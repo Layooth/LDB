@@ -22,6 +22,8 @@ pub const AUTH: &str = "AUTH_FAILED";
 pub const INTERNAL: &str = "INTERNAL_ERROR";
 pub const ROW_TOO_LARGE: &str = "ROW_TOO_LARGE";
 pub const PROTOCOL: &str = "PROTOCOL_ERROR";
+/// 需要 Content-Length（例如客户端用了 chunked 传输）
+pub const LENGTH_REQUIRED: &str = "LENGTH_REQUIRED";
 
 impl DbError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {

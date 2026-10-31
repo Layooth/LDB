@@ -151,8 +151,25 @@ pub fn serve(state: HttpState, host: &str, port: u16) -> Result<()> {
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                // 与 LDBP 端共用 max_connections，防止线程被无限连接耗尽
-                if state.connections.load(Ordering::SeqCst) >= state.max_connections {
+                // 先 CAS 预约名额再 spawn：原来的「load 检查 + 线程内 fetch_add」
+                // 在并发 accept 时会超卖 max_connections
+                let mut current = state.connections.load(Ordering::SeqCst);
+                let mut reserved = false;
+                while current < state.max_connections {
+                    match state.connections.compare_exchange(
+                        current,
+                        current + 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            reserved = true;
+                            break;
+                        }
+                        Err(actual) => current = actual,
+                    }
+                }
+                if !reserved {
                     state.rejected.fetch_add(1, Ordering::SeqCst);
                     let mut stream = stream;
                     let _ = stream.write_all(
@@ -163,14 +180,17 @@ pub fn serve(state: HttpState, host: &str, port: u16) -> Result<()> {
                 let state = state.clone();
                 let connections = Arc::clone(&state.connections);
                 let rejected = Arc::clone(&state.rejected);
+                // 连接线程按解析器闸门给栈：MAX_EXPR_DEPTH=64、MAX_TOKENS=2万，
+                // 2MB 足够；64 连接因此省下约 384MB 虚拟内存
+                let slot = Arc::clone(&connections);
                 let spawn = thread::Builder::new()
-                    .stack_size(8 * 1024 * 1024)
+                    .stack_size(2 * 1024 * 1024)
                     .spawn(move || {
-                        connections.fetch_add(1, Ordering::SeqCst);
                         handle(state, stream);
-                        connections.fetch_sub(1, Ordering::SeqCst);
+                        slot.fetch_sub(1, Ordering::SeqCst);
                     });
                 if spawn.is_err() {
+                    connections.fetch_sub(1, Ordering::SeqCst);
                     rejected.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -221,7 +241,30 @@ fn handle(state: HttpState, mut stream: TcpStream) {
     loop {
         let request = match read_request(&mut stream, &mut pending) {
             Ok(Some(r)) => r,
-            _ => return,
+            Ok(None) => return,
+            Err(err) => {
+                // 解析失败必须回一个错误响应再断开：
+                // 旧行为直接关连接，客户端只看到「连接被重置」
+                let status = if err.code == error::LENGTH_REQUIRED {
+                    411
+                } else {
+                    400
+                };
+                let body = format!(
+                    "{{\"ok\":false,\"error\":{{\"code\":\"{}\",\"message\":\"{}\"}}}}",
+                    err.code, err.message
+                );
+                let _ = send_response(
+                    &mut stream,
+                    status,
+                    status_text(status),
+                    "application/json; charset=utf-8",
+                    body.as_bytes(),
+                    &[],
+                    false,
+                );
+                return;
+            }
         };
         let keep_alive = wants_keep_alive(&request);
 
@@ -302,14 +345,39 @@ fn read_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<Option<
         if let Some(index) = line.find(':') {
             let key = line[..index].trim().to_lowercase();
             let value = line[index + 1..].trim().to_string();
+            // 关键头部重复出现是请求走私的典型手法，直接拒绝
+            let critical = matches!(
+                key.as_str(),
+                "content-length" | "transfer-encoding" | "host"
+            );
+            if critical && headers.contains_key(&key) {
+                return Err(DbError::new(
+                    error::PROTOCOL,
+                    format!("请求头 {} 重复出现", key),
+                ));
+            }
             headers.insert(key, value);
         }
     }
 
-    let content_length = headers
-        .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
+    // 不支持分块传输：静默当空 body 会让「POST /api/sql」变成
+    // 「执行一条没有 body 的语句」，必须显式拒绝
+    if let Some(encoding) = headers.get("transfer-encoding") {
+        if encoding.to_ascii_lowercase().contains("chunked") {
+            return Err(DbError::new(
+                error::LENGTH_REQUIRED,
+                "不支持 Transfer-Encoding: chunked，请改用 Content-Length",
+            ));
+        }
+    }
+
+    // Content-Length 存在但非法（负数、非数字）时要报错，不能当成 0 静默吞掉 body
+    let content_length = match headers.get("content-length") {
+        Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            DbError::new(error::PROTOCOL, "Content-Length 不是合法的非负整数")
+        })?,
+        None => 0,
+    };
     if content_length > MAX_BODY {
         return Err(DbError::new(error::PROTOCOL, "请求体超过 2MB 上限"));
     }
@@ -445,6 +513,10 @@ fn status_text(status: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        503 => "Service Unavailable",
         500 => "Internal Server Error",
         _ => "Unknown",
     }
@@ -1073,7 +1145,7 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request, ke
     }
 
     let web_dir = &state.web_dir;
-    let mut file_path = web_dir.join(cleaned.trim_start_matches('/'));
+    let file_path = web_dir.join(cleaned.trim_start_matches('/'));
     let canonical_base = fs::canonicalize(web_dir).unwrap_or_else(|_| web_dir.clone());
     // 文件不存在时 canonicalize 会失败，交给后面的 index.html 兜底处理；
     // 这里只拦截「解析成功但落在 web_dir 之外」的路径。
@@ -1094,19 +1166,18 @@ fn serve_static(state: &HttpState, stream: &mut TcpStream, request: &Request, ke
     }
 
     if !file_path.is_file() {
-        file_path = web_dir.join("index.html");
-        if !file_path.is_file() {
-            send_response(
-                stream,
-                404,
-                "Not Found",
-                "text/plain; charset=utf-8",
-                b"404 Not Found",
-                &[],
-                keep_alive,
-            );
-            return;
-        }
+        // 只有根路径映射到 index.html；其余缺失文件老实回 404
+        // （旧行为是任何路径都回 index.html + 200，前端拿到一堆「HTML 格式的 JS」）
+        send_response(
+            stream,
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"404 Not Found",
+            &[],
+            keep_alive,
+        );
+        return;
     }
 
     match fs::read(&file_path) {

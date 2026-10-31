@@ -151,7 +151,8 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | `LIMIT_EXCEEDED` | 400 | 超过单表页数、连接数或单语句行数上限 |
 | `ROW_TOO_LARGE` | 400 | 单行超过 4060B |
 | `AUTH_FAILED` | 401 | 令牌缺失或错误 |
-| `PROTOCOL_ERROR` | 400 | 报文非法 |
+| `PROTOCOL_ERROR` | 400 | 报文非法（含重复的关键头部、非法 Content-Length） |
+| `LENGTH_REQUIRED` | 411 | 客户端用了 `Transfer-Encoding: chunked`，请改用 `Content-Length` |
 | `INTERNAL_ERROR` | 400 | 内部错误（含待恢复状态） |
 
 ## 限制一览
@@ -166,10 +167,13 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | 并发连接 | 默认 64（协议与 HTTP 共用配额） |
 | WAL 自动 checkpoint | 8MB；每轮最多 1024 页 |
 | 表达式嵌套 / token 数 / JSON 深度 | 64 / 20000 / 200 |
+| `LIKE` 回溯步数 | 5,000,000（超出报 `LIMIT_EXCEEDED`，防 O(n·m) 慢查询） |
+| `ROUND` 小数位数 | -30 ..= 30 |
 
 ## 已知未做
 
 - 语句级写并行（需要存储层内部可变性改造，见 `docs/mvcc-design.md` §3.9）。
 - 复合索引只在**前导列等值**时可用（前缀查找）；范围扫描目前只走单列索引。
 - `UPDATE`/`DELETE` 仍全表物化后逐行处理（有行数上限保护）。
-- 视图、触发器、外键、分布式、TLS、chunked 请求体。
+- 视图、触发器、外键、分布式、TLS。
+- `Transfer-Encoding: chunked` 请求体不支持（会显式返回 411，不会静默当空 body）。

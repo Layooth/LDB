@@ -70,9 +70,6 @@ pub struct Wal {
     pub bytes: u64,
     /// 打开时是 JSON 旧格式（恢复前不能按二进制扫描）
     legacy: bool,
-    /// 提交时是否 fsync。false = synchronous NORMAL 语义：
-    /// 进程崩溃仍安全（数据在 OS 页缓存），掉电可能丢最近提交
-    durable_commits: bool,
 }
 
 impl Wal {
@@ -87,7 +84,6 @@ impl Wal {
             file,
             bytes: len,
             legacy: false,
-            durable_commits: true,
         };
 
         if len == 0 {
@@ -106,11 +102,6 @@ impl Wal {
         }
     }
 
-    /// 切换提交耐久性（full / normal）
-    pub fn set_durable_commits(&mut self, durable: bool) {
-        self.durable_commits = durable;
-    }
-
     fn write_header(&mut self) -> Result<()> {
         let mut header = [0u8; HEADER_LEN];
         header[..5].copy_from_slice(MAGIC);
@@ -122,7 +113,8 @@ impl Wal {
         Ok(())
     }
 
-    /// 追加一组记录并 fsync（调用方负责最后附加 commit 记录）
+    /// 追加一组记录（只写入 OS 缓存，不做 fsync）。
+    /// fsync 由 Store 的后台同步线程统一批量完成。
     pub fn append(&mut self, records: &[WalRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -133,9 +125,6 @@ impl Wal {
         }
         self.file.seek(SeekFrom::Start(self.bytes))?;
         self.file.write_all(&buf)?;
-        if self.durable_commits {
-            self.file.sync_all()?;
-        }
         self.bytes += buf.len() as u64;
         Ok(())
     }

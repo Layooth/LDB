@@ -534,3 +534,56 @@ fn concurrent_readers_during_open_txn() {
     engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 组提交：并发写会话全部成功且数据完整（fsync 已移出引擎写锁）
+#[test]
+fn concurrent_writers_group_commit() {
+    use littledb::sql::executor::ConnSession;
+    use littledb::sql::QueryResult;
+    use std::sync::{Arc, RwLock};
+
+    let dir = temp_dir("groupcommit");
+    let mut engine = Engine::open(&dir).unwrap();
+    setup(&mut engine).unwrap();
+    engine.close().unwrap();
+
+    let engine = Arc::new(RwLock::new(Engine::open(&dir).unwrap()));
+    let mut handles = Vec::new();
+    for tid in 0..8 {
+        let engine = Arc::clone(&engine);
+        handles.push(std::thread::spawn(move || {
+            let mut session = ConnSession::new(engine);
+            for i in 0..25 {
+                let id = tid * 25 + i;
+                session
+                    .execute(
+                        &format!("INSERT INTO players VALUES ({}, 'w{}', {})", id, id, i),
+                        &[],
+                    )
+                    .unwrap_or_else(|e| panic!("并发写失败: {}", e));
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let mut check = ConnSession::new(Arc::clone(&engine));
+    match check.execute("SELECT COUNT(*) FROM players", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(200)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // 全部 200 行按主键可查（索引一致）
+    match check
+        .execute("SELECT COUNT(*) FROM players WHERE id >= 0", &[])
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(200)]]),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    drop(check);
+    let mut engine = RwLock::into_inner(Arc::into_inner(engine).unwrap()).unwrap();
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

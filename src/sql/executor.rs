@@ -373,13 +373,20 @@ impl Session {
         statement: &Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        execute_on(
+        let outcome = execute_on(
             &mut self.engine,
             &mut self.in_txn,
             statement,
             params,
             crate::engine::EXCLUSIVE_TXN_OWNER,
-        )
+        );
+        // 独占引擎：full 模式下同样等待 fsync 确认再返回
+        let barrier = self.engine.store.commit_barrier();
+        let seq = self.engine.store.last_commit_seq();
+        if self.engine.store.durable_commits() {
+            barrier.wait_for(seq)?;
+        }
+        outcome
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -430,11 +437,23 @@ impl ConnSession {
                 Statement::Begin | Statement::Commit | Statement::Rollback
             );
         if needs_write {
-            let mut guard = self
-                .engine
-                .write()
-                .map_err(|_| DbError::internal("数据库锁状态异常"))?;
-            execute_on(&mut *guard, &mut self.in_txn, &statement, params, self.session_id)
+            let (outcome, barrier, seq) = {
+                let mut guard = self
+                    .engine
+                    .write()
+                    .map_err(|_| DbError::internal("数据库锁状态异常"))?;
+                let outcome =
+                    execute_on(&mut *guard, &mut self.in_txn, &statement, params, self.session_id);
+                // full 模式下在【释放写锁之后】等待 fsync 确认（组提交：
+                // 等待期间其它会话可以继续执行写语句）
+                let barrier = guard.store.commit_barrier();
+                let seq = guard.store.last_commit_seq();
+                (outcome, barrier, seq)
+            };
+            if self.engine.read().unwrap().store.durable_commits() {
+                barrier.wait_for(seq)?;
+            }
+            outcome
         } else {
             let guard = self
                 .engine

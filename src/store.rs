@@ -10,6 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use crate::catalog::Catalog;
 use crate::error::{self, DbError, Result};
@@ -17,6 +21,119 @@ use crate::page::{init_page, PAGE_SIZE};
 use crate::wal::{Wal, WalRecord};
 
 pub type PageKey = (u32, u32);
+
+/// 提交持久化屏障：写路径只负责把 WAL 字节落进 OS 缓存并发布序号，
+/// fsync 由后台线程批量完成；full 模式下调用方在【释放引擎写锁之后】
+/// 等待自己的序号被确认，从而把 fsync 从临界区里挪出去（组提交）。
+pub struct CommitBarrier {
+    state: Mutex<BarrierState>,
+    cv: Condvar,
+}
+
+struct BarrierState {
+    last_written: u64,
+    last_synced: u64,
+    error: Option<String>,
+    shutting_down: bool,
+}
+
+impl CommitBarrier {
+    fn new() -> CommitBarrier {
+        CommitBarrier {
+            state: Mutex::new(BarrierState {
+                last_written: 0,
+                last_synced: 0,
+                error: None,
+                shutting_down: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// 提交线程发布「已写入 OS 缓存」的新序号
+    fn publish(&self, seq: u64) {
+        let mut state = self.state.lock().unwrap();
+        if seq > state.last_written {
+            state.last_written = seq;
+        }
+        drop(state);
+        self.cv.notify_all();
+    }
+
+    /// 后台线程确认 fsync 覆盖到 seq（保守：只标记它醒来时看到的快照）
+    fn mark_synced(&self, seq: u64, err: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        if err.is_some() {
+            state.error = err;
+        }
+        if seq > state.last_synced {
+            state.last_synced = seq;
+        }
+        drop(state);
+        self.cv.notify_all();
+    }
+
+    /// 等待指定序号持久化完成。full 模式下「响应返回 ⇒ 已 fsync」由此保证。
+    /// 带超时兜底，避免极端丢通知时永久挂起。
+    pub fn wait_for(&self, seq: u64) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(err) = &state.error {
+                return Err(crate::error::DbError::internal(format!(
+                    "WAL fsync 失败，最近的提交可能未持久化，请重启确认状态：{}",
+                    err
+                )));
+            }
+            if state.last_synced >= seq {
+                return Ok(());
+            }
+            if state.shutting_down {
+                return Err(crate::error::DbError::internal("数据库正在关闭，提交未确认持久化"));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(crate::error::DbError::internal(
+                    "等待 WAL fsync 确认超时，请重试或重启",
+                ));
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(state, Duration::from_millis(200))
+                .unwrap();
+            state = guard;
+        }
+    }
+
+    /// 等待全部已写入的提交落盘（checkpoint / close 前 drain）
+    fn wait_all(&self) -> Result<()> {
+        let seq = self.state.lock().unwrap().last_written;
+        self.wait_for(seq)
+    }
+
+    fn error(&self) -> Option<String> {
+        self.state.lock().unwrap().error.clone()
+    }
+
+    fn shutdown(&self) {
+        self.state.lock().unwrap().shutting_down = true;
+        self.cv.notify_all();
+    }
+
+    /// 后台线程：阻塞直到有新工作或关闭；返回 (快照序号, 是否关闭中)
+    fn wait_for_work(&self, synced_upto: u64) -> (u64, bool) {
+        let mut state = self.state.lock().unwrap();
+        while state.last_written == synced_upto && !state.shutting_down {
+            state = self.cv.wait(state).unwrap();
+        }
+        (state.last_written, state.shutting_down)
+    }
+
+    fn drained(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.last_synced >= state.last_written
+    }
+}
 
 pub struct TableFile {
     pub file: File,
@@ -53,6 +170,13 @@ pub struct Store {
     catalog_pending: bool,
     wal_limit: u64,
     txn_seq: i64,
+    /// 已提交（字节已写入 WAL）的事务序号
+    commit_seq: u64,
+    /// full 模式下调用方在锁外等待 fsync 确认；normal 模式不等待
+    durable_commits: bool,
+    commit_barrier: Arc<CommitBarrier>,
+    sync_thread: Option<thread::JoinHandle<()>>,
+    sync_thread_started: AtomicBool,
     pub needs_recovery: bool,
     pub checkpoints: u64,
     pub recovered_txns: usize,
@@ -87,6 +211,11 @@ impl Store {
             catalog_pending: false,
             wal_limit: 8 * 1024 * 1024,
             txn_seq: 0,
+            commit_seq: 0,
+            durable_commits: true,
+            commit_barrier: Arc::new(CommitBarrier::new()),
+            sync_thread: None,
+            sync_thread_started: AtomicBool::new(false),
             needs_recovery: false,
             checkpoints: 0,
             recovered_txns: 0,
@@ -103,17 +232,67 @@ impl Store {
         for id in table_ids {
             let _ = store.table_file(id);
         }
+        store.spawn_sync_thread();
         Ok(store)
+    }
+
+    /// 后台 WAL 同步线程：把 fsync 从引擎写锁里挪出去。
+    /// 使用独立的文件句柄做 sync_all，与写路径互不干扰。
+    fn spawn_sync_thread(&mut self) {
+        if self.sync_thread_started.swap(true, AtomicOrdering::SeqCst) {
+            return;
+        }
+        let barrier = Arc::clone(&self.commit_barrier);
+        let sync_handle = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.dir.join("wal.log"))
+        {
+            Ok(handle) => handle,
+            Err(_) => return, // 打不开就不做后台同步；full 模式的等待会超时报错
+        };
+        let handle = thread::Builder::new()
+            .name("ldb-wal-sync".to_string())
+            .spawn(move || {
+                let mut synced_upto = 0u64;
+                loop {
+                    let (target, shutting) = barrier.wait_for_work(synced_upto);
+                    if target > synced_upto {
+                        let res = sync_handle.sync_all();
+                        barrier.mark_synced(
+                            target,
+                            res.err().map(|e| e.to_string()),
+                        );
+                        synced_upto = target;
+                    }
+                    if shutting && barrier.drained() {
+                        break;
+                    }
+                }
+            });
+        self.sync_thread = handle.ok();
     }
 
     pub fn set_wal_limit(&mut self, bytes: u64) {
         self.wal_limit = bytes;
     }
 
-    /// 提交耐久性：true = 每次提交 fsync（默认，掉电安全）；
-    /// false = synchronous NORMAL（checkpoint 时才 fsync，掉电可能丢最近提交）
+    /// 提交耐久性：true = full，调用方等待 fsync 确认后才返回（默认，掉电安全）；
+    /// false = normal，立即返回，后台线程异步 fsync（掉电可能丢最近提交）
     pub fn set_sync_mode(&mut self, durable: bool) {
-        self.wal.set_durable_commits(durable);
+        self.durable_commits = durable;
+    }
+
+    pub fn durable_commits(&self) -> bool {
+        self.durable_commits
+    }
+
+    pub fn last_commit_seq(&self) -> u64 {
+        self.commit_seq
+    }
+
+    pub fn commit_barrier(&self) -> Arc<CommitBarrier> {
+        Arc::clone(&self.commit_barrier)
     }
 
     pub fn assert_usable(&self) -> Result<()> {
@@ -305,6 +484,16 @@ impl Store {
         }
         records.push(WalRecord::Commit { txn: txn.id as u32 });
 
+        // 上一次同步已报错（磁盘故障）的场景：拒绝新写入，等待重启恢复
+        if let Some(err) = self.commit_barrier.error() {
+            self.discard_txn(&txn);
+            self.needs_recovery = true;
+            return Err(DbError::internal(format!(
+                "之前的 WAL fsync 失败（{}），本事务未提交，请重启恢复",
+                err
+            )));
+        }
+
         if let Err(err) = self.wal.append(&records) {
             self.discard_txn(&txn);
             return Err(DbError::internal(format!(
@@ -335,6 +524,10 @@ impl Store {
                 )));
             }
         }
+
+        // 发布提交序号；full 模式由调用方在【释放引擎写锁之后】等待 fsync 确认
+        self.commit_seq += 1;
+        self.commit_barrier.publish(self.commit_seq);
         Ok(())
     }
 
@@ -364,6 +557,8 @@ impl Store {
         if self.txn.is_some() {
             return Err(DbError::internal("不能在事务进行中执行 checkpoint"));
         }
+        // WAL 截断前必须确认所有已写入的提交都已 fsync
+        self.commit_barrier.wait_all()?;
         let pending = std::mem::take(&mut self.pending);
         let mut touched: HashSet<u32> = HashSet::new();
         for ((table_id, page_no), page) in pending.iter() {
@@ -561,7 +756,10 @@ impl Store {
         if self.txn.is_some() {
             self.rollback();
         }
+        // 先确认全部提交落盘，再 checkpoint（会截断 WAL）
+        let _ = self.commit_barrier.wait_all();
         let _ = self.checkpoint();
+        self.shutdown_sync_thread();
         for (_, f) in self.files.iter() {
             let _ = f.file.sync_all();
         }
@@ -570,6 +768,13 @@ impl Store {
         // 释放目录锁，允许之后重新打开
         self._lock = None;
         Ok(())
+    }
+
+    fn shutdown_sync_thread(&mut self) {
+        self.commit_barrier.shutdown();
+        if let Some(handle) = self.sync_thread.take() {
+            let _ = handle.join();
+        }
     }
 
     pub fn stats(&self) -> StoreStats {
@@ -585,6 +790,14 @@ impl Store {
             pending_pages: self.pending.len(),
             checkpoints: self.checkpoints,
         }
+    }
+}
+
+/// 只负责停掉后台同步线程；故意不触碰 WAL / 数据文件——
+/// 「打开后不 close 直接丢弃」是崩溃模拟测试依赖的行为。
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.shutdown_sync_thread();
     }
 }
 

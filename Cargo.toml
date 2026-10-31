@@ -16,6 +16,10 @@ path = "src/lib.rs"
 [dependencies]
 # 刻意保持零依赖：只用 std，避免网络拉包和版本不匹配
 
+[build-dependencies]
+# 仅构建时使用（嵌入图标到 PE 资源段），不影响运行时
+winresource = "0.1"
+
 [profile.release]
 opt-level = 3
 lto = true

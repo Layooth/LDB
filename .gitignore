@@ -1,1 +1,5 @@
 /target
+
+# Python 字节码（sdk/ 下有 Python 客户端与测试）
+__pycache__/
+*.pyc

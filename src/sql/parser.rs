@@ -637,7 +637,27 @@ impl Parser {
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
         let name = self.expect_ident()?;
-        let type_name = self.expect_ident()?;
+        let mut type_name = self.expect_ident()?;
+        // DECIMAL(p, s) / DECIMAL(p)：标度进类型声明，随 catalog 持久化
+        if type_name.to_uppercase() == "DECIMAL" && self.at_punct("(") {
+            self.advance();
+            let mut parts = Vec::new();
+            loop {
+                let token = self.peek().clone();
+                if token.kind != TokenKind::Number {
+                    return Err(DbError::syntax(format!(
+                        "DECIMAL 声明需要整数参数，实际是 \"{}\"",
+                        token.text
+                    )));
+                }
+                parts.push(self.advance().text);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct(")")?;
+            type_name = format!("DECIMAL({})", parts.join(","));
+        }
 
         let mut primary_key = false;
         let mut not_null = false;

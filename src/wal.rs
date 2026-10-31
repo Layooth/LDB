@@ -14,10 +14,7 @@
 //!
 //! ## 兼容性
 //!
-//! 恢复同时支持旧版 JSON Lines 格式（Node 版 1.0 写的，以 `{` 开头），
-//! 但本版本新写入一律是二进制。**Node 版 1.0 无法重放 LDBW2 记录**——
-//! 把数据目录交给 Node 版之前请先 checkpoint（干净关闭即可），或给 Node
-//! 版同步移植本格式。
+//! 恢复同时兼容旧版 JSON Lines 格式（历史遗留目录），新写入一律二进制。
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

@@ -281,6 +281,10 @@ fn value_json(value: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Int(n) => Json::Int(*n),
         Value::Real(n) => Json::Num(*n),
+        // DECIMAL 走字符串保真（金额精度不折损）
+        Value::Decimal { v, scale } => {
+            Json::Str(crate::codec::format_decimal(*v, *scale))
+        }
         Value::Text(s) => Json::Str(s.clone()),
         Value::Bool(b) => Json::Bool(*b),
     }
@@ -740,6 +744,9 @@ fn resolve_subqueries(
                             Some(Value::Null) => Literal::Null,
                             Some(Value::Int(n)) => Literal::Int(n),
                             Some(Value::Real(n)) => Literal::Real(n),
+                            Some(Value::Decimal { v, scale }) => {
+                                Literal::Text(crate::codec::format_decimal(v, scale))
+                            }
                             Some(Value::Text(s)) => Literal::Text(s),
                             Some(Value::Bool(b)) => Literal::Bool(b),
                             None => Literal::Null,
@@ -1512,7 +1519,7 @@ fn exec_insert(engine: &mut Engine, stmt: &InsertStmt, params: &[Value]) -> Resu
 
         for (slot, expr) in target.iter().zip(row_exprs.iter()) {
             let raw = eval(expr, &empty, params)?;
-            values[*slot] = codec::coerce(columns[*slot].ty, &raw)?;
+            values[*slot] = codec::coerce(columns[*slot].ty, columns[*slot].scale, &raw)?;
         }
 
         engine.insert(&stmt.table, values)?;
@@ -1557,7 +1564,7 @@ fn exec_update(engine: &mut Engine, stmt: &UpdateStmt, params: &[Value]) -> Resu
         let mut next = values.clone();
         for (slot, expr) in &assignments {
             let raw = eval(expr, &ctx, params)?;
-            next[*slot] = codec::coerce(columns[*slot].ty, &raw)?;
+            next[*slot] = codec::coerce(columns[*slot].ty, columns[*slot].scale, &raw)?;
         }
 
         engine.update(&stmt.table, row_id, next)?;
@@ -1614,6 +1621,7 @@ fn exec_create_table(
 
     for def in &stmt.columns {
         let ty = ColumnType::parse(&def.type_name)?;
+        let scale = ColumnType::decimal_scale_from_type(&def.type_name)?;
         let is_pk = def.primary_key
             || stmt
                 .primary_key
@@ -1621,6 +1629,7 @@ fn exec_create_table(
                 .any(|n| n.to_lowercase() == def.name.to_lowercase());
 
         let mut column = Column::new(def.name.clone(), ty);
+        column.scale = scale;
         column.primary_key = is_pk;
         column.not_null = def.not_null || is_pk;
         column.unique = def.unique;
@@ -1636,7 +1645,7 @@ fn exec_create_table(
             column.default = if raw.is_null() {
                 None
             } else {
-                Some(codec::coerce(ty, &raw)?)
+                Some(codec::coerce(ty, column.scale, &raw)?)
             };
         }
 

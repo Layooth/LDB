@@ -1,4 +1,4 @@
-//! 4KB 数据页，slotted page 布局，与 Node 版逐字节兼容。
+//! 4KB 数据页，slotted page 布局。
 //!
 //! ```text
 //! offset 0      : u8   pageType (1 = data)

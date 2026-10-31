@@ -672,12 +672,14 @@ impl Engine {
 
             let type_name = spec.get("type").and_then(|v| v.as_str()).unwrap_or("TEXT");
             let ty = ColumnType::parse(type_name)?;
+            let scale = ColumnType::decimal_scale_from_type(type_name)?;
             let primary_key = spec
                 .get("primaryKey")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
             let mut column = Column::new(col_name.clone(), ty);
+            column.scale = scale;
             column.primary_key = primary_key;
             column.not_null = spec
                 .get("notNull")
@@ -689,7 +691,7 @@ impl Engine {
             if let Some(default) = spec.get("default") {
                 let value = json_to_value(default);
                 if !value.is_null() && !value.as_text().is_empty() {
-                    column.default = Some(codec::coerce(ty, &value)?);
+                    column.default = Some(codec::coerce(ty, column.scale, &value)?);
                 }
             }
 
@@ -716,7 +718,7 @@ impl Engine {
                 let value = match old_index.get(&sources[i]) {
                     Some(old_at) => {
                         let raw = values.get(*old_at).cloned().unwrap_or(Value::Null);
-                        codec::coerce(column.ty, &raw)?
+                        codec::coerce(column.ty, column.scale, &raw)?
                     }
                     None => match &column.default {
                         Some(default) => default.clone(),
@@ -805,7 +807,7 @@ pub fn coerce_row(columns: &[Column], raw: Vec<Value>) -> Result<Vec<Value>> {
     }
     let mut out = Vec::with_capacity(columns.len());
     for (i, column) in columns.iter().enumerate() {
-        out.push(codec::coerce(column.ty, &raw[i])?);
+        out.push(codec::coerce(column.ty, column.scale, &raw[i])?);
     }
     Ok(out)
 }

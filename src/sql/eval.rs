@@ -116,6 +116,7 @@ pub fn truthy(value: &Value) -> Option<bool> {
         Value::Bool(b) => Some(*b),
         Value::Int(n) => Some(*n != 0),
         Value::Real(n) => Some(*n != 0.0),
+        Value::Decimal { v, .. } => Some(*v != 0),
         Value::Text(s) => Some(!s.is_empty()),
     }
 }
@@ -301,6 +302,10 @@ pub fn apply_unary(op: UnOp, value: &Value) -> Result<Value> {
     match op {
         UnOp::Neg => match value {
             Value::Null => Ok(Value::Null),
+            Value::Decimal { v, scale } => match v.checked_neg() {
+                Some(nv) => Ok(Value::Decimal { v: nv, scale: *scale }),
+                None => Err(DbError::type_error("DECIMAL 取负溢出")),
+            },
             // i64::MIN 取负会溢出，升级为 REAL 而不是静默回绕
             Value::Int(n) => match n.checked_neg() {
                 Some(v) => Ok(Value::Int(v)),
@@ -357,9 +362,85 @@ fn compare_op(op: BinOp, left: &Value, right: &Value) -> Value {
     Value::Bool(result)
 }
 
+/// 定标十进制四则运算：加/减对齐标度后整数运算（精确），
+/// 乘法标度相加（精确），除法结果标度取较大者（截断）。
+/// 溢出/除零显式报错——金额场景宁可不返回结果，也不返回错误结果。
+fn decimal_arith(op: BinOp, av: i128, ascale: u8, bv: i128, bscale: u8) -> Result<Value> {
+    // 加/减/取模：对齐到较大标度后整数运算
+    if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mod) {
+        let scale = ascale.max(bscale);
+        let a = av
+            .checked_mul(10i128.pow((scale - ascale) as u32))
+            .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
+        let b = bv
+            .checked_mul(10i128.pow((scale - bscale) as u32))
+            .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
+        let v = match op {
+            BinOp::Add => a.checked_add(b),
+            BinOp::Sub => a.checked_sub(b),
+            BinOp::Mod => {
+                if b == 0 {
+                    return Err(DbError::type_error("取模的除数为 0"));
+                }
+                a.checked_rem(b)
+            }
+            _ => unreachable!(),
+        }
+        .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
+        return Ok(Value::Decimal { v, scale });
+    }
+
+    // 乘：标度相加（0.01[s2] × 3[s0] = 0.03[s2]）
+    if op == BinOp::Mul {
+        let v = av
+            .checked_mul(bv)
+            .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
+        return Ok(Value::Decimal {
+            v,
+            scale: ascale + bscale,
+        });
+    }
+
+    // 除：结果标度取较大者（截断），v = av · 10^(bscale - ascale + scale) / bv
+    if op == BinOp::Div {
+        if bv == 0 {
+            return Err(DbError::type_error("除数为 0"));
+        }
+        let scale = ascale.max(bscale);
+        let shift = bscale as i32 - ascale as i32 + scale as i32;
+        let v = if shift >= 0 {
+            let factor = 10i128
+                .checked_pow(shift as u32)
+                .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?;
+            av.checked_mul(factor)
+                .ok_or_else(|| DbError::type_error("DECIMAL 运算溢出"))?
+                .div_euclid(bv)
+        } else {
+            (av / bv) / 10i128.pow((-shift) as u32)
+        };
+        return Ok(Value::Decimal { v, scale });
+    }
+
+    Err(DbError::internal("非算术运算符"))
+}
+
 fn arith(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
+    }
+
+    // DECIMAL：精确十进制运算（金额场景零浮点误差）；
+    // Int 与 Decimal 混合时把 Int 提升为标度 0 的 Decimal
+    let dec_pair = match (left, right) {
+        (Value::Decimal { v: av, scale: sa }, Value::Decimal { v: bv, scale: sb }) => {
+            Some((*av, *sa, *bv, *sb))
+        }
+        (Value::Decimal { v: av, scale: sa }, Value::Int(n)) => Some((*av, *sa, *n as i128, 0)),
+        (Value::Int(n), Value::Decimal { v: bv, scale: sb }) => Some((*n as i128, 0, *bv, *sb)),
+        _ => None,
+    };
+    if let Some((av, sa, bv, sb)) = dec_pair {
+        return decimal_arith(op, av, sa, bv, sb);
     }
 
     // INT × INT 的加减乘走 i64 精确运算，避免 2^53 以上静默丢精度；
@@ -612,6 +693,35 @@ pub fn eval_aggregate(
 
     match name {
         "COUNT" => Ok(Value::Int(values.len() as i64)),
+        "SUM" | "AVG" if values.iter().all(|v| matches!(v, Value::Decimal { .. })) => {
+            // DECIMAL 精确求和：对齐标度后整数累加（checked）
+            let mut total: i128 = 0;
+            let mut scale: u8 = 0;
+            for value in &values {
+                if let Value::Decimal { v, scale: s } = value {
+                    // 先把累计值提升到较大标度，再对齐当前值
+                    if *s > scale {
+                        total = total
+                            .checked_mul(10i128.pow((*s - scale) as u32))
+                            .ok_or_else(|| DbError::type_error("SUM 溢出"))?;
+                        scale = *s;
+                    }
+                    let aligned = v
+                        .checked_mul(10i128.pow((*s - scale) as u32))
+                        .ok_or_else(|| DbError::type_error("SUM 溢出"))?;
+                    total = total
+                        .checked_add(aligned)
+                        .ok_or_else(|| DbError::type_error("SUM 溢出"))?;
+                }
+            }
+            if name == "SUM" {
+                return Ok(Value::Decimal { v: total, scale });
+            }
+            // AVG：商转 REAL（均值天然允许近似）
+            let count = values.len() as f64;
+            let total_f = total as f64 / 10f64.powi(scale as i32);
+            Ok(Value::Real(total_f / count))
+        }
         "SUM" | "AVG" => {
             if values.is_empty() {
                 return Ok(Value::Null);

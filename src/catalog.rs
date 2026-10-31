@@ -57,6 +57,7 @@ fn value_to_json(value: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Int(n) => Json::Int(*n),
         Value::Real(n) => Json::Num(*n),
+        Value::Decimal { v, scale } => Json::Str(crate::codec::format_decimal(*v, *scale)),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Bool(b) => Json::Bool(*b),
     }
@@ -167,6 +168,9 @@ impl Catalog {
                     ("unique".to_string(), Json::Bool(column.unique)),
                     ("primaryKey".to_string(), Json::Bool(column.primary_key)),
                 ];
+                if column.ty == crate::codec::ColumnType::Decimal {
+                    fields.push(("scale".to_string(), Json::Num(column.scale as f64)));
+                }
                 if let Some(default) = &column.default {
                     fields.push(("default".to_string(), value_to_json(default)));
                 }
@@ -294,6 +298,15 @@ fn parse_column(value: &Json) -> Result<Column> {
     Ok(Column {
         name,
         ty,
+        scale: if ty == crate::codec::ColumnType::Decimal {
+            value
+                .get("scale")
+                .and_then(|v| v.as_i64())
+                .map(|s| s as u8)
+                .unwrap_or(crate::codec::DECIMAL_DEFAULT_SCALE)
+        } else {
+            crate::codec::DECIMAL_DEFAULT_SCALE
+        },
         not_null: value.get("notNull").and_then(|v| v.as_bool()).unwrap_or(false),
         unique: value.get("unique").and_then(|v| v.as_bool()).unwrap_or(false),
         primary_key: value

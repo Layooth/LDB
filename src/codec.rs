@@ -1,4 +1,4 @@
-//! 行记录编解码与类型系统，二进制格式与 Node 版一致。
+//! 行记录编解码与类型系统。
 //!
 //! ```text
 //! [null bitmap: ceil(n/8) 字节]
@@ -22,22 +22,32 @@ pub enum ColumnType {
     Date,
     DateTime,
     Json,
+    /// 定标十进制：i128 存储，标度（小数位数）在 Column.scale 上
+    Decimal,
 }
+
+/// DECIMAL 默认标度
+pub const DECIMAL_DEFAULT_SCALE: u8 = 4;
+/// DECIMAL 标度上限（保证 i128 对齐运算不轻易溢出）
+pub const DECIMAL_MAX_SCALE: u8 = 9;
 
 impl ColumnType {
     pub fn parse(raw: &str) -> Result<ColumnType> {
-        let upper = raw.trim().to_uppercase();
+        // 允许 "DECIMAL(10,2)" 形式：截取括号前的类型名
+        let base = raw.find('(').map(|i| &raw[..i]).unwrap_or(raw);
+        let upper = base.trim().to_uppercase();
         let ty = match upper.as_str() {
             "INT" | "INTEGER" | "BIGINT" | "SMALLINT" => ColumnType::Int,
-            "REAL" | "FLOAT" | "DOUBLE" | "DECIMAL" | "NUMERIC" => ColumnType::Real,
+            "REAL" | "FLOAT" | "DOUBLE" => ColumnType::Real,
             "TEXT" | "VARCHAR" | "CHAR" | "STRING" => ColumnType::Text,
             "BOOL" | "BOOLEAN" => ColumnType::Bool,
             "DATE" => ColumnType::Date,
             "DATETIME" | "TIMESTAMP" => ColumnType::DateTime,
             "JSON" | "JSONB" => ColumnType::Json,
+            "DECIMAL" | "NUMERIC" => ColumnType::Decimal,
             _ => {
                 return Err(DbError::syntax(format!(
-                    "不支持的列类型 \"{}\"，可用类型: INT, REAL, TEXT, BOOL, DATE, DATETIME, JSON",
+                    "不支持的列类型 \"{}\"，可用类型: INT, REAL, TEXT, BOOL, DATE, DATETIME, JSON, DECIMAL(p,s)",
                     raw
                 )))
             }
@@ -54,6 +64,7 @@ impl ColumnType {
             ColumnType::Date => "DATE",
             ColumnType::DateTime => "DATETIME",
             ColumnType::Json => "JSON",
+            ColumnType::Decimal => "DECIMAL",
         }
     }
 
@@ -64,12 +75,41 @@ impl ColumnType {
             ColumnType::Text | ColumnType::Date | ColumnType::DateTime | ColumnType::Json
         )
     }
+
+    /// 从类型声明里提取 DECIMAL 标度：DECIMAL(10,2) → 2，DECIMAL → 默认 4
+    pub fn decimal_scale_from_type(raw: &str) -> Result<u8> {
+        let upper = raw.trim().to_uppercase();
+        if !upper.starts_with("DECIMAL") {
+            return Ok(DECIMAL_DEFAULT_SCALE);
+        }
+        let inner = match (upper.find('('), upper.rfind(')')) {
+            (Some(a), Some(b)) if b > a => &upper[a + 1..b],
+            _ => return Ok(DECIMAL_DEFAULT_SCALE),
+        };
+        let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+        let scale = match parts.len() {
+            2 => parts[1]
+                .parse::<u8>()
+                .map_err(|_| DbError::syntax(format!("DECIMAL 标度非法：{}", raw)))?,
+            1 => return Ok(DECIMAL_DEFAULT_SCALE),
+            _ => return Err(DbError::syntax(format!("DECIMAL 声明非法：{}", raw))),
+        };
+        if scale > DECIMAL_MAX_SCALE {
+            return Err(DbError::syntax(format!(
+                "DECIMAL 标度 {} 超过上限 {}",
+                scale, DECIMAL_MAX_SCALE
+            )));
+        }
+        Ok(scale)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
     pub ty: ColumnType,
+    /// DECIMAL 列的小数位数（其它类型忽略）
+    pub scale: u8,
     pub not_null: bool,
     pub unique: bool,
     pub primary_key: bool,
@@ -81,6 +121,7 @@ impl Column {
         Column {
             name: name.into(),
             ty,
+            scale: DECIMAL_DEFAULT_SCALE,
             not_null: false,
             unique: false,
             primary_key: false,
@@ -98,6 +139,8 @@ pub enum Value {
     Null,
     Int(i64),
     Real(f64),
+    /// 定标十进制：v = 数值 × 10^scale（精确，无浮点误差）
+    Decimal { v: i128, scale: u8 },
     Text(String),
     Bool(bool),
 }
@@ -112,6 +155,7 @@ impl Value {
             Value::Null => String::new(),
             Value::Int(n) => n.to_string(),
             Value::Real(n) => format!("{}", n),
+            Value::Decimal { v, scale } => format_decimal(*v, *scale),
             Value::Text(s) => s.clone(),
             Value::Bool(b) => {
                 if *b {
@@ -127,6 +171,9 @@ impl Value {
         match self {
             Value::Int(n) => Some(*n as f64),
             Value::Real(n) => Some(*n),
+            Value::Decimal { v, scale } => {
+                Some(*v as f64 / 10f64.powi(*scale as i32))
+            }
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             Value::Text(s) => {
                 let t = s.trim();
@@ -145,10 +192,115 @@ impl Value {
             Value::Bool(b) => Some(*b),
             Value::Int(n) => Some(*n != 0),
             Value::Real(n) => Some(*n != 0.0),
+            Value::Decimal { v, .. } => Some(*v != 0),
             Value::Text(s) => Some(!s.is_empty()),
             Value::Null => None,
         }
     }
+}
+
+// ------------------------------------------------------------------ 定标十进制
+
+/// 把 i128 按标度格式化为十进制文本（去掉尾随 0）
+pub fn format_decimal(v: i128, scale: u8) -> String {
+    if scale == 0 {
+        return v.to_string();
+    }
+    let negative = v < 0;
+    let abs = v.unsigned_abs();
+    let divisor = 10u128.pow(scale as u32);
+    let int_part = abs / divisor;
+    let frac_part = abs % divisor;
+    let mut frac = format!("{:0width$}", frac_part, width = scale as usize);
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+    let sign = if negative { "-" } else { "" };
+    if frac.is_empty() {
+        format!("{}{}", sign, int_part)
+    } else {
+        format!("{}{}.{}", sign, int_part, frac)
+    }
+}
+
+/// 解析十进制文本到指定标度（四舍五入到标度位）
+pub fn parse_decimal(text: &str, scale: u8) -> Result<i128> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err(DbError::type_error("DECIMAL 不能为空"));
+    }
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int_part, frac_part) = match digits.find('.') {
+        Some(i) => (&digits[..i], &digits[i + 1..]),
+        None => (digits, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(DbError::type_error(format!("无法把 \"{}\" 转换为 DECIMAL", text)));
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(DbError::type_error(format!("无法把 \"{}\" 转换为 DECIMAL", text)));
+    }
+
+    let mut v: i128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part
+            .parse::<i128>()
+            .map_err(|_| DbError::type_error(format!("DECIMAL 整数位过大：{}", text)))?
+    };
+    v = v
+        .checked_mul(10i128.pow(scale as u32))
+        .ok_or_else(|| DbError::type_error(format!("DECIMAL 整数位过大：{}", text)))?;
+
+    // 小数位：标度内直接取，超出的第一位做四舍五入
+    let frac_bytes = frac_part.as_bytes();
+    for i in 0..scale as usize {
+        let digit = if i < frac_bytes.len() {
+            (frac_bytes[i] - b'0') as i128
+        } else {
+            0
+        };
+        v = v
+            .checked_add(digit * 10i128.pow((scale as usize - i - 1) as u32))
+            .ok_or_else(|| DbError::type_error(format!("DECIMAL 精度过高：{}", text)))?;
+    }
+    if frac_bytes.len() > scale as usize && frac_bytes[scale as usize] >= b'5' {
+        v = v
+            .checked_add(if negative { -1 } else { 1 })
+            .ok_or_else(|| DbError::type_error(format!("DECIMAL 精度过高：{}", text)))?;
+    }
+
+    Ok(if negative { -v } else { v })
+}
+
+/// 对齐两个 Decimal 到同一标度（较大的那个）
+fn align_decimals(
+    a: &Value,
+    b: &Value,
+) -> std::result::Result<(i128, i128, u8), ()> {
+    let (av, ascale) = match a {
+        Value::Decimal { v, scale } => (*v, *scale),
+        Value::Int(n) => (*n as i128, 0),
+        _ => return Err(()),
+    };
+    let (bv, bscale) = match b {
+        Value::Decimal { v, scale } => (*v, *scale),
+        Value::Int(n) => (*n as i128, 0),
+        _ => return Err(()),
+    };
+    let scale = ascale.max(bscale);
+    let a_up = av
+        .checked_mul(10i128.pow((scale - ascale) as u32))
+        .ok_or(())?;
+    let b_up = bv
+        .checked_mul(10i128.pow((scale - bscale) as u32))
+        .ok_or(())?;
+    Ok((a_up, b_up, scale))
 }
 
 // ------------------------------------------------------------------ 编码
@@ -176,6 +328,7 @@ pub fn encode_row(columns: &[Column], values: &[Value]) -> Result<Vec<u8>> {
             Value::Null => {}
             Value::Int(n) => out.extend_from_slice(&n.to_le_bytes()),
             Value::Real(n) => out.extend_from_slice(&n.to_le_bytes()),
+            Value::Decimal { v, .. } => out.extend_from_slice(&v.to_le_bytes()),
             Value::Bool(b) => out.push(if *b { 1 } else { 0 }),
             Value::Text(s) => {
                 let bytes = s.as_bytes();
@@ -227,6 +380,17 @@ pub fn decode_row(columns: &[Column], buf: &[u8]) -> Result<Vec<Value>> {
             }
             values.push(Value::Bool(buf[off] == 1));
             off += 1;
+        } else if ty == ColumnType::Decimal {
+            if off + 16 > buf.len() {
+                return Err(DbError::internal("记录截断：DECIMAL"));
+            }
+            let mut raw = [0u8; 16];
+            raw.copy_from_slice(&buf[off..off + 16]);
+            values.push(Value::Decimal {
+                v: i128::from_le_bytes(raw),
+                scale: columns[i].scale,
+            });
+            off += 16;
         } else {
             if off + 4 > buf.len() {
                 return Err(DbError::internal("记录截断：TEXT 长度"));
@@ -248,7 +412,7 @@ pub fn decode_row(columns: &[Column], buf: &[u8]) -> Result<Vec<Value>> {
 
 // ------------------------------------------------------------------ 类型转换
 
-pub fn coerce(ty: ColumnType, value: &Value) -> Result<Value> {
+pub fn coerce(ty: ColumnType, scale: u8, value: &Value) -> Result<Value> {
     if value.is_null() {
         return Ok(Value::Null);
     }
@@ -269,11 +433,28 @@ pub fn coerce(ty: ColumnType, value: &Value) -> Result<Value> {
                     .map(Value::Int)
                     .map_err(|_| DbError::type_error(format!("无法把 \"{}\" 转换为 INT", s)))
             }
+            Value::Decimal { v, scale } => {
+                // 仅整值 Decimal 可转 INT
+                let divisor = 10i128.pow(*scale as u32);
+                if v % divisor != 0 {
+                    return Err(DbError::type_error(format!(
+                        "DECIMAL {} 不是整数，无法转换为 INT",
+                        format_decimal(*v, *scale)
+                    )));
+                }
+                let q = v / divisor;
+                i64::try_from(q)
+                    .map(Value::Int)
+                    .map_err(|_| DbError::type_error("DECIMAL 整数值超出 INT 范围"))
+            }
             Value::Null => Ok(Value::Null),
         },
         ColumnType::Real => match value {
             Value::Real(n) => Ok(Value::Real(*n)),
             Value::Int(n) => Ok(Value::Real(*n as f64)),
+            Value::Decimal { v, scale } => Ok(Value::Real(
+                *v as f64 / 10f64.powi(*scale as i32),
+            )),
             Value::Bool(b) => Ok(Value::Real(if *b { 1.0 } else { 0.0 })),
             Value::Text(s) => s
                 .trim()
@@ -286,6 +467,7 @@ pub fn coerce(ty: ColumnType, value: &Value) -> Result<Value> {
             Value::Bool(b) => Ok(Value::Bool(*b)),
             Value::Int(n) => Ok(Value::Bool(*n != 0)),
             Value::Real(n) => Ok(Value::Bool(*n != 0.0)),
+            Value::Decimal { v, .. } => Ok(Value::Bool(*v != 0)),
             Value::Text(s) => {
                 let t = s.trim().to_lowercase();
                 match t.as_str() {
@@ -297,6 +479,54 @@ pub fn coerce(ty: ColumnType, value: &Value) -> Result<Value> {
             Value::Null => Ok(Value::Null),
         },
         ColumnType::Text => Ok(Value::Text(value.as_text())),
+        ColumnType::Decimal => match value {
+            Value::Decimal { v, scale: vs } => {
+                // 标度对齐：升标度乘 10，降标度四舍五入
+                if *vs == scale {
+                    Ok(Value::Decimal { v: *v, scale: *vs })
+                } else if *vs < scale {
+                    let v = v
+                        .checked_mul(10i128.pow((scale - *vs) as u32))
+                        .ok_or_else(|| DbError::type_error("DECIMAL 精度溢出"))?;
+                    Ok(Value::Decimal { v, scale })
+                } else {
+                    let divisor = 10i128.pow((*vs - scale) as u32);
+                    let q = v / divisor;
+                    let rem = (v % divisor).abs();
+                    let round = if rem * 2 >= divisor { 1i128 } else { 0i128 };
+                    let v = if *v < 0 { q - round } else { q + round };
+                    Ok(Value::Decimal { v, scale })
+                }
+            }
+            Value::Int(n) => {
+                let v = (*n as i128)
+                    .checked_mul(10i128.pow(scale as u32))
+                    .ok_or_else(|| DbError::type_error("DECIMAL 整数位过大"))?;
+                Ok(Value::Decimal { v, scale })
+            }
+            Value::Real(n) => {
+                if !n.is_finite() {
+                    return Err(DbError::type_error("DECIMAL 不接受无穷/NaN"));
+                }
+                let scaled = n * 10f64.powi(scale as i32);
+                if scaled.abs() > 1.7e38 {
+                    return Err(DbError::type_error("DECIMAL 数值过大"));
+                }
+                Ok(Value::Decimal {
+                    v: scaled.round() as i128,
+                    scale,
+                })
+            }
+            Value::Text(s) => {
+                let v = parse_decimal(s, scale)?;
+                Ok(Value::Decimal { v, scale })
+            }
+            Value::Bool(b) => Ok(Value::Decimal {
+                v: if *b { 10i128.pow(scale as u32) } else { 0 },
+                scale,
+            }),
+            Value::Null => Ok(Value::Null),
+        },
         ColumnType::Date => {
             let text = value.as_text();
             Ok(Value::Text(normalize_date(&text)?))
@@ -467,6 +697,19 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Int(y)) => Some((if *x { 1i64 } else { 0 }).cmp(y)),
         (Value::Int(x), Value::Bool(y)) => Some(x.cmp(&(if *y { 1i64 } else { 0 }))),
+        // Decimal：与另一 Decimal 或 Int 对齐标度后精确比较
+        (Value::Decimal { .. }, Value::Decimal { .. })
+        | (Value::Decimal { .. }, Value::Int(_))
+        | (Value::Int(_), Value::Decimal { .. }) => match align_decimals(a, b) {
+            Ok((x, y, _)) => Some(x.cmp(&y)),
+            Err(()) => None,
+        },
+        (Value::Decimal { .. }, Value::Real(_)) => {
+            a.as_f64().and_then(|x| b.as_f64().and_then(|y| x.partial_cmp(&y)))
+        }
+        (Value::Real(_), Value::Decimal { .. }) => {
+            a.as_f64().and_then(|x| b.as_f64().and_then(|y| x.partial_cmp(&y)))
+        }
         _ => None,
     }
 }
@@ -481,6 +724,7 @@ pub fn index_key(value: &Value) -> Option<String> {
         Value::Null => None,
         Value::Int(n) => Some(format!("n{}", n)),
         Value::Real(n) => Some(format!("n{}", n)),
+        Value::Decimal { v, scale } => Some(format!("d{}", format_decimal(*v, *scale))),
         Value::Bool(b) => Some(format!("b{}", if *b { 1 } else { 0 })),
         Value::Text(s) => Some(format!("s{}", s)),
     }
@@ -568,16 +812,16 @@ mod tests {
     #[test]
     fn coerce_rules() {
         assert_eq!(
-            coerce(ColumnType::Int, &Value::Text("42".to_string())).unwrap(),
+            coerce(ColumnType::Int, 0, &Value::Text("42".to_string())).unwrap(),
             Value::Int(42)
         );
-        assert!(coerce(ColumnType::Int, &Value::Text("4.2".to_string())).is_err());
+        assert!(coerce(ColumnType::Int, 0, &Value::Text("4.2".to_string())).is_err());
         assert_eq!(
-            coerce(ColumnType::Bool, &Value::Text("yes".to_string())).unwrap(),
+            coerce(ColumnType::Bool, 0, &Value::Text("yes".to_string())).unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            coerce(ColumnType::Json, &Value::Text("{ \"a\": 1 }".to_string())).unwrap(),
+            coerce(ColumnType::Json, 0, &Value::Text("{ \"a\": 1 }".to_string())).unwrap(),
             Value::Text("{\"a\":1}".to_string())
         );
     }
@@ -590,5 +834,51 @@ mod tests {
             "sx"
         );
         assert!(index_key(&Value::Null).is_none());
+    }
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::*;
+
+    #[test]
+    fn parse_and_format_roundtrip() {
+        for (text, scale) in [("123.45", 2u8), ("0.1", 4), ("-99.999", 3), ("42", 0), ("0.0001", 4)] {
+            let v = parse_decimal(text, scale).unwrap();
+            assert_eq!(format_decimal(v, scale), text, "roundtrip {}", text);
+        }
+        // 四舍五入到标度位（half-up）
+        assert_eq!(parse_decimal("1.005", 2).unwrap(), 101); // 1.01
+        assert_eq!(parse_decimal("1.004", 2).unwrap(), 100); // 1.00
+        assert_eq!(format_decimal(parse_decimal("1.006", 2).unwrap(), 2), "1.01");
+        // 尾随 0
+        assert_eq!(format_decimal(parse_decimal("10.50", 4).unwrap(), 4), "10.5");
+        assert_eq!(format_decimal(parse_decimal("10.0000", 4).unwrap(), 4), "10");
+    }
+
+    #[test]
+    fn decimal_compare_exact() {
+        let a = Value::Decimal { v: 10, scale: 1 }; // 1.0
+        let b = Value::Decimal { v: 99, scale: 2 }; // 0.99
+        assert_eq!(compare(&a, &b), Some(Ordering::Greater));
+        let c = Value::Decimal { v: 10, scale: 1 }; // 1.0
+        assert_eq!(compare(&a, &c), Some(Ordering::Equal));
+        // 跨类型：Decimal vs Int
+        assert_eq!(compare(&Value::Int(1), &a), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn decimal_index_key_stable() {
+        let k1 = index_key(&Value::Decimal { v: 12345, scale: 4 }).unwrap();
+        let k2 = index_key(&Value::Decimal { v: 123450, scale: 5 }).unwrap();
+        assert_eq!(k1, "d1.2345");
+        assert_eq!(k2, "d1.2345"); // 同值不同标度 → 同键
+    }
+
+    #[test]
+    fn garbage_rejected() {
+        assert!(parse_decimal("abc", 4).is_err());
+        assert!(parse_decimal("1.2.3", 4).is_err());
+        assert!(parse_decimal("", 4).is_err());
     }
 }

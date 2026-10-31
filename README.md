@@ -537,6 +537,14 @@ $payload = json_decode(curl_exec($ch), true);   // $payload['result']
 
 ## 性能测试
 
+### 可视化测试台（推荐）
+
+双击 `bench\启动性能测试.bat`（或 `python bench\app.py`）：自动起一个隔离的数据库实例
+（随机空闲端口，数据放在 `bench\data\`，与真实数据隔离）并打开浏览器界面——
+填规模、点「开始测试」，看进度条、吞吐对比图和延迟分位数，跑完自动停库。
+
+### 命令行版
+
 `tools/bench.py` 按真实部署形态（HTTP + 认证 + 参数化）测六类场景：
 
 ```powershell

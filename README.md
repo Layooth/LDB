@@ -1,6 +1,4 @@
-# LittleDB
-
-[![CI](https://github.com/Layooth/LDB/actions/workflows/ci.yml/badge.svg)](https://github.com/Layooth/LDB/actions/workflows/ci.yml) (Rust)
+# LittleDB (Rust)
 
 单机嵌入式数据库：4KB slotted page + LDBW2 预写日志 + 快照隔离事务 + 自研 SQL 执行器，
 带 LDBP/1 TCP 协议服务和一个单文件 Web 控制台。**运行时零第三方依赖**（只用 std）。
@@ -189,9 +187,8 @@ build.cmd build --release # 发布构建
 
 ### 一键门禁与专项脚本
 
-**CI**：`.github/workflows/ci.yml`——push / PR 时在 Windows runner 上自动执行完整门禁
-（Rust 测试 → release 构建 → 部署 → 冒烟 → JS/Python SDK），并单独编译检查桌面版。
-本地通过 = CI 通过（CI 复用同一个脚本）。
+质量把关靠**本地门禁** `tools/verify.ps1`（测试 → 构建 → 部署 → 冒烟 → SDK 测试）；
+仓库未配置 CI（可按需自行添加 `.github/workflows/`）。
 
 ```powershell
 pwsh -File tools\verify.ps1              # 测试 → 发布构建 → 部署 → 冒烟（10 项 HTTP/会话/并发/畸形请求）

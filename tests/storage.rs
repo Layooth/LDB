@@ -155,7 +155,7 @@ fn update_replaces_row_and_keeps_index_consistent() {
     setup(&mut engine).unwrap();
 
     let row_id = engine
-        .write(|e| -> Result<u32> {
+        .write(|e| -> Result<u64> {
             e.insert(
                 "players",
                 vec![Value::Int(1), Value::Text("old".to_string()), Value::Int(10)],
@@ -493,7 +493,7 @@ fn many_rows_cross_pages() {
     // 删除一半再验证
     engine
         .write(|e| -> Result<()> {
-            let ids: Vec<u32> = e.scan("players")?.iter().map(|item| item.0).take(250).collect();
+            let ids: Vec<u64> = e.scan("players")?.iter().map(|item| item.0).take(250).collect();
             for id in ids {
                 e.delete("players", id)?;
             }

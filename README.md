@@ -209,7 +209,7 @@ build.cmd test --release -- --ignored row_cap
 
 **页**（slotted page，小端）：`pageType(1) | 保留(3) | pageNo(4) | slotCount(2) | freeOffset(2) |
 nextPage(4) | flags(4) | 保留(4)` = 24B 头，之后是每槽 6B 的 slot 目录（offset/len/flags），
-记录从页尾向前生长。行号 `row_id = (pageNo << 16) | slot`，因此**单表上限 65535 页 ≈ 256MB**。
+记录从页尾向前生长。行号 `row_id = (pageNo << 16) | slot`（u64：页号 32 位 + 槽 16 位），**单表容量只受文件系统限制（约 16 TiB）**；row_id 仅存在于内存索引，磁盘格式不存它。
 
 **行编码**：`null bitmap(⌈列数/8⌉)` + 非空列依次拼接：INT=i64、REAL=f64、BOOL=1B、
 TEXT/DATE/DATETIME/JSON=u32 长度+UTF-8、DECIMAL=i128（标度存 catalog）。单行上限 4060B。
@@ -645,7 +645,7 @@ python tools\bench.py
 | 项 | 值 |
 |---|---|
 | 页大小 / 单行 | 4096B / 4060B |
-| 单表 | 65535 页 ≈ 256MB |
+| 单表 | 约 16 TiB（u32 页号 × 4KB 页） |
 | 单语句物化行数 | 500,000（超出报 `LIMIT_EXCEEDED`，请加 WHERE/LIMIT） |
 | JOIN 组合行对 | 2,000,000 |
 | 协议帧 / HTTP body | 16MB / 2MB |

@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use crate::codec::{self, Column, ColumnType, Value};
 use crate::engine::{Engine, IndexLookup};
 use crate::error::{self, DbError, Result};
-use crate::table;
+use crate::table::{self, RowId};
 use crate::json::Json;
 
 use super::ast::*;
@@ -2248,7 +2248,7 @@ fn range_candidates(
     where_clause: Option<&Expr>,
     params: &[Value],
     owner: Option<u64>,
-) -> Result<Option<Vec<u32>>> {
+) -> Result<Option<Vec<RowId>>> {
     let expr = match where_clause {
         Some(e) => e,
         None => return Ok(None),
@@ -2671,7 +2671,7 @@ fn write_candidates(
     where_clause: Option<&Expr>,
     params: &[Value],
     owner: u64,
-) -> Result<Option<Vec<u32>>> {
+) -> Result<Option<Vec<RowId>>> {
     let Some(expr) = where_clause else {
         return Ok(None);
     };
@@ -2715,7 +2715,7 @@ fn exec_update(
     };
 
     // 行来源：索引候选（通常只有几行）→ 全表快照（受行数上限保护）
-    let rows: Vec<(u32, Vec<Value>)> =
+    let rows: Vec<(RowId, Vec<Value>)> =
         match write_candidates(&*engine, &stmt.table, where_clause.as_ref(), params, owner)? {
             Some(ids) => {
                 let mut rows = Vec::with_capacity(ids.len());
@@ -2773,7 +2773,7 @@ fn exec_delete(
         Some(expr) => Some(resolve_subqueries(&*engine, expr, params, false, Some(owner))?),
         None => None,
     };
-    let rows: Vec<(u32, Vec<Value>)> =
+    let rows: Vec<(RowId, Vec<Value>)> =
         match write_candidates(&*engine, &stmt.table, where_clause.as_ref(), params, owner)? {
             Some(ids) => {
                 let mut rows = Vec::with_capacity(ids.len());
@@ -3080,12 +3080,10 @@ fn exec_vacuum(engine: &mut Engine) -> Result<QueryResult> {
             message: "没有表需要整理".to_string(),
         });
     }
-    let mut total_before = 0u64;
     let mut rebuilt = 0usize;
     let mut total_rows = 0u64;
     for name in &names {
-        let (before, _) = engine.vacuum_table(name)?;
-        total_before += before;
+        let _ = engine.vacuum_table(name)?;
         total_rows += engine.table(name)?.row_count as u64;
         rebuilt += 1;
     }

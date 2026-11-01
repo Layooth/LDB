@@ -11,7 +11,7 @@ use crate::codec::{self, Column, ColumnType, Value};
 use crate::error::{self, DbError, Result};
 use crate::json::Json;
 use crate::store::{IndexOp, Store, StoreStats};
-use crate::table::{self, Index, Table};
+use crate::table::{self, Index, RowId, Table};
 
 pub struct Engine {
     pub store: Store,
@@ -35,7 +35,7 @@ pub const EXCLUSIVE_TXN_OWNER: u64 = u64::MAX;
 /// 一次索引查找的结果：命中的 rowId + 人类可读的访问方式（EXPLAIN 直接复用，
 /// 保证「执行计划」与实际走的路一致）
 pub struct IndexLookup {
-    pub ids: Vec<u32>,
+    pub ids: Vec<RowId>,
     pub label: String,
 }
 
@@ -433,7 +433,7 @@ impl Engine {
 
     // ------------------------------------------------------------ 行操作
 
-    pub fn insert(&mut self, table_name: &str, values: Vec<Value>) -> Result<u32> {
+    pub fn insert(&mut self, table_name: &str, values: Vec<Value>) -> Result<RowId> {
         Ok(self.insert_returning(table_name, values)?.0)
     }
 
@@ -448,7 +448,7 @@ impl Engine {
         &mut self,
         table_name: &str,
         mut values: Vec<Value>,
-    ) -> Result<(u32, Option<i64>)> {
+    ) -> Result<(RowId, Option<i64>)> {
         let position = self.table_index(table_name)?;
         let auto_value = self.assign_auto_increment(position, &mut values)?;
         let row_id = table::insert(&mut self.store, &mut self.tables[position], values)?;
@@ -517,7 +517,7 @@ impl Engine {
         let position = self.table_index(table_name)?;
         let table_id = self.tables[position].id;
 
-        let mut ids: Vec<u32> = Vec::new();
+        let mut ids: Vec<RowId> = Vec::new();
         {
             let table = &self.tables[position];
             table::scan_shared_while(&self.store, table, None, |row_id, _values| {
@@ -554,10 +554,10 @@ impl Engine {
         &self,
         table_id: u32,
         index_pos: usize,
-        mut ids: Vec<u32>,
+        mut ids: Vec<RowId>,
         owner: Option<u64>,
         mut hit: impl FnMut(&str) -> bool,
-    ) -> Vec<u32> {
+    ) -> Vec<RowId> {
         if let Some(o) = owner {
             if let Some(txn) = self.store.txn_of(o) {
                 for op in &txn.index_ops {
@@ -602,7 +602,7 @@ impl Engine {
         column_name: &str,
         bounds: &table::RangeBounds,
         owner: Option<u64>,
-    ) -> Option<Vec<u32>> {
+    ) -> Option<Vec<RowId>> {
         let position = self.table_index(table_name).ok()?;
         let table = &self.tables[position];
         let ci = table.column_index(column_name)?;
@@ -639,37 +639,37 @@ impl Engine {
         self.store.has_txns_other_than(owner)
     }
 
-    pub fn delete(&mut self, table_name: &str, row_id: u32) -> Result<bool> {
+    pub fn delete(&mut self, table_name: &str, row_id: RowId) -> Result<bool> {
         let position = self.table_index(table_name)?;
         table::delete(&mut self.store, &mut self.tables[position], row_id)
     }
 
-    pub fn update(&mut self, table_name: &str, row_id: u32, values: Vec<Value>) -> Result<Option<u32>> {
+    pub fn update(&mut self, table_name: &str, row_id: RowId, values: Vec<Value>) -> Result<Option<RowId>> {
         let position = self.table_index(table_name)?;
         table::update(&mut self.store, &mut self.tables[position], row_id, values)
     }
 
-    pub fn get(&mut self, table_name: &str, row_id: u32) -> Result<Option<Vec<Value>>> {
+    pub fn get(&mut self, table_name: &str, row_id: RowId) -> Result<Option<Vec<Value>>> {
         let position = self.table_index(table_name)?;
         let table = &self.tables[position];
         table::get(&mut self.store, table, row_id)
     }
 
-    pub fn scan(&mut self, table_name: &str) -> Result<Vec<(u32, Vec<Value>)>> {
+    pub fn scan(&mut self, table_name: &str) -> Result<Vec<(RowId, Vec<Value>)>> {
         let position = self.table_index(table_name)?;
         let table = &self.tables[position];
         table::scan(&mut self.store, table)
     }
 
     /// 共享视图扫描（读锁 / &self）：owner 匹配事务属主时可见其未提交页
-    pub fn scan_shared(&self, table_name: &str, owner: Option<u64>) -> Result<Vec<(u32, Vec<Value>)>> {
+    pub fn scan_shared(&self, table_name: &str, owner: Option<u64>) -> Result<Vec<(RowId, Vec<Value>)>> {
         let position = self.table_index(table_name)?;
         let table = &self.tables[position];
         table::scan_shared(&self.store, table, owner)
     }
 
     /// 共享视图按 row_id 取行
-    pub fn get_shared(&self, table_name: &str, row_id: u32, owner: Option<u64>) -> Result<Option<Vec<Value>>> {
+    pub fn get_shared(&self, table_name: &str, row_id: RowId, owner: Option<u64>) -> Result<Option<Vec<Value>>> {
         let position = self.table_index(table_name)?;
         let table = &self.tables[position];
         table::get_shared(&self.store, table, row_id, owner)
@@ -682,7 +682,7 @@ impl Engine {
         column_name: &str,
         value: &Value,
         owner: Option<u64>,
-    ) -> Result<Option<Vec<u32>>> {
+    ) -> Result<Option<Vec<RowId>>> {
         let equals = [(column_name.to_string(), value.clone())];
         Ok(self
             .find_by_index(table_name, &equals, owner)?
@@ -963,7 +963,7 @@ impl Engine {
             // （free_pages 的语义是「有空闲空间可复用的页」，半空页带活行属正常，
             //   所以只校验页号范围，不要求「无活行」）
             let free: std::collections::HashSet<u32> = free_pages;
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut seen_ids: std::collections::HashSet<RowId> = std::collections::HashSet::new();
             for (row_id, _) in &rows {
                 let (page_no, _slot) = crate::table::split_row_id(*row_id);
                 if page_no >= page_count {
@@ -985,7 +985,7 @@ impl Engine {
 
             // ---- 3. 索引一致性：重建期望并与内存比对
             let index_count = self.tables[position].indexes.len();
-            let mut expected: Vec<std::collections::BTreeMap<String, Vec<u32>>> =
+            let mut expected: Vec<std::collections::BTreeMap<String, Vec<RowId>>> =
                 vec![std::collections::BTreeMap::new(); index_count];
             for (row_id, values) in &rows {
                 for (pos, key) in crate::table::index_keys_of(&self.tables[position], values) {

@@ -182,13 +182,13 @@ pub enum IndexOp {
         table_id: u32,
         index_pos: usize,
         key: String,
-        row_id: u32,
+        row_id: crate::table::RowId,
     },
     Remove {
         table_id: u32,
         index_pos: usize,
         key: String,
-        row_id: u32,
+        row_id: crate::table::RowId,
     },
 }
 

@@ -21,7 +21,14 @@ const RECLAIM_MIN_BYTES: usize = 512;
 
 /// row_id = (page_no << 16) | slot，page_no 只有 16 位可用，
 /// 超过上限后 row_id 会与前面的页冲突（静默数据损坏），必须显式拒绝。
-pub const MAX_PAGES_PER_TABLE: u32 = 65535;
+/// row_id = (page_no << 16) | slot：**u64**，页号占 32 位、槽号占 16 位。
+/// 单表容量因此只受文件系统限制（u32 页号 × 4KB ≈ 16 TiB）。
+/// row_id 只存在于内存（索引/执行器），页/WAL/catalog 都不存它，
+/// 所以扩宽编码不需要任何磁盘格式迁移。
+pub type RowId = u64;
+
+/// 页数上限（u32 页号的自然边界；4TB 文件偏移在 NTFS/ext4 上均无压力）
+pub const MAX_PAGES_PER_TABLE: u32 = u32::MAX;
 
 pub struct Index {
     pub name: String,
@@ -29,7 +36,7 @@ pub struct Index {
     pub unique: bool,
     pub primary: bool,
     pub implicit: bool,
-    pub map: BTreeMap<String, Vec<u32>>,
+    pub map: BTreeMap<String, Vec<RowId>>,
 }
 
 impl Index {
@@ -54,12 +61,12 @@ pub struct Table {
     pub free_pages: HashSet<u32>,
 }
 
-pub fn make_row_id(page_no: u32, slot: u16) -> u32 {
-    (page_no << 16) | slot as u32
+pub fn make_row_id(page_no: u32, slot: u16) -> RowId {
+    ((page_no as u64) << 16) | slot as u64
 }
 
-pub fn split_row_id(row_id: u32) -> (u32, u16) {
-    (row_id >> 16, (row_id & 0xFFFF) as u16)
+pub fn split_row_id(row_id: RowId) -> (u32, u16) {
+    ((row_id >> 16) as u32, (row_id & 0xFFFF) as u16)
 }
 
 impl Table {
@@ -177,7 +184,7 @@ impl Table {
 }
 
 /// 扫描整表，返回 (row_id, values)
-pub fn scan(store: &mut Store, table: &Table) -> Result<Vec<(u32, Vec<Value>)>> {
+pub fn scan(store: &mut Store, table: &Table) -> Result<Vec<(RowId, Vec<Value>)>> {
     let pages = store.page_count(table.id);
     let mut rows = Vec::new();
     for page_no in 0..pages {
@@ -194,7 +201,7 @@ pub fn scan(store: &mut Store, table: &Table) -> Result<Vec<(u32, Vec<Value>)>> 
 }
 
 /// 共享视图扫描（&store，读锁下并发安全）
-pub fn scan_shared(store: &Store, table: &Table, owner: Option<u64>) -> Result<Vec<(u32, Vec<Value>)>> {
+pub fn scan_shared(store: &Store, table: &Table, owner: Option<u64>) -> Result<Vec<(RowId, Vec<Value>)>> {
     let pages = store.page_count_shared(table.id);
     let mut rows = Vec::new();
     for page_no in 0..pages {
@@ -221,7 +228,7 @@ pub fn scan_shared_while<F>(
     mut visit: F,
 ) -> Result<()>
 where
-    F: FnMut(u32, Vec<Value>) -> Result<bool>,
+    F: FnMut(RowId, Vec<Value>) -> Result<bool>,
 {
     let pages = store.page_count_shared(table.id);
     for page_no in 0..pages {
@@ -243,7 +250,7 @@ where
 pub fn get_shared(
     store: &Store,
     table: &Table,
-    row_id: u32,
+    row_id: RowId,
     owner: Option<u64>,
 ) -> Result<Option<Vec<Value>>> {
     let (page_no, slot) = split_row_id(row_id);
@@ -280,12 +287,12 @@ pub fn build_indexes(store: &mut Store, table: &mut Table) -> Result<()> {
 }
 
 /// 重建索引前先确认现有数据不违反唯一性（比如给已有重复值的列加唯一索引）
-fn check_all_unique(table: &Table, rows: &[(u32, Vec<Value>)]) -> Result<()> {
+fn check_all_unique(table: &Table, rows: &[(RowId, Vec<Value>)]) -> Result<()> {
     for index in &table.indexes {
         if !index.unique {
             continue;
         }
-        let mut seen: HashMap<String, u32> = HashMap::new();
+        let mut seen: HashMap<String, RowId> = HashMap::new();
         for (row_id, values) in rows {
             let picked: Vec<Value> = index.columns.iter().map(|i| values[*i].clone()).collect();
             if let Some(key) = codec::index_key_of(&picked) {
@@ -320,7 +327,7 @@ fn collect_free_pages(store: &mut Store, table: &Table) -> Result<HashSet<u32>> 
     Ok(free)
 }
 
-pub fn get(store: &mut Store, table: &Table, row_id: u32) -> Result<Option<Vec<Value>>> {
+pub fn get(store: &mut Store, table: &Table, row_id: RowId) -> Result<Option<Vec<Value>>> {
     let (page_no, slot) = split_row_id(row_id);
     if page_no >= store.page_count(table.id) {
         return Ok(None);
@@ -333,7 +340,7 @@ pub fn get(store: &mut Store, table: &Table, row_id: u32) -> Result<Option<Vec<V
 }
 
 /// key 级索引应用（提交期把 delta 落到共享索引时使用；带去重）
-pub fn index_add_key(table: &mut Table, index_pos: usize, key: &str, row_id: u32) {
+pub fn index_add_key(table: &mut Table, index_pos: usize, key: &str, row_id: RowId) {
     if let Some(index) = table.indexes.get_mut(index_pos) {
         let list = index.map.entry(key.to_string()).or_insert_with(Vec::new);
         if !list.contains(&row_id) {
@@ -342,7 +349,7 @@ pub fn index_add_key(table: &mut Table, index_pos: usize, key: &str, row_id: u32
     }
 }
 
-pub fn index_remove_key(table: &mut Table, index_pos: usize, key: &str, row_id: u32) {
+pub fn index_remove_key(table: &mut Table, index_pos: usize, key: &str, row_id: RowId) {
     if let Some(index) = table.indexes.get_mut(index_pos) {
         let mut empty = false;
         if let Some(list) = index.map.get_mut(key) {
@@ -374,7 +381,7 @@ fn record_index_delta(
     store: &mut Store,
     table: &Table,
     keys: &[(usize, String)],
-    row_id: u32,
+    row_id: RowId,
     add: bool,
 ) {
     for (pos, key) in keys {
@@ -416,7 +423,7 @@ fn check_not_null(table: &Table, values: &[Value]) -> Result<()> {
     Ok(())
 }
 
-fn insert_physical(store: &mut Store, table: &mut Table, record: &[u8]) -> Result<u32> {
+fn insert_physical(store: &mut Store, table: &mut Table, record: &[u8]) -> Result<RowId> {
     if record.len() > pg::MAX_RECORD_SIZE {
         return Err(DbError::new(
             error::ROW_TOO_LARGE,
@@ -478,10 +485,10 @@ fn insert_physical(store: &mut Store, table: &mut Table, record: &[u8]) -> Resul
         return Err(DbError::new(
             error::LIMIT,
             format!(
-                "表 \"{}\" 已达单表页数上限（{} 页 ≈ {} MB），无法再分配新页",
+                "表 \"{}\" 已达单表页数上限（{} 页 ≈ {} TB），无法再分配新页",
                 table.name,
                 MAX_PAGES_PER_TABLE,
-                MAX_PAGES_PER_TABLE * pg::PAGE_SIZE as u32 / 1024 / 1024
+                MAX_PAGES_PER_TABLE as u64 * pg::PAGE_SIZE as u64 / 1024 / 1024 / 1024 / 1024
             ),
         ));
     }
@@ -497,7 +504,7 @@ fn insert_physical(store: &mut Store, table: &mut Table, record: &[u8]) -> Resul
     Ok(make_row_id(page_no, slot))
 }
 
-fn delete_physical(store: &mut Store, table: &mut Table, row_id: u32) -> Result<bool> {
+fn delete_physical(store: &mut Store, table: &mut Table, row_id: RowId) -> Result<bool> {
     let (page_no, slot) = split_row_id(row_id);
     if page_no >= store.page_count(table.id) {
         return Ok(false);
@@ -529,7 +536,7 @@ fn reclaim_page_space(store: &mut Store, table_id: u32, page_no: u32) -> Result<
     Ok(())
 }
 
-pub fn insert(store: &mut Store, table: &mut Table, values: Vec<Value>) -> Result<u32> {
+pub fn insert(store: &mut Store, table: &mut Table, values: Vec<Value>) -> Result<RowId> {
     check_not_null(table, &values)?;
     let record = codec::encode_row(&table.columns, &values)?;
     let keys = index_keys_of(table, &values);
@@ -540,7 +547,7 @@ pub fn insert(store: &mut Store, table: &mut Table, values: Vec<Value>) -> Resul
     Ok(row_id)
 }
 
-pub fn delete(store: &mut Store, table: &mut Table, row_id: u32) -> Result<bool> {
+pub fn delete(store: &mut Store, table: &mut Table, row_id: RowId) -> Result<bool> {
     let values = match get(store, table, row_id)? {
         Some(v) => v,
         None => return Ok(false),
@@ -557,9 +564,9 @@ pub fn delete(store: &mut Store, table: &mut Table, row_id: u32) -> Result<bool>
 pub fn update(
     store: &mut Store,
     table: &mut Table,
-    row_id: u32,
+    row_id: RowId,
     values: Vec<Value>,
-) -> Result<Option<u32>> {
+) -> Result<Option<RowId>> {
     let old = match get(store, table, row_id)? {
         Some(v) => v,
         None => return Ok(None),
@@ -584,7 +591,7 @@ pub fn update(
 }
 
 /// 按等值条件查索引，返回 rowId 列表；没有可用索引返回 None
-pub fn find_by_equality(table: &Table, column_name: &str, value: &Value) -> Option<Vec<u32>> {
+pub fn find_by_equality(table: &Table, column_name: &str, value: &Value) -> Option<Vec<RowId>> {
     let index = table.single_column_index(column_name)?;
     let key = codec::index_key(value)?;
     match index.map.get(&key) {
@@ -594,7 +601,7 @@ pub fn find_by_equality(table: &Table, column_name: &str, value: &Value) -> Opti
 }
 
 /// 在指定索引上按完整 key 取 rowId（键不存在返回空）
-pub fn find_index_key(table: &Table, index_pos: usize, key: &str) -> Vec<u32> {
+pub fn find_index_key(table: &Table, index_pos: usize, key: &str) -> Vec<RowId> {
     match table.indexes.get(index_pos).and_then(|ix| ix.map.get(key)) {
         Some(list) => list.clone(),
         None => Vec::new(),
@@ -605,7 +612,7 @@ pub fn find_index_key(table: &Table, index_pos: usize, key: &str) -> Vec<u32> {
 ///
 /// 复合索引的键是「各列编码 + \u{1}」拼起来的，前导列等值时整段前缀相同，
 /// BTreeMap 从下界顺序扫到不再是该前缀为止即可（命中数而非表行数）。
-pub fn find_by_prefix(table: &Table, index_pos: usize, prefix: &str) -> Vec<u32> {
+pub fn find_by_prefix(table: &Table, index_pos: usize, prefix: &str) -> Vec<RowId> {
     let mut ids = Vec::new();
     if let Some(index) = table.indexes.get(index_pos) {
         for (key, list) in index
@@ -628,7 +635,7 @@ pub struct RangeBounds {
 }
 
 /// 按范围查索引：目标列必须是某个索引的**第一列**（单列索引或复合索引的前导列）
-pub fn find_by_range(table: &Table, column_name: &str, bounds: &RangeBounds) -> Option<Vec<u32>> {
+pub fn find_by_range(table: &Table, column_name: &str, bounds: &RangeBounds) -> Option<Vec<RowId>> {
     let ci = table.column_index(column_name)?;
     let index_pos = table
         .indexes
@@ -642,7 +649,7 @@ pub fn find_by_range_at(
     table: &Table,
     index_pos: usize,
     bounds: &RangeBounds,
-) -> Option<Vec<u32>> {
+) -> Option<Vec<RowId>> {
     let index = table.indexes.get(index_pos)?;
     let composite = index.columns.len() > 1;
 

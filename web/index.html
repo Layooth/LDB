@@ -2701,6 +2701,10 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     if (!capturingShortcut) return;
     e.preventDefault();
     e.stopPropagation();
+    // 长按的自动重复不参与录入（否则按住不放会连发多次）
+    if (e.repeat) return;
+    // 只按了修饰键本身（Control/Alt/Shift/Meta）：这是在等组合键，不是录入
+    if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return;
     if (e.key === 'Escape') {
       capturingShortcut = null;
       refreshShortcutUi();

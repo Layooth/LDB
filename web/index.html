@@ -463,6 +463,8 @@
   .help-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   .help-table td { padding: 7px 6px; border-bottom: 1px solid rgba(148, 163, 184, .08); }
   .help-table tr:last-child td { border-bottom: 0; }
+  .sc-capture { min-width: 140px; font-family: var(--mono); }
+  .sc-capture.capturing { border-color: var(--accent); color: #fff; background: var(--accent-soft); }
   .help-table td:first-child { white-space: nowrap; width: 42%; color: #cbd5e1; }
   .help-table td:last-child { color: var(--muted); }
   #filter-input {
@@ -774,11 +776,32 @@
       </div>
 
       <div class="settings-section">
+        <h3>快捷键（可自定义）</h3>
+        <div class="settings-row">
+          <div class="main">运行 SQL<div class="hint">点击右侧按钮后按下新组合；Esc 取消录入</div></div>
+          <button class="sc-capture" data-action="run">-</button>
+        </div>
+        <div class="settings-row">
+          <div class="main">唤起自动补全<div class="hint">默认已避开 Ctrl+空格（与输入法切换冲突）</div></div>
+          <button class="sc-capture" data-action="complete">-</button>
+        </div>
+        <div class="settings-row">
+          <div class="main">格式化 SQL<div class="hint">有选中内容时只格式化选中部分</div></div>
+          <button class="sc-capture" data-action="format">-</button>
+        </div>
+        <div class="settings-row">
+          <div class="main">恢复默认快捷键</div>
+          <button id="sc-reset">恢复默认</button>
+        </div>
+      </div>
+
+      <div class="settings-section">
         <h3>快捷键与操作</h3>
         <table class="help-table">
           <tbody>
-            <tr><td>Ctrl + Enter</td><td>运行 SQL（选中了文本则只执行选中部分）</td></tr>
-            <tr><td>Ctrl + 空格 / Alt + /</td><td>手动唤起自动补全</td></tr>
+            <tr><td id="sc-cur-run">-</td><td>运行 SQL（选中了文本则只执行选中部分）</td></tr>
+            <tr><td id="sc-cur-complete">-</td><td>手动唤起自动补全</td></tr>
+            <tr><td id="sc-cur-format">-</td><td>格式化 SQL</td></tr>
             <tr><td>Tab</td><td>接受补全候选；无补全时插入缩进</td></tr>
             <tr><td>Esc</td><td>关闭补全、右键菜单、弹窗</td></tr>
             <tr><td>Delete</td><td>删除表格中选中的行（需主键，慎用）</td></tr>
@@ -2545,14 +2568,19 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
       }
     }
 
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    if (matchShortcut(e, settings.shortcuts.run)) {
       e.preventDefault();
       execute();
       return;
     }
-    if ((e.ctrlKey && (e.key === ' ' || e.code === 'Space')) || (e.altKey && e.key === '/')) {
+    if (matchShortcut(e, settings.shortcuts.complete)) {
       e.preventDefault();
       computeSuggest(true);
+      return;
+    }
+    if (matchShortcut(e, settings.shortcuts.format)) {
+      e.preventDefault();
+      $('#format').click();
       return;
     }
     if (e.key === 'Tab') {
@@ -2583,14 +2611,41 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     autocomplete: true,  // 自动补全
     historyMax: 50,      // 历史保留条数
   };
+  // 可自定义快捷键（补全默认 Alt+/：Ctrl+空格 与中文输入法切换冲突）
+  const SHORTCUT_ACTIONS = [
+    { id: 'run', label: '运行 SQL' },
+    { id: 'complete', label: '唤起自动补全' },
+    { id: 'format', label: '格式化 SQL' },
+  ];
+  const DEFAULT_SHORTCUTS = { run: 'Ctrl+Enter', complete: 'Alt+/', format: 'Ctrl+Shift+F' };
   let settings = loadSettings();
 
   function loadSettings() {
+    let saved = {};
     try {
-      return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem('ldb_settings') || '{}'));
-    } catch (_) {
-      return Object.assign({}, DEFAULT_SETTINGS);
-    }
+      saved = JSON.parse(localStorage.getItem('ldb_settings') || '{}') || {};
+    } catch (_) { /* 忽略 */ }
+    const merged = Object.assign({}, DEFAULT_SETTINGS, saved);
+    // shortcuts 深合并：旧存档缺的键回落默认值
+    merged.shortcuts = Object.assign({}, DEFAULT_SHORTCUTS, saved.shortcuts || {});
+    return merged;
+  }
+
+  /** 键盘事件 → 规范组合串（如 "Ctrl+Alt+K"；单字母统一大写） */
+  function comboOf(e) {
+    const parts = [];
+    if (e.ctrlKey || e.metaKey) parts.push('Ctrl');
+    if (e.altKey) parts.push('Alt');
+    if (e.shiftKey) parts.push('Shift');
+    let key = e.key;
+    if (key === ' ' || e.code === 'Space') key = 'Space';
+    else if (key.length === 1) key = key.toUpperCase();
+    parts.push(key);
+    return parts.join('+');
+  }
+
+  function matchShortcut(e, combo) {
+    return !!combo && comboOf(e) === combo;
   }
 
   function saveSettings() {
@@ -2604,6 +2659,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     sqlInput.style.tabSize = settings.tabSize;
     document.body.classList.toggle('zebra', !!settings.zebra);
     document.body.classList.toggle('light', settings.theme === 'light');
+    refreshShortcutUi();
     if (historyItems.length > settings.historyMax) {
       historyItems.length = settings.historyMax;
       try { localStorage.setItem('ldb_history', JSON.stringify(historyItems)); } catch (_) { /* 忽略 */ }
@@ -2616,6 +2672,66 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     if (isNaN(v)) return def;
     return Math.min(max, Math.max(min, v));
   }
+
+  // ------------------------------------------------------------ 快捷键自定义
+  let capturingShortcut = null; // 正在录入的动作 id
+
+  function refreshShortcutUi() {
+    for (const a of SHORTCUT_ACTIONS) {
+      const btn = document.querySelector('.sc-capture[data-action="' + a.id + '"]');
+      if (btn) {
+        btn.textContent = settings.shortcuts[a.id] || '未设置';
+        btn.classList.toggle('capturing', capturingShortcut === a.id);
+      }
+      const cell = document.getElementById('sc-cur-' + a.id);
+      if (cell) cell.textContent = settings.shortcuts[a.id] || '未设置';
+    }
+  }
+
+  for (const btn of document.querySelectorAll('.sc-capture')) {
+    btn.addEventListener('click', () => {
+      capturingShortcut = btn.dataset.action;
+      refreshShortcutUi();
+      btn.textContent = '按下新组合…（Esc 取消）';
+    });
+  }
+
+  // 录入期拦截所有按键（capture 阶段，先于其它处理器）
+  document.addEventListener('keydown', (e) => {
+    if (!capturingShortcut) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === 'Escape') {
+      capturingShortcut = null;
+      refreshShortcutUi();
+      return;
+    }
+    // 必须带 Ctrl/Alt 修饰键，避免单键占用正常打字
+    if (!e.ctrlKey && !e.altKey && !e.metaKey) {
+      toast('组合需要包含 Ctrl 或 Alt（Esc 取消录入）');
+      return;
+    }
+    const combo = comboOf(e);
+    const dup = SHORTCUT_ACTIONS.find(
+      (a) => a.id !== capturingShortcut && settings.shortcuts[a.id] === combo
+    );
+    if (dup) {
+      toast('与「' + dup.label + '」冲突，请换一个组合');
+      return;
+    }
+    settings.shortcuts[capturingShortcut] = combo;
+    capturingShortcut = null;
+    saveSettings();
+    refreshShortcutUi();
+    toast('已设置');
+  }, true);
+
+  $('#sc-reset').addEventListener('click', () => {
+    settings.shortcuts = Object.assign({}, DEFAULT_SHORTCUTS);
+    saveSettings();
+    refreshShortcutUi();
+    toast('已恢复默认快捷键');
+  });
 
   const settingsModal = $('#settings-modal');
 

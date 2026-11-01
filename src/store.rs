@@ -334,6 +334,13 @@ impl Store {
         self.sync_thread = handle.ok();
     }
 
+    /// 是否存在「别的会话」的活跃写事务。
+    /// 索引条目在提交期才落进共享索引，但个别路径（如影子表重建的 build_indexes）
+    /// 会把未提交行直接写进索引——计数捷径在此时必须回退到逐行可见性过滤。
+    pub fn has_txns_other_than(&self, owner: u64) -> bool {
+        self.txns.keys().any(|key| *key != owner)
+    }
+
     pub fn set_wal_limit(&mut self, bytes: u64) {
         self.wal_limit = bytes;
     }

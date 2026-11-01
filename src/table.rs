@@ -630,10 +630,20 @@ pub struct RangeBounds {
 /// 按范围查索引：目标列必须是某个索引的**第一列**（单列索引或复合索引的前导列）
 pub fn find_by_range(table: &Table, column_name: &str, bounds: &RangeBounds) -> Option<Vec<u32>> {
     let ci = table.column_index(column_name)?;
-    let index = table
+    let index_pos = table
         .indexes
         .iter()
-        .find(|ix| ix.columns.first() == Some(&ci))?;
+        .position(|ix| ix.columns.first() == Some(&ci))?;
+    find_by_range_at(table, index_pos, bounds)
+}
+
+/// 同上，但由调用方指定索引位置（引擎层要在同一个索引上合并事务 delta）
+pub fn find_by_range_at(
+    table: &Table,
+    index_pos: usize,
+    bounds: &RangeBounds,
+) -> Option<Vec<u32>> {
+    let index = table.indexes.get(index_pos)?;
     let composite = index.columns.len() > 1;
 
     // 复合索引的键是「各列编码 + \u{1}」，范围只作用在第一列上：

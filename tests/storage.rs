@@ -2122,6 +2122,122 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// COUNT(*) 索引计数捷径 + 范围路径的读己之写（旧版范围扫描缺失 delta 合并）
+#[test]
+fn count_shortcut_and_range_read_own_writes() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("countshortcut");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, k INT, v INT)", &[])
+        .unwrap();
+    session.execute("CREATE INDEX ix_k ON t(k)", &[]).unwrap();
+    session
+        .execute(
+            &format!(
+                "INSERT INTO t (k, v) VALUES {}",
+                (0..100).map(|i| format!("({},0)", i)).collect::<Vec<_>>().join(",")
+            ),
+            &[],
+        )
+        .unwrap();
+
+    let scalar = |session: &mut Session, sql: &str| -> (String, Value) {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { columns, rows, .. } => {
+                assert_eq!(rows.len(), 1, "{}", sql);
+                (columns[0].clone(), rows[0][0].clone())
+            }
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+    let count = |session: &mut Session, sql: &str, expected_name: &str| -> i64 {
+        let (name, value) = scalar(session, sql);
+        // 捷径与常规路径的列名必须一致（expr_label 的既有约定：
+        // COUNT(*) → "COUNT(*)"，COUNT(列) → "COUNT()"——参数列表不进列名）
+        assert_eq!(name, expected_name, "列名应一致：{}", sql);
+        match value {
+            Value::Int(n) => n,
+            other => panic!("期望 INT，得到 {:?}", other),
+        }
+    };
+    let ids = |session: &mut Session, sql: &str| -> usize {
+        match session.execute(sql, &[]).unwrap() {
+            QueryResult::Select { rows, .. } => rows.len(),
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        }
+    };
+
+    // 范围 COUNT（走捷径）与等值 COUNT
+    assert_eq!(
+        count(&mut session, "SELECT COUNT(*) FROM t WHERE k BETWEEN 10 AND 19", "COUNT(*)"),
+        10
+    );
+    assert_eq!(count(&mut session, "SELECT COUNT(*) FROM t WHERE k = 15", "COUNT(*)"), 1);
+
+    // 读己之写（范围路径）：本事务未提交的插入必须可见（旧版会「消失」）
+    session.execute("BEGIN", &[]).unwrap();
+    session
+        .execute("INSERT INTO t (k, v) VALUES (15, 1),(15, 2),(150, 3)", &[])
+        .unwrap();
+    assert_eq!(
+        ids(&mut session, "SELECT id FROM t WHERE k BETWEEN 10 AND 19"),
+        12,
+        "范围扫描应看到本事务未提交的 2 行"
+    );
+    assert_eq!(
+        count(&mut session, "SELECT COUNT(*) FROM t WHERE k BETWEEN 10 AND 19", "COUNT(*)"),
+        12
+    );
+    // 事务内删除同样立即可见
+    session.execute("DELETE FROM t WHERE k = 15 AND v = 1", &[]).unwrap();
+    assert_eq!(
+        count(&mut session, "SELECT COUNT(*) FROM t WHERE k BETWEEN 10 AND 19", "COUNT(*)"),
+        11
+    );
+    session.execute("ROLLBACK", &[]).unwrap();
+    assert_eq!(
+        count(&mut session, "SELECT COUNT(*) FROM t WHERE k BETWEEN 10 AND 19", "COUNT(*)"),
+        10,
+        "回滚后恢复"
+    );
+
+    // 非捷径形态仍然正确：COUNT(列)、COUNT(DISTINCT 列)、非索引条件
+    // （注意 expr_label 的既有约定：COUNT(列) 的列名是 "COUNT()"，参数不进列名）
+    assert_eq!(
+        count(&mut session, "SELECT COUNT(k) FROM t WHERE k BETWEEN 10 AND 19", "COUNT()"),
+        10
+    );
+    assert_eq!(
+        count(&mut session, "SELECT COUNT(DISTINCT k) FROM t WHERE k BETWEEN 10 AND 19", "COUNT()"),
+        10
+    );
+    assert_eq!(
+        count(&mut session, "SELECT COUNT(*) FROM t WHERE v + 0 = 0", "COUNT(*)"),
+        100,
+        "非索引条件走全表扫描，结果不受捷径影响"
+    );
+    // GROUP BY 形态不匹配捷径（多行结果），结果也必须正确
+    match session
+        .execute(
+            "SELECT COUNT(*) AS n FROM t WHERE k < 5 GROUP BY k ORDER BY k",
+            &[],
+        )
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(
+            rows,
+            vec![vec![Value::Int(1)]; 5],
+            "k=0..4 各一组，每组 1 行"
+        ),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 标量子查询：投影、WHERE 比较、相关子查询、空结果与错误路径
 #[test]
 fn scalar_subquery() {

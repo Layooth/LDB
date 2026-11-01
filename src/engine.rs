@@ -546,6 +546,99 @@ impl Engine {
         Ok(removed)
     }
 
+    /// 把本事务的索引 delta 合并进查找结果（读己之写）。
+    ///
+    /// `hit` 判定某个 delta 的键是否落在本次查找覆盖的键区间内：
+    /// 等值查找是精确相等，前缀查找是 starts_with，范围查找是区间比较。
+    fn merge_index_deltas(
+        &self,
+        table_id: u32,
+        index_pos: usize,
+        mut ids: Vec<u32>,
+        owner: Option<u64>,
+        mut hit: impl FnMut(&str) -> bool,
+    ) -> Vec<u32> {
+        if let Some(o) = owner {
+            if let Some(txn) = self.store.txn_of(o) {
+                for op in &txn.index_ops {
+                    let (op_table, op_pos, op_key, op_row, is_add) = match op {
+                        IndexOp::Add {
+                            table_id,
+                            index_pos,
+                            key,
+                            row_id,
+                        } => (*table_id, *index_pos, key, *row_id, true),
+                        IndexOp::Remove {
+                            table_id,
+                            index_pos,
+                            key,
+                            row_id,
+                        } => (*table_id, *index_pos, key, *row_id, false),
+                    };
+                    if op_table != table_id || op_pos != index_pos || !hit(op_key) {
+                        continue;
+                    }
+                    if is_add {
+                        if !ids.contains(&op_row) {
+                            ids.push(op_row);
+                        }
+                    } else {
+                        ids.retain(|id| *id != op_row);
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// 前导列范围查找（共享视图 + 读己之写）。
+    ///
+    /// `bounds` 里的键必须已按 `codec::index_key` 编码（`range_candidates` 负责）。
+    /// 返回 None 表示该列没有前导索引；有 delta 的一并合并，
+    /// 所以本事务未提交的插入/删除在这里同样可见/不可见。
+    pub fn find_by_range_shared(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        bounds: &table::RangeBounds,
+        owner: Option<u64>,
+    ) -> Option<Vec<u32>> {
+        let position = self.table_index(table_name).ok()?;
+        let table = &self.tables[position];
+        let ci = table.column_index(column_name)?;
+        let index_pos = table
+            .indexes
+            .iter()
+            .position(|ix| ix.columns.first() == Some(&ci))?;
+        let ids = table::find_by_range_at(table, index_pos, bounds)?;
+        let table_id = table.id;
+        Some(self.merge_index_deltas(table_id, index_pos, ids, owner, |op_key: &str| {
+            let within = |bound: &Option<(String, bool)>, is_lower: bool| -> bool {
+                match bound {
+                    None => true,
+                    Some((key, inclusive)) => {
+                        let ord = op_key.cmp(key.as_str());
+                        if is_lower {
+                            ord == std::cmp::Ordering::Greater
+                                || (ord == std::cmp::Ordering::Equal && *inclusive)
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                                || (ord == std::cmp::Ordering::Equal && *inclusive)
+                        }
+                    }
+                }
+            };
+            within(&bounds.lower, true) && within(&bounds.upper, false)
+        }))
+    }
+
+    /// 是否存在「别的会话」的活跃写事务。
+    /// COUNT(*) 索引计数捷径的保险丝：个别路径（影子表重建的 build_indexes）
+    /// 会把未提交行写进共享索引，此时必须回退到逐行可见性过滤。
+    pub fn has_other_writers(&self, owner: u64) -> bool {
+        self.store.has_txns_other_than(owner)
+    }
+
     pub fn delete(&mut self, table_name: &str, row_id: u32) -> Result<bool> {
         let position = self.table_index(table_name)?;
         table::delete(&mut self.store, &mut self.tables[position], row_id)
@@ -673,44 +766,19 @@ impl Engine {
             table::find_by_prefix(table, index_pos, &prefix)
         };
 
-        if let Some(o) = owner {
-            if let Some(txn) = self.store.txn_of(o) {
-                for op in &txn.index_ops {
-                    let (op_table, op_pos, op_key, op_row, is_add) = match op {
-                        IndexOp::Add {
-                            table_id,
-                            index_pos,
-                            key,
-                            row_id,
-                        } => (*table_id, *index_pos, key, *row_id, true),
-                        IndexOp::Remove {
-                            table_id,
-                            index_pos,
-                            key,
-                            row_id,
-                        } => (*table_id, *index_pos, key, *row_id, false),
-                    };
-                    if op_table != table.id || op_pos != index_pos {
-                        continue;
-                    }
-                    let hit = if full {
-                        op_key == &key
-                    } else {
-                        op_key.starts_with(&prefix)
-                    };
-                    if !hit {
-                        continue;
-                    }
-                    if is_add {
-                        if !ids.contains(&op_row) {
-                            ids.push(op_row);
-                        }
-                    } else {
-                        ids.retain(|id| *id != op_row);
-                    }
+        ids = self.merge_index_deltas(
+            table.id,
+            index_pos,
+            ids,
+            owner,
+            |op_key: &str| {
+                if full {
+                    op_key == &key
+                } else {
+                    op_key.starts_with(&prefix)
                 }
-            }
-        }
+            },
+        );
 
         let label = if full {
             format!("索引查找（{}，{} 列）", index.name, k)

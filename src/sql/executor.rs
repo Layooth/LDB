@@ -1032,7 +1032,7 @@ fn select_base(
                 let candidates =
                     index_candidates(engine, name, where_clause.as_ref(), params, owner)?;
                 let range_ids = if candidates.is_none() {
-                    range_candidates(engine, name, where_clause.as_ref(), params)?
+                    range_candidates(engine, name, where_clause.as_ref(), params, owner)?
                 } else {
                     None
                 };
@@ -1253,6 +1253,29 @@ fn select_base(
     Ok((out_columns, out_types, output))
 }
 
+/// 是否是「纯 `SELECT COUNT(*) FROM t [WHERE …]`」形态（可走索引计数捷径）。
+///
+/// 收紧到最窄形态：无 DISTINCT/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET/UNION，
+/// 投影只有一个是 `COUNT(*)`（`COUNT(列)`/`COUNT(DISTINCT …)` 不算——它们要看行内容）。
+fn is_star_count(stmt: &SelectStmt) -> bool {
+    if stmt.distinct
+        || !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || stmt.union.is_some()
+        || stmt.items.len() != 1
+    {
+        return false;
+    }
+    matches!(
+        &stmt.items[0].expr,
+        Expr::Function { name, star: true, args, .. }
+            if name.eq_ignore_ascii_case("COUNT") && args.is_empty()
+    )
+}
+
 /// `ORDER BY` 里引用投影别名时，返回该别名在输出列中的下标。
 ///
 /// 只处理裸列名（`ORDER BY d`）；`ORDER BY 表达式` 仍然走正常求值。
@@ -1415,6 +1438,36 @@ pub(crate) fn exec_select(
     if !stmt.ctes.is_empty() {
         let expanded = expand_ctes(stmt)?;
         return exec_select(engine, &expanded, params, committed_only, owner, outer);
+    }
+
+    // COUNT(*) 捷径：WHERE 完全落在索引上（等值/前缀/范围）时直接数索引条目，
+    // 不回表取行——50 万行的范围 COUNT 从 ~500 ops/s 提升到数千 ops/s。
+    // 保险丝：有其他会话的活跃写事务时回退常规路径（索引里可能有未提交行，
+    // 捷径没有逐行可见性过滤）。
+    if is_star_count(stmt) {
+        if let Some(TableSource::Table { name, .. }) = &stmt.from {
+            let has_other_writers = engine.has_other_writers(owner.unwrap_or(0));
+            if !has_other_writers {
+                let ids = index_candidates(engine, name, stmt.where_clause.as_ref(), params, owner)?
+                    .map(|lookup| lookup.ids)
+                    .or(range_candidates(
+                        engine,
+                        name,
+                        stmt.where_clause.as_ref(),
+                        params,
+                        owner,
+                    )?);
+                if let Some(ids) = ids {
+                    return Ok(QueryResult::Select {
+                        // 列名用 expr_label 产出，与常规路径完全一致（是 "COUNT()"）
+                        columns: vec![expr_label(&stmt.items[0].expr)],
+                        types: vec!["INT".to_string()],
+                        rows: vec![vec![Value::Int(ids.len() as i64)]],
+                    });
+                }
+                // 没有可用索引 → 走下面的常规路径（全表扫描数数）
+            }
+        }
     }
 
     let (columns, mut types, mut pairs) =
@@ -2189,6 +2242,7 @@ fn range_candidates(
     table_name: &str,
     where_clause: Option<&Expr>,
     params: &[Value],
+    owner: Option<u64>,
 ) -> Result<Option<Vec<u32>>> {
     let expr = match where_clause {
         Some(e) => e,
@@ -2222,7 +2276,9 @@ fn range_candidates(
         if bounds.lower.is_none() && bounds.upper.is_none() {
             continue;
         }
-        if let Some(ids) = crate::table::find_by_range(table, column_name, &bounds) {
+        // 走引擎层：带读己之写的 delta 合并（旧实现直接读共享索引，
+        // 本事务未提交的插入在范围扫描里会「消失」）
+        if let Some(ids) = engine.find_by_range_shared(table_name, column_name, &bounds, owner) {
             return Ok(Some(ids));
         }
     }
@@ -2617,7 +2673,7 @@ fn write_candidates(
     if let Some(lookup) = index_candidates(engine, table, Some(expr), params, Some(owner))? {
         return Ok(Some(lookup.ids));
     }
-    range_candidates(engine, table, Some(expr), params)
+    range_candidates(engine, table, Some(expr), params, Some(owner))
 }
 
 fn exec_update(
@@ -3069,7 +3125,7 @@ fn exec_explain(
                                 read
                             }
                             None => {
-                                match range_candidates(engine, name, select.where_clause.as_ref(), params)? {
+                                match range_candidates(engine, name, select.where_clause.as_ref(), params, Some(owner))? {
                                     Some(ids) => {
                                         rows.push(kv(
                                             "访问方式",

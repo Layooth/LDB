@@ -1066,12 +1066,68 @@ pub struct RebuildOutcome {
     pub columns: Vec<(String, String)>,
 }
 
+/// SQL 值 → 配置用 Json（VACUUM 构造列 spec 时用；Text/Decimal 走文本保精度）
+fn value_to_json(value: &Value) -> Json {
+    match value {
+        Value::Null => Json::Null,
+        Value::Bool(b) => Json::Bool(*b),
+        Value::Int(n) => Json::Int(*n),
+        Value::Real(n) => Json::Num(*n),
+        Value::Decimal { v, scale } => Json::Str(codec::format_decimal(*v, *scale)),
+        Value::Text(s) => Json::Str(s.clone()),
+    }
+}
+
 impl Engine {
     /// 按新列定义重建表并迁移数据（影子表重建）。
     ///
     /// 每个列可以带 `source` 指向旧列名，因此「改名」也能保住数据；
     /// 新列没有 source 时取默认值，否则填 NULL。
     /// 必须在事务内调用，任何一步失败都会整体回滚。
+    /// VACUUM：对一张表做影子表重建（同 schema），数据紧凑地写进新文件，
+    /// 旧文件随之删除——把删除/更新留下的空闲空间还给文件系统。
+    /// 列属性（主键/唯一/非空/默认值/自增/DECIMAL 标度）与索引全部保留。
+    /// 返回（整理前字节, 整理后字节）。
+    pub fn vacuum_table(&mut self, name: &str) -> Result<(u64, u64)> {
+        let before = self.store.stats().bytes;
+        let position = self.table_index(name)?;
+        let columns = self.tables[position].columns.clone();
+
+        let specs: Vec<Json> = columns
+            .iter()
+            .map(|c| {
+                let mut items: Vec<(String, Json)> = vec![
+                    ("name".to_string(), Json::str(&c.name)),
+                    ("type".to_string(), Json::str(c.ty.as_str())),
+                    (
+                        "primaryKey".to_string(),
+                        Json::Bool(c.primary_key),
+                    ),
+                    ("notNull".to_string(), Json::Bool(c.not_null)),
+                    ("unique".to_string(), Json::Bool(c.unique)),
+                    (
+                        "autoIncrement".to_string(),
+                        Json::Bool(c.auto_increment),
+                    ),
+                    // 数据来源 = 同名列（保数据）
+                    ("source".to_string(), Json::str(&c.name)),
+                ];
+                if c.ty == ColumnType::Decimal {
+                    // 精度不存于列定义，显式带 scale 防丢
+                    items.push(("scale".to_string(), Json::Num(c.scale as f64)));
+                }
+                if let Some(default) = &c.default {
+                    items.push(("default".to_string(), value_to_json(default)));
+                }
+                Json::Obj(items)
+            })
+            .collect();
+
+        self.rebuild_table(name, &specs)?;
+        let after = self.store.stats().bytes;
+        Ok((before, after))
+    }
+
     pub fn rebuild_table(&mut self, name: &str, specs: &[Json]) -> Result<RebuildOutcome> {
         if specs.is_empty() {
             return Err(DbError::syntax("表至少要保留一列"));
@@ -1117,7 +1173,12 @@ impl Engine {
 
             let type_name = spec.get("type").and_then(|v| v.as_str()).unwrap_or("TEXT");
             let ty = ColumnType::parse(type_name)?;
-            let scale = ColumnType::decimal_scale_from_type(type_name)?;
+            // DECIMAL 标度：优先用显式 scale 键（Column 不存精度，
+            // 只传 "DECIMAL" 会把标度丢成默认值），否则从类型串里解析
+            let scale = match spec.get("scale").and_then(|v| v.as_i64()) {
+                Some(scale) if scale >= 0 && scale <= u8::MAX as i64 => scale as u8,
+                _ => ColumnType::decimal_scale_from_type(type_name)?,
+            };
             let primary_key = spec
                 .get("primaryKey")
                 .and_then(|v| v.as_bool())

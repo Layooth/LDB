@@ -212,6 +212,10 @@ impl Parser {
             let table = self.expect_ident()?;
             return Ok(Statement::Truncate { table });
         }
+        if self.at_keyword("VACUUM") {
+            self.advance();
+            return Ok(Statement::Vacuum);
+        }
         if self.at_keyword("SHOW") {
             self.advance();
             self.expect_keyword("TABLES")?;

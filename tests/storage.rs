@@ -2499,6 +2499,120 @@ fn count_shortcut_and_range_read_own_writes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// VACUUM：碎片空间回收，且列属性（标度/唯一/自增/默认值）与数据完整保留
+#[test]
+fn vacuum_reclaims_space_and_preserves_schema() {
+    use littledb::sql::QueryResult;
+
+    let dir = temp_dir("vacuum");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute(
+            "CREATE TABLE t (\n\
+               id INT PRIMARY KEY AUTO_INCREMENT,\n\
+               code INT UNIQUE,\n\
+               price DECIMAL(10,2) DEFAULT '0.00',\n\
+               tag TEXT DEFAULT 'keep'\n\
+             )",
+            &[],
+        )
+        .unwrap();
+
+    // 制造碎片：插 1500 行，再删掉 1490 行（页里全是死空间）
+    session
+        .execute(
+            &format!(
+                "INSERT INTO t (code, price) VALUES {}",
+                (1..=1500)
+                    .map(|i| format!("({}, '{}.50')", i, i))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            &[],
+        )
+        .unwrap();
+    session
+        .execute("DELETE FROM t WHERE code % 150 != 0", &[])
+        .unwrap();
+
+    let bytes_before = session.engine.store.stats().bytes;
+    let rows_before: usize = match session.execute("SELECT COUNT(*) FROM t", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => match &rows[0][0] {
+            Value::Int(n) => *n as usize,
+            other => panic!("期望 INT，得到 {:?}", other),
+        },
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    };
+    assert_eq!(rows_before, 10);
+
+    match session.execute("VACUUM", &[]).unwrap() {
+        QueryResult::Ddl { message } => {
+            assert!(message.contains("已重建 1 张表"), "{}", message);
+        }
+        other => panic!("期望 DDL，得到 {:?}", other),
+    }
+    // 旧文件的删除被设计为提交后的下一次 checkpoint（崩溃安全：checkpoint 前
+    // WAL 必须完整）。这里模拟「下次 checkpoint」后的效果：
+    session.engine.store.checkpoint_full().unwrap();
+    let bytes_after = session.engine.store.stats().bytes;
+    assert!(
+        bytes_after < bytes_before,
+        "VACUUM + checkpoint 后应回收空间：{} → {}",
+        bytes_before,
+        bytes_after
+    );
+
+    // 数据完整
+    match session.execute("SELECT COUNT(*) FROM t", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows[0][0], Value::Int(10)),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // DECIMAL 标度保留：新插入的 1.50 读回来仍是 2 位小数
+    match session
+        .execute("INSERT INTO t (code, price) VALUES (5000, '1.50')", &[])
+        .unwrap()
+    {
+        QueryResult::Insert { ids, .. } => assert_eq!(ids, vec![1501], "自增应接在旧最大 id 之后"),
+        other => panic!("期望 INSERT，得到 {:?}", other),
+    }
+    match session
+        .execute("SELECT price FROM t WHERE code = 5000", &[])
+        .unwrap()
+    {
+        QueryResult::Select { rows, .. } => assert_eq!(
+            rows[0][0],
+            Value::Decimal { v: 150, scale: 2 },
+            "DECIMAL 标度应保留（v=150, scale=2 即 1.50）"
+        ),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // 默认值保留
+    match session.execute("SELECT tag FROM t WHERE code = 5000", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows[0][0], Value::Text("keep".into())),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    // 唯一约束仍然生效
+    let err = session
+        .execute("INSERT INTO t (code) VALUES (5000)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, "CONSTRAINT_VIOLATION", "{}", err.message);
+    // 删除的行没有复活
+    match session.execute("SELECT COUNT(*) FROM t", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows[0][0], Value::Int(11)),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // 空库 VACUUM 不报错
+    session.execute("CREATE TABLE empty_t (id INT PRIMARY KEY)", &[]).unwrap();
+    match session.execute("VACUUM", &[]).unwrap() {
+        QueryResult::Ddl { message } => assert!(message.contains("2 张表"), "{}", message),
+        other => panic!("期望 DDL，得到 {:?}", other),
+    }
+
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 标量子查询：投影、WHERE 比较、相关子查询、空结果与错误路径
 #[test]
 fn scalar_subquery() {

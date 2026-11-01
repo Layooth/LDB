@@ -313,6 +313,8 @@ pub enum Statement {
     Truncate {
         table: String,
     },
+    /// `VACUUM`：对全部表做影子重建，把空闲空间还给文件系统
+    Vacuum,
 }
 
 impl Statement {
@@ -334,6 +336,7 @@ impl Statement {
             Statement::Explain { .. } => "explain",
             Statement::AlterTable { .. } => "alter_table",
             Statement::Truncate { .. } => "truncate",
+            Statement::Vacuum => "vacuum",
         }
     }
 

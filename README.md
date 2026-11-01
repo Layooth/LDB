@@ -252,7 +252,7 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 | 类别 | 支持 |
 |---|---|
 | DDL | `CREATE TABLE`（列级 PK/NOT NULL/UNIQUE/DEFAULT/**AUTO_INCREMENT**、表级 PK、IF NOT EXISTS）、`DROP TABLE`、`CREATE/DROP [UNIQUE] INDEX`、`ALTER TABLE`（`ADD [COLUMN]` / `DROP [COLUMN]` / `RENAME COLUMN a TO b` / `RENAME TO c`） |
-| DML | `INSERT INTO t [(列)] VALUES (...),(...)`、`INSERT INTO t [(列)] SELECT ...`、`INSERT ... ON CONFLICT [(列)] DO UPDATE SET ... / DO NOTHING`（UPSERT，可用 `EXCLUDED.列` 引用待插入行）、`UPDATE ... SET ... [WHERE]`、`DELETE FROM ... [WHERE]`、`TRUNCATE [TABLE] t` |
+| DML | `INSERT INTO t [(列)] VALUES (...),(...)`、`INSERT INTO t [(列)] SELECT ...`、`INSERT ... ON CONFLICT [(列)] DO UPDATE SET ... / DO NOTHING`（UPSERT，可用 `EXCLUDED.列` 引用待插入行）、`UPDATE ... SET ... [WHERE]`、`DELETE FROM ... [WHERE]`、`TRUNCATE [TABLE] t`、`VACUUM` |
 | 查询 | `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`/`UNION [ALL]`、`INNER/LEFT/CROSS JOIN`（左深树，嵌套循环）、`IN (SELECT ...)`（非关联单列）、**派生表** `FROM (SELECT ...) AS t`、**CTE** `WITH x AS (...) SELECT ... FROM x`、**`EXISTS` / `NOT EXISTS`**（支持相关子查询）、**标量子查询** `(SELECT ...)` |
 | 事务 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` |
 | 元命令 | `SHOW TABLES`、`DESCRIBE t`、`EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` |
@@ -270,7 +270,10 @@ DECIMAL 是 i128 + 标度的**精确**十进制（金额场景零浮点误差，
 
 `INSERT ... SELECT` 先**物化**子查询再逐行插入（因此 `INSERT INTO t SELECT ... FROM t`
 是安全的：不会边读边写），受 50 万行上限保护；不支持与 `ON CONFLICT` 组合（会明确报错）。
-`TRUNCATE` 逐行删除而不是重建文件：**保留表结构与索引定义**、自增游标归零，
+`VACUUM` 对库里**所有表**做影子重建（数据紧凑写入新文件，旧文件随建随删）：
+列属性（主键/唯一/非空/默认值/自增/**DECIMAL 标度**）与索引全部保留，可回滚。
+旧文件的物理删除发生在**提交后的下一次 checkpoint**（崩溃安全要求），持续写入会
+自动触发；`TRUNCATE` 逐行删除而不是重建文件：**保留表结构与索引定义**、自增游标归零，
 并且是可回滚的（`BEGIN; TRUNCATE ...; ROLLBACK` 数据会回来）。
 
 JSON 列在存储层就是 TEXT，`JSON_*` 在求值期解析：路径语法 `$` / `$.键` / `[下标]`

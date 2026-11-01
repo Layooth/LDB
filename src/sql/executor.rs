@@ -729,6 +729,11 @@ fn run_with_engine(
             exec_alter_table(engine, table, action, params)
         }
         Statement::Truncate { table } => exec_truncate(engine, table),
+        Statement::Vacuum => {
+            // 重建与 ALTER 同级：拿 DDL 独占，避免和别的写事务交叉
+            engine.ensure_ddl_exclusive(owner)?;
+            exec_vacuum(engine)
+        }
         Statement::ShowTables | Statement::Describe { .. } | Statement::Explain { .. } => {
             run_read_only(engine, statement, params, committed_only, owner)
         }
@@ -3060,6 +3065,35 @@ fn exec_truncate(engine: &mut Engine, table: &str) -> Result<QueryResult> {
     let removed = engine.truncate(table)?;
     Ok(QueryResult::Ddl {
         message: format!("已清空表 \"{}\"（删除 {} 行），表结构与索引保留", table, removed),
+    })
+}
+
+/// `VACUUM`：对库里所有表做影子重建，把删除/更新留下的空闲空间还给文件系统。
+///
+/// 旧表文件的删除被设计为**提交后的下一次 checkpoint** 时执行
+/// （崩溃安全：checkpoint 前 WAL 必须完整，提前删文件会让恢复重放出幽灵表），
+/// 所以回收在下次 checkpoint 或重启时自动完成，不在本语句内同步发生。
+fn exec_vacuum(engine: &mut Engine) -> Result<QueryResult> {
+    let names = engine.table_names();
+    if names.is_empty() {
+        return Ok(QueryResult::Ddl {
+            message: "没有表需要整理".to_string(),
+        });
+    }
+    let mut total_before = 0u64;
+    let mut rebuilt = 0usize;
+    let mut total_rows = 0u64;
+    for name in &names {
+        let (before, _) = engine.vacuum_table(name)?;
+        total_before += before;
+        total_rows += engine.table(name)?.row_count as u64;
+        rebuilt += 1;
+    }
+    Ok(QueryResult::Ddl {
+        message: format!(
+            "已重建 {} 张表的数据文件（约 {} 行）；旧文件将在下次 checkpoint 或重启时移除",
+            rebuilt, total_rows
+        ),
     })
 }
 

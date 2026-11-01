@@ -1,5 +1,9 @@
 /target
 
+# 桌面版构建产物（launcher/desktop）
+launcher/desktop/bin/
+launcher/desktop/obj/
+
 # Python 字节码（sdk/ 下有 Python 客户端与测试）
 __pycache__/
 *.pyc

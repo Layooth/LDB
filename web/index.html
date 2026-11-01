@@ -624,7 +624,6 @@
           <div class="dotset"><i></i><i></i><i></i></div>
           <button id="editor-toggle" title="收起 / 展开编辑器"><span class="chev">▾</span></button>
           <span>SQL 编辑器</span>
-          <span class="hint">选中后 Ctrl+Enter 只执行选中 · Ctrl+空格 补全 · 按 ? 看快捷键</span>
           <div class="grow"></div>
           <select id="history" title="最近执行过的 SQL">
             <option value="">历史</option>
@@ -775,6 +774,23 @@
       </div>
 
       <div class="settings-section">
+        <h3>快捷键与操作</h3>
+        <table class="help-table">
+          <tbody>
+            <tr><td>Ctrl + Enter</td><td>运行 SQL（选中了文本则只执行选中部分）</td></tr>
+            <tr><td>Ctrl + 空格 / Alt + /</td><td>手动唤起自动补全</td></tr>
+            <tr><td>Tab</td><td>接受补全候选；无补全时插入缩进</td></tr>
+            <tr><td>Esc</td><td>关闭补全、右键菜单、弹窗</td></tr>
+            <tr><td>Delete</td><td>删除表格中选中的行（需主键，慎用）</td></tr>
+            <tr><td>双击单元格</td><td>编辑该单元格的值</td></tr>
+            <tr><td>单击长内容</td><td>查看完整内容（JSON 自动格式化）</td></tr>
+            <tr><td>拖拽列头右缘</td><td>调整列宽</td></tr>
+            <tr><td>拖拽编辑器下缘</td><td>调整编辑器高度</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="settings-section">
         <h3>历史记录</h3>
         <div class="settings-row">
           <div class="main">保留条数<div class="hint">最多保存多少条执行过的 SQL（10–200）</div></div>
@@ -850,30 +866,6 @@
       <span style="flex:1"></span>
       <button id="insert-cancel">取消</button>
       <button id="insert-save" class="primary">插入</button>
-    </div>
-  </div>
-</div>
-
-<div id="help-modal" class="modal" hidden>
-  <div class="modal-card" style="width:min(500px,94vw)">
-    <div class="modal-head">
-      <span>快捷键与操作</span>
-      <button id="help-close" class="x" title="关闭">✕</button>
-    </div>
-    <div class="modal-body">
-      <table class="help-table">
-        <tbody>
-          <tr><td>Ctrl + Enter</td><td>运行 SQL（选中了文本则只执行选中部分）</td></tr>
-          <tr><td>Ctrl + 空格 / Alt + /</td><td>手动唤起自动补全</td></tr>
-          <tr><td>Tab</td><td>接受补全候选；无补全时插入缩进</td></tr>
-          <tr><td>Esc</td><td>关闭补全、右键菜单、弹窗</td></tr>
-          <tr><td>Delete</td><td>删除表格中选中的行（需主键，慎用）</td></tr>
-          <tr><td>双击单元格</td><td>编辑该单元格的值</td></tr>
-          <tr><td>单击长内容</td><td>查看完整内容（JSON 自动格式化）</td></tr>
-          <tr><td>拖拽列头右缘</td><td>调整列宽</td></tr>
-          <tr><td>?（在编辑器外按问号）</td><td>打开本面板</td></tr>
-        </tbody>
-      </table>
     </div>
   </div>
 </div>
@@ -1759,18 +1751,18 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       hideMenu();
-      for (const id of ['cell-modal', 'danger-modal', 'help-modal', 'insert-modal']) {
+      for (const id of ['cell-modal', 'danger-modal', 'insert-modal']) {
         const el = document.getElementById(id);
         if (el) el.hidden = true;
       }
       return;
     }
-    // 编辑器外按问号打开快捷键面板
+    // 编辑器外按问号打开设置（快捷键表在设置页里）
     if (e.key === '?') {
       const tag = (document.activeElement && document.activeElement.tagName) || '';
       if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
         e.preventDefault();
-        $('#help-modal').hidden = false;
+        openSettings();
       }
     }
     // 选中表格行后按 Delete 删除该行（需要主键）
@@ -3160,12 +3152,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     }
   });
 
-  // ------------------------------------------------------------ 快捷键帮助
-  const helpModal = $('#help-modal');
-  $('#help-close').addEventListener('click', () => { helpModal.hidden = true; });
-  helpModal.addEventListener('mousedown', (e) => {
-    if (e.target === helpModal) helpModal.hidden = true;
-  });
+  // （快捷键表已移入设置页，原独立弹窗已删除）
 
   // ------------------------------------------------------------ 连接监控与自动重连
   async function checkConnection() {

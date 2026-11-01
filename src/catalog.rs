@@ -119,6 +119,14 @@ impl Catalog {
         let root = json::parse(&text)?;
 
         let version = root.get("version").and_then(|v| v.as_i64()).unwrap_or(CATALOG_VERSION);
+        if version > CATALOG_VERSION {
+            // 由更新版本的引擎创建：打开就意味着可能以旧规则读写新格式，
+            // 静默继续是最坏选择。明确拒绝并让用户升级引擎。
+            return Err(crate::error::DbError::internal(format!(
+                "catalog 版本 {} 高于本引擎支持的 {}：请升级 LittleDB 后再打开这个数据目录",
+                version, CATALOG_VERSION
+            )));
+        }
         let mut next_table_id = root
             .get("nextTableId")
             .and_then(|v| v.as_i64())

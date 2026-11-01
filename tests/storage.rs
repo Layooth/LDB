@@ -1865,6 +1865,56 @@ fn ldbp_auth_failures_back_off() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// /api/health 暴露服务端分位数指标与错误计数
+#[test]
+fn health_reports_latency_percentiles_and_errors() {
+    let dir = temp_dir("healthlat");
+    let port = start_http(&dir);
+
+    // 建表 + 若干查询（含一次错误）
+    let sql = |body: &str| {
+        let _ = http_roundtrip(
+            port,
+            &format!(
+                "POST /api/sql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+    };
+    sql(r#"{"sql":"CREATE TABLE t (id INT PRIMARY KEY, k INT)"}"#);
+    sql(r#"{"sql":"INSERT INTO t VALUES (1,1),(2,2),(3,3)"}"#);
+    sql(r#"{"sql":"SELECT COUNT(*) FROM t"}"#);
+    sql(r#"{"sql":"SELECT * FROM no_such_table"}"#); // 404 → errors+1
+
+    let resp = http_roundtrip(
+        port,
+        "GET /api/health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    let parsed = littledb::json::parse(body).expect("health 应是 JSON");
+    let text = parsed.to_string();
+
+    assert!(
+        text.contains("\"latency\"") && text.contains("\"p50Ms\"") && text.contains("\"p99Ms\""),
+        "health 应带分位数：{}",
+        &text[..text.len().min(400)]
+    );
+    assert!(
+        text.contains("\"errors\":1"),
+        "应恰好 1 次错误（404 那条）：{}",
+        &text[..text.len().min(400)]
+    );
+    assert!(
+        text.contains("\"samples\":4"),
+        "4 条 SQL 都真实执行过（含 SQL 层报错的 404），延迟样本应计 4：{}",
+        &text[..text.len().min(400)]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// CORS 默认只允许同源：任意网页不能借用户浏览器读写数据库
 #[test]
 fn cors_is_same_origin_by_default() {

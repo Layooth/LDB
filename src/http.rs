@@ -111,6 +111,10 @@ pub struct HttpState {
     auth: Arc<AuthLimiter>,
     /// 同一会话被占用时，等待多久算超时
     session_wait: Duration,
+    /// 最近查询耗时样本（毫秒，环形，上限 512）：/api/health 计算 p50/p95/p99
+    latencies: Arc<Mutex<Vec<f64>>>,
+    /// /api/* 返回 4xx/5xx 的累计次数
+    errors: Arc<AtomicUsize>,
 }
 
 impl HttpState {
@@ -139,6 +143,8 @@ impl HttpState {
             cors_origin: None,
             auth: Arc::new(AuthLimiter::new(DEFAULT_AUTH_FAIL_LIMIT)),
             session_wait: Duration::from_secs(DEFAULT_SESSION_WAIT_SECS),
+            latencies: Arc::new(Mutex::new(Vec::new())),
+            errors: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -650,6 +656,19 @@ fn route(
     request: &Request,
     remote: Option<IpAddr>,
 ) -> (u16, Json, Vec<(String, String)>) {
+    let outcome = route_inner(state, request, remote);
+    // 错误计数：任何 /api/* 的 4xx/5xx（含 401/404/429/503）都算一次
+    if outcome.0 >= 400 {
+        state.errors.fetch_add(1, Ordering::SeqCst);
+    }
+    outcome
+}
+
+fn route_inner(
+    state: &HttpState,
+    request: &Request,
+    remote: Option<IpAddr>,
+) -> (u16, Json, Vec<(String, String)>) {
     if let Some(expected) = &state.token {
         // 退避窗口内直接 429，连比较都不做（避免继续给爆破方反馈）
         if let Some(ip) = remote {
@@ -900,6 +919,33 @@ fn write_engine(state: &HttpState) -> std::sync::RwLockWriteGuard<'_, Engine> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// 记录一次查询耗时（环形样本，上限 512）
+fn record_latency(state: &HttpState, elapsed_ms: f64) {
+    let mut ring = state.latencies.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if ring.len() >= 512 {
+        ring.remove(0);
+    }
+    ring.push(elapsed_ms);
+}
+
+/// 从环形样本计算分位数（毫秒，保留 2 位）
+fn latency_percentiles(state: &HttpState) -> (f64, f64, f64, usize) {
+    let mut samples = state
+        .latencies
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0, 0);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |p: f64| -> f64 {
+        let index = ((samples.len() as f64 * p) as usize).clamp(1, samples.len()) - 1;
+        (samples[index] * 100.0).round() / 100.0
+    };
+    (pct(0.5), pct(0.95), pct(0.99), samples.len())
+}
+
 fn health(state: &HttpState) -> Result<Json> {
     let engine = read_engine(state);
     let stats = engine.store.stats();
@@ -936,6 +982,22 @@ fn health(state: &HttpState) -> Result<Json> {
                     Json::Num(stats.checkpoints as f64),
                 ),
             ]),
+        ),
+        (
+            "latency".to_string(),
+            {
+                let (p50, p95, p99, samples) = latency_percentiles(state);
+                Json::Obj(vec![
+                    ("p50Ms".to_string(), Json::Num(p50)),
+                    ("p95Ms".to_string(), Json::Num(p95)),
+                    ("p99Ms".to_string(), Json::Num(p99)),
+                    ("samples".to_string(), Json::Num(samples as f64)),
+                ])
+            },
+        ),
+        (
+            "errors".to_string(),
+            Json::Num(state.errors.load(Ordering::SeqCst) as f64),
         ),
         (
             "connections".to_string(),
@@ -1076,6 +1138,7 @@ fn run_sql(
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
 
     state.queries.fetch_add(1, Ordering::SeqCst);
+    record_latency(state, elapsed);
     let result = outcome?;
 
     Ok((result.to_wire_json(), elapsed, Some(id)))

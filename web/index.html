@@ -176,7 +176,9 @@
     background: transparent; color: var(--muted);
   }
   .res-tabs button.active { background: var(--accent-soft); color: #fff; border-color: rgba(79,140,255,.45); }
+  .res-tabs button.ok::after { content: ' ✓'; color: #34d399; }
   .res-tabs button.has-error { border-color: rgba(248,113,113,.6); color: #fca5a5; }
+  .res-tabs button.has-error::after { content: ' ✖'; color: #f87171; }
 
   .editor.collapsed .editor-body { display: none; }
 
@@ -637,7 +639,7 @@
         </div>
         <div class="editor-body" id="editor-body">
           <div class="gutter" id="gutter">1</div>
-          <textarea id="sql" spellcheck="false" autocomplete="off" placeholder="输入 SQL，Ctrl+Enter 运行；Ctrl+空格 唤出补全"></textarea>
+          <textarea id="sql" spellcheck="false" autocomplete="off" placeholder="输入 SQL；快捷键见设置页"></textarea>
         </div>
         <div class="editor-resize" id="editor-resize" title="拖拽调整编辑器高度"></div>
       </div>
@@ -2238,6 +2240,13 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     let tabButtons = null;
     let currentPanel = 0;
     if (multi) {
+      // 标签显示「序号 + SQL 摘要」：跳过注释与空行取第一条有效行，方便区分多条语句
+      const tabLabel = (i) => {
+        const firstLine =
+          statements[i].split('\n').find((l) => l.trim() && !l.trim().startsWith('--')) || statements[i];
+        const text = firstLine.trim().replace(/\s+/g, ' ');
+        return (i + 1) + '. ' + (text.length > 22 ? text.slice(0, 22) + '…' : text);
+      };
       panels = statements.map(() => {
         const p = document.createElement('div');
         p.hidden = true;
@@ -2248,8 +2257,8 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
       tabbar.className = 'res-tabs';
       tabButtons = panels.map((_, i) => {
         const b = document.createElement('button');
-        b.textContent = '语句 ' + (i + 1);
-        b.title = statements[i].slice(0, 120);
+        b.textContent = tabLabel(i);
+        b.title = '语句 ' + (i + 1) + '：\n' + statements[i].slice(0, 400);
         b.addEventListener('click', () => {
           currentPanel = i;
           panels.forEach((p, pi) => (p.hidden = pi !== i));
@@ -2270,6 +2279,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
         try {
           const result = await runSql(stmt);
           renderResult(result, target);
+          if (tabButtons) tabButtons[i].classList.add('ok'); // 标签打勾：这条已成功
         } catch (err) {
           const hint = errorHint(err.code);
           target.appendChild(messageCard('err', err.message, [err.code ? '错误码 ' + err.code : '', hint].filter(Boolean).join(' · ')));

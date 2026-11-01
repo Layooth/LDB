@@ -1,0 +1,5 @@
+E:\桌面\littledb-rust\littledb-rust-src\launcher\desktop\bin\Release\net8.0-windows\win-x64\publish\LittleDB桌面版.pdb
+E:\桌面\littledb-rust\littledb-rust-src\launcher\desktop\bin\Release\net8.0-windows\win-x64\publish\Microsoft.Web.WebView2.Core.xml
+E:\桌面\littledb-rust\littledb-rust-src\launcher\desktop\bin\Release\net8.0-windows\win-x64\publish\Microsoft.Web.WebView2.WinForms.xml
+E:\桌面\littledb-rust\littledb-rust-src\launcher\desktop\bin\Release\net8.0-windows\win-x64\publish\Microsoft.Web.WebView2.Wpf.xml
+E:\桌面\littledb-rust\littledb-rust-src\launcher\desktop\bin\Release\net8.0-windows\win-x64\publish\LittleDB桌面版.exe

@@ -18,7 +18,8 @@ LittleDB控制台.exe      安全启动器（生成 token → 拉起 littledb.ex
 ## 快速开始
 
 ```powershell
-# 双击 dist\LittleDB控制台.exe：自动生成访问令牌、启动服务、打开控制台
+# 双击 dist\LittleDB桌面版.exe：主界面桌面应用（内嵌控制台 + 托盘 + 服务管理）
+# 或双击 dist\LittleDB控制台.exe：轻量启动器（生成令牌、起服务、开浏览器）
 # 或者手动（先 cd 到 dist）：
 .\littledb.exe serve .\data               # 协议 7801 + 控制台 7802，并自动开浏览器
 .\littledb.exe serve .\data --token secret  # 启用 Bearer 认证
@@ -29,13 +30,37 @@ LittleDB控制台.exe      安全启动器（生成 token → 拉起 littledb.ex
 .\littledb.exe load .\new-data backup.sql # 从脚本导入（--batch 200 控制每批事务）
 ```
 
+### 桌面版主界面（LittleDB桌面版.exe）
+
+`launcher/desktop/`：WinForms + WebView2 的桌面壳，窗口里加载的就是服务端自带的
+Web 控制台——**与网页端天然同步**：同一份前端代码、同一个服务进程、同一份数据，
+浏览器里的操作桌面端立即可见，反之亦然；控制台前端更新时桌面壳无需重新打包。
+
+壳提供的原生能力：
+
+| 能力 | 说明 |
+|---|---|
+| 服务生命周期 | 启动/停止/重启 littledb.exe；令牌生成后走 `LDB_TOKEN` 环境变量（不进命令行） |
+| 托盘 | 最小化到托盘，双击恢复；退出时会停止自己拉起的服务 |
+| 状态栏 | 服务状态（PID/健康检查）、端口，可跳浏览器打开同一控制台（同一令牌） |
+| 与 CLI 互通 | 桌面壳写的 `littledb.pid` 与 `littledb start/stop/status` 完全兼容 |
+
+依赖：.NET 8 桌面运行时 + WebView2 运行时（Win10/11 一般自带）。重新打包：
+
+```powershell
+cd littledb-rust-src\launcher\desktop
+dotnet publish -c Release
+Copy-Item bin\Release\net8.0-windows\win-x64\publish\LittleDB桌面版.exe ..\..\..\dist\
+```
+
 ### 目录结构
 
 ```
 littledb-rust\
 ├── dist\                          ← 运行层：拿这一目录就能在任何机器上跑
 │   ├── littledb.exe               服务本体（verify.ps1 自动部署到这里）
-│   ├── LittleDB控制台.exe          图形启动器（token 走环境变量传给服务）
+│   ├── LittleDB桌面版.exe          主界面桌面应用（WinForms + WebView2 内嵌控制台）
+│   ├── LittleDB控制台.exe          轻量图形启动器（token 走环境变量传给服务）
 │   ├── .ldb-token                 启动器生成的令牌文件
 │   ├── web\                       控制台前端（单文件 index.html）
 │   └── data\                      数据目录（catalog.json + t<N>.tbl + *.wal）

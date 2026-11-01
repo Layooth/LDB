@@ -152,6 +152,7 @@
     flex: none; width: 46px; overflow: hidden; user-select: none;
     padding: 14px 8px 14px 4px; text-align: right;
     font-family: var(--mono); font-size: 13px; line-height: 1.65;
+    white-space: pre; /* 行号靠 \n 分行，不设 pre 会被折叠成空格导致换行错乱 */
     color: #4a5a72; background: rgba(148,163,184,.05);
     border-right: 1px solid rgba(148,163,184,.12);
   }
@@ -935,7 +936,7 @@
 
   function insertSample() {
     expandEditor();
-    sqlInput.value = SAMPLE;
+    setEditorValue(SAMPLE);
     sqlInput.focus();
   }
 
@@ -1128,7 +1129,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
             label: '生成 SELECT',
             action: () => {
               expandEditor();
-              sqlInput.value = `SELECT * FROM "${t.name}" LIMIT 100;`;
+              setEditorValue(`SELECT * FROM "${t.name}" LIMIT 100;`);
               sqlInput.focus();
             },
           },
@@ -1647,7 +1648,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     const value = sqlInput.value;
     const before = value.slice(0, ac.start);
     const after = value.slice(ac.start + ac.word.length);
-    sqlInput.value = before + item.insert + after;
+    setEditorValue(before + item.insert + after);
     let caret = before.length + item.insert.length + item.caretOffset;
     sqlInput.selectionStart = sqlInput.selectionEnd = caret;
     hideDrop();
@@ -2491,7 +2492,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     const v = historySel.value;
     if (!v) return;
     expandEditor();
-    sqlInput.value = v;
+    setEditorValue(v);
     historySel.selectedIndex = 0;
     sqlInput.focus();
   });
@@ -2501,7 +2502,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
   $('#editor-toggle').addEventListener('click', () => editorSection.classList.toggle('collapsed'));
 
   $('#clear').addEventListener('click', () => {
-    sqlInput.value = '';
+    setEditorValue('');
     resultBox.innerHTML = '';
     resultBox.appendChild(welcomePanel);
     sqlInput.focus();
@@ -2567,7 +2568,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
       const start = sqlInput.selectionStart;
       const end = sqlInput.selectionEnd;
       const spaces = ' '.repeat(settings.tabSize);
-      sqlInput.value = sqlInput.value.slice(0, start) + spaces + sqlInput.value.slice(end);
+      setEditorValue(sqlInput.value.slice(0, start) + spaces + sqlInput.value.slice(end));
       sqlInput.selectionStart = sqlInput.selectionEnd = start + settings.tabSize;
       hideDrop();
     }
@@ -2993,11 +2994,11 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     const formatted = formatSql(target);
     if (sel.trim()) {
       const start = sqlInput.selectionStart;
-      sqlInput.value = sqlInput.value.slice(0, start) + formatted + sqlInput.value.slice(sqlInput.selectionEnd);
+      setEditorValue(sqlInput.value.slice(0, start) + formatted + sqlInput.value.slice(sqlInput.selectionEnd));
       sqlInput.selectionStart = start;
       sqlInput.selectionEnd = start + formatted.length;
     } else {
-      sqlInput.value = formatted;
+      setEditorValue(formatted);
     }
     expandEditor();
     saveDraftNow();
@@ -3194,6 +3195,15 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     gutter.textContent = Array.from({ length: lines }, (_, i) => i + 1).join('\n');
   }
 
+  /**
+   * 编辑器内容的唯一写入口：程序化赋值（插入示例/格式化/历史/补全/清空）不触发
+   * input 事件，行号会停在旧值——所有赋值必须走这里。
+   */
+  function setEditorValue(v) {
+    sqlInput.value = v;
+    refreshGutter();
+  }
+
   // 拖拽调高编辑器（60..600px，记住选择）
   resizeBar.addEventListener('mousedown', (e) => {
     e.preventDefault();
@@ -3227,7 +3237,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
   // 启动
   try {
     const draft = localStorage.getItem('ldb_draft');
-    if (draft && !sqlInput.value) sqlInput.value = draft;
+    if (draft && !sqlInput.value) setEditorValue(draft);
   } catch (_) { /* 忽略 */ }
   applySettings();
   refreshTables();

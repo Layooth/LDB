@@ -356,7 +356,7 @@ pub fn index_remove_key(table: &mut Table, index_pos: usize, key: &str, row_id: 
 }
 
 /// 计算一行在所有索引上的 (index_pos, key)
-fn index_keys_of(table: &Table, values: &[Value]) -> Vec<(usize, String)> {
+pub fn index_keys_of(table: &Table, values: &[Value]) -> Vec<(usize, String)> {
     table
         .indexes
         .iter()

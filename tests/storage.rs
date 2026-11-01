@@ -2122,6 +2122,217 @@ fn deleted_space_is_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 递归复制目录（深度校验/故障注入用的小工具，数据目录都很小）
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_recursive(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// 深度一致性校验：健康库通过；人为破坏索引后必须被发现
+#[test]
+fn deep_verify_detects_index_corruption() {
+    let dir = temp_dir("deepverify");
+    let mut session = Session::open(&dir).unwrap();
+    session
+        .execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, k INT)", &[])
+        .unwrap();
+    session.execute("CREATE INDEX ix_k ON t(k)", &[]).unwrap();
+    session
+        .execute(
+            &format!(
+                "INSERT INTO t (k) VALUES {}",
+                (0..50).map(|i| format!("({})", i)).collect::<Vec<_>>().join(",")
+            ),
+            &[],
+        )
+        .unwrap();
+    session.execute("DELETE FROM t WHERE k = 7", &[]).unwrap();
+    session.close().unwrap();
+
+    // 健康库：深度校验通过
+    let mut engine = Engine::open(&dir).unwrap();
+    let problems = engine.deep_verify();
+    assert!(
+        problems.is_empty(),
+        "健康库不应报问题：{problems:?}"
+    );
+
+    // 人为破坏 1：从索引里删掉一个键（行还在）→「索引漏条目」
+    let pos = engine.table_index("t").unwrap();
+    let key49 = littledb::codec::index_key(&Value::Int(49)).unwrap();
+    engine.tables[pos]
+        .indexes
+        .iter_mut()
+        .find(|ix| ix.name == "ix_k")
+        .unwrap()
+        .map
+        .remove(&key49);
+    let problems = engine.deep_verify();
+    assert!(
+        problems.iter().any(|p| p.contains("漏条目") && p.contains("ix_k")),
+        "应发现索引漏条目：{problems:?}"
+    );
+
+    // 人为破坏 2：索引指向不存在的行 →「指向不存在的行」
+    let pos = engine.table_index("t").unwrap();
+    let key99 = littledb::codec::index_key(&Value::Int(99)).unwrap();
+    engine.tables[pos]
+        .indexes
+        .iter_mut()
+        .find(|ix| ix.name == "ix_k")
+        .unwrap()
+        .map
+        .insert(key99, vec![99999]);
+    let problems = engine.deep_verify();
+    assert!(
+        problems.iter().any(|p| p.contains("指向不存在的行")),
+        "应发现索引指向不存在的行：{problems:?}"
+    );
+
+    // 人为破坏 3：row_count 与实际不符
+    let pos = engine.table_index("t").unwrap();
+    engine.tables[pos].row_count = 12345;
+    let problems = engine.deep_verify();
+    assert!(
+        problems.iter().any(|p| p.contains("row_count 不一致")),
+        "应发现 row_count 不一致：{problems:?}"
+    );
+
+    engine.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 确定性故障注入：WAL 尾部截断模糊测试 + 恢复幂等 + checkpoint 中途崩溃
+#[test]
+fn wal_fault_injection() {
+    use littledb::sql::QueryResult;
+
+    // ---- 场景 1：checkpoint 中途崩溃（先写一半 → 全量 checkpoint → 再写一半 → 强杀模拟）
+    let dir = temp_dir("faultckpt");
+    {
+        let mut session = Session::open(&dir).unwrap();
+        session.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, k INT)", &[]).unwrap();
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO t (k) VALUES {}",
+                    (0..300).map(|i| format!("({})", i)).collect::<Vec<_>>().join(",")
+                ),
+                &[],
+            )
+            .unwrap();
+        session.engine.store.checkpoint_full().unwrap(); // 前半数据已落盘
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO t (k) VALUES {}",
+                    (300..500).map(|i| format!("({})", i)).collect::<Vec<_>>().join(",")
+                ),
+                &[],
+            )
+            .unwrap();
+        // 直接丢弃 Session（不 close）= 进程强杀，后半数据只在 WAL 里
+    }
+    let mut session = Session::open(&dir).unwrap();
+    match session.execute("SELECT COUNT(*), MIN(id), MAX(id) FROM t", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => {
+            assert_eq!(rows[0][0], Value::Int(500), "checkpoint 前后的已提交行都要恢复");
+            assert_eq!(rows[0][1], Value::Int(1));
+            assert_eq!(rows[0][2], Value::Int(500));
+        }
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+
+    // ---- 场景 2：恢复幂等——恢复后再恢复一次，数据不变
+    session.close().unwrap();
+    let mut session = Session::open(&dir).unwrap();
+    match session.execute("SELECT COUNT(*) FROM t", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows[0][0], Value::Int(500), "二次打开不得重复应用"),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // ---- 场景 3：WAL 尾部截断模糊测试
+    // 写 120 行（一批一个事务），然后按质数步长采样截断点强改 wal.log，
+    // 不变量：重开后「要么恢复出前缀行（id 连续 1..k），要么报明确错误」，
+    // 绝不允许出现洞、重复行或无法解析的行。
+    let dir = temp_dir("faulttorn");
+    let mut session = Session::open(&dir).unwrap();
+    session.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, k INT)", &[]).unwrap();
+    for start in (0..120).step_by(10) {
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO t (k) VALUES {}",
+                    (start..start + 10).map(|i| format!("({})", i)).collect::<Vec<_>>().join(",")
+                ),
+                &[],
+            )
+            .unwrap();
+    }
+    // 不 close，直接丢弃 = WAL 里有全部 12 个已提交事务。
+    // 此时数据只存在于 WAL（页还没 checkpoint），把这个「原始状态」留一份副本：
+    // 每个截断点都从同一原始状态出发，避免上一轮 close 的 checkpoint 污染下一轮。
+    drop(session);
+    let pristine = temp_dir("faulttorn_pristine");
+    copy_dir_recursive(&dir, &pristine);
+
+    let wal_path = std::path::Path::new(&dir).join("wal.log");
+    let full = std::fs::read(&wal_path).unwrap();
+    let mut checked = 0usize;
+    for cut in (0..full.len()).step_by(97) {
+        // 每轮：还原原始状态 → 把 WAL 截断到 cut 字节 → 打开
+        std::fs::remove_dir_all(&dir).unwrap();
+        copy_dir_recursive(&pristine, &dir);
+        std::fs::write(&wal_path, &full[..cut]).unwrap();
+
+        let mut session = Session::open(&dir).unwrap();
+        let ids: Vec<usize> = match session.execute("SELECT id FROM t ORDER BY id", &[]) {
+            Ok(QueryResult::Select { rows, .. }) => rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::Int(n) => *n as usize,
+                    other => panic!("期望 INT，得到 {:?}", other),
+                })
+                .collect(),
+            // 建表 DDL 本身也可能只存在于被截断的 WAL 里：表消失等价于 0 行前缀
+            Err(err) if err.code == "NOT_FOUND" => Vec::new(),
+            other => panic!("期望 SELECT，得到 {:?}", other),
+        };
+        // 不变量：恢复出的必须是「恰好前 k 个事务」——id 连续 1..=k，无洞、无重复、无垃圾
+        let k = ids.len();
+        assert!(
+            ids == (1..=k).collect::<Vec<_>>(),
+            "截断到 {} 字节：恢复的 id 应为连续前缀 1..={}，实际 {:?}",
+            cut,
+            k,
+            &ids[..ids.len().min(20)]
+        );
+        session.close().unwrap();
+        checked += 1;
+    }
+    assert!(checked >= 30, "应采样到足够多的截断点，实际 {}", checked);
+
+    // 完整日志重开：全部 120 行都在
+    std::fs::write(&wal_path, &full).unwrap();
+    let mut session = Session::open(&dir).unwrap();
+    match session.execute("SELECT COUNT(*) FROM t", &[]).unwrap() {
+        QueryResult::Select { rows, .. } => assert_eq!(rows[0][0], Value::Int(120), "完整日志应恢复全部 120 行"),
+        other => panic!("期望 SELECT，得到 {:?}", other),
+    }
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// COUNT(*) 索引计数捷径 + 范围路径的读己之写（旧版范围扫描缺失 delta 合并）
 #[test]
 fn count_shortcut_and_range_read_own_writes() {

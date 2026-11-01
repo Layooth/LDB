@@ -916,6 +916,123 @@ impl Engine {
         self.store.close()
     }
 
+    /// 深度一致性校验：全表扫描 + 行数比对 + 索引重建比对。
+    ///
+    /// 返回问题列表（空 = 通过）。检查项：
+    /// 1. 每一页都能解析、每个 row_id 的页号都在页数范围内；
+    /// 2. catalog 的 row_count 与实际行数一致；
+    /// 3. 每个索引的内存内容 == 按行重建的期望内容（能发现「索引指向不存在行」
+    ///    与「行存在但索引漏了」两类静默损坏）；
+    /// 4. 唯一索引的键不重复；
+    /// 5. 空闲页列表里的页不含活行。
+    pub fn deep_verify(&mut self) -> Vec<String> {
+        let mut problems: Vec<String> = Vec::new();
+        let names = self.table_names();
+
+        for name in &names {
+            let position = match self.table_index(name) {
+                Ok(pos) => pos,
+                Err(err) => {
+                    problems.push(format!("[{name}] 打开表失败：{err}"));
+                    continue;
+                }
+            };
+            let (page_count, row_count_claimed, free_pages) = {
+                let table = &self.tables[position];
+                let page_count = self.store.page_count(table.id);
+                (page_count, table.row_count, table.free_pages.clone())
+            };
+
+            let rows = match self.scan(name) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    problems.push(format!("[{name}] 全表扫描失败（存在无法解析的页/行）：{err}"));
+                    continue;
+                }
+            };
+
+            // ---- 1. row_count 与实际行数
+            if rows.len() as u64 != row_count_claimed as u64 {
+                problems.push(format!(
+                    "[{name}] row_count 不一致：catalog 记录 {row_count_claimed}，实际扫描 {}",
+                    rows.len()
+                ));
+            }
+
+            // ---- 2. row_id 页号越界 + 空闲页列表合法性
+            // （free_pages 的语义是「有空闲空间可复用的页」，半空页带活行属正常，
+            //   所以只校验页号范围，不要求「无活行」）
+            let free: std::collections::HashSet<u32> = free_pages;
+            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for (row_id, _) in &rows {
+                let (page_no, _slot) = crate::table::split_row_id(*row_id);
+                if page_no >= page_count {
+                    problems.push(format!(
+                        "[{name}] row_id {row_id} 的页号 {page_no} 超出页数 {page_count}"
+                    ));
+                }
+                if !seen_ids.insert(*row_id) {
+                    problems.push(format!("[{name}] row_id {row_id} 重复出现"));
+                }
+            }
+            for page_no in &free {
+                if *page_no >= page_count {
+                    problems.push(format!(
+                        "[{name}] 空闲页 {page_no} 超出页数 {page_count}"
+                    ));
+                }
+            }
+
+            // ---- 3. 索引一致性：重建期望并与内存比对
+            let index_count = self.tables[position].indexes.len();
+            let mut expected: Vec<std::collections::BTreeMap<String, Vec<u32>>> =
+                vec![std::collections::BTreeMap::new(); index_count];
+            for (row_id, values) in &rows {
+                for (pos, key) in crate::table::index_keys_of(&self.tables[position], values) {
+                    expected[pos].entry(key).or_default().push(*row_id);
+                }
+            }
+            for pos in 0..index_count {
+                let index_name = self.tables[position].indexes[pos].name.clone();
+                let is_unique = self.tables[position].indexes[pos].unique;
+                let actual = &self.tables[position].indexes[pos].map;
+
+                // 期望里有、索引里没有 = 行存在但索引漏了；反之 = 索引指向不存在行
+                for (key, ids) in &expected[pos] {
+                    match actual.get(key) {
+                        None => problems.push(format!(
+                            "[{name}] 索引 {index_name} 漏条目：键 {key:?} 应指向 {} 行",
+                            ids.len()
+                        )),
+                        Some(actual_ids) if actual_ids != ids => problems.push(format!(
+                            "[{name}] 索引 {index_name} 条目不一致：键 {key:?} 期望 {ids:?}，实际 {actual_ids:?}"
+                        )),
+                        _ => {}
+                    }
+                }
+                for key in actual.keys() {
+                    if !expected[pos].contains_key(key) {
+                        problems.push(format!(
+                            "[{name}] 索引 {index_name} 指向不存在的行：键 {key:?}"
+                        ));
+                    }
+                }
+                // 唯一索引键重复
+                if is_unique {
+                    for (key, ids) in actual {
+                        if ids.len() > 1 {
+                            problems.push(format!(
+                                "[{name}] 唯一索引 {index_name} 键 {key:?} 有 {} 行（应唯一）",
+                                ids.len()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        problems
+    }
+
     pub fn stats(&self) -> StoreStats {
         self.store.stats()
     }

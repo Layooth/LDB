@@ -1,0 +1,58 @@
+# LittleDB CI：push / PR 时自动跑完整门禁 + 桌面版编译检查
+#
+# verify.ps1 本身就是项目的一键门禁（Rust 测试 → release 构建 → 部署 →
+# 13 项冒烟 → JS/Python SDK 集成测试 → 认证限速检查），CI 直接复用它，
+# 保证「本地通过 = CI 通过」。桌面版单独做一次编译检查（NuGet 还原需要网络）。
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  gate:
+    name: 测试 + 冒烟（Windows）
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: littledb-rust-src
+
+      - name: 一键门禁（测试 + 构建 + 部署 + 冒烟 + SDK）
+        run: pwsh -NoProfile -File tools\verify.ps1
+
+      - name: 上传失败时的日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: |
+            littledb-rust-src/target/debug/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  desktop:
+    name: 桌面版编译检查
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 还原并编译
+        run: dotnet build littledb-rust-src/launcher/desktop/LittleDB.Desktop.csproj -c Release

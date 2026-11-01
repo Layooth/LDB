@@ -23,7 +23,7 @@ fn print_help() {
     println!("  littledb serve <目录>         启动 LDBP/1 协议服务");
     println!("  littledb sql <目录> <SQL>     执行 SQL");
     println!("  littledb demo <目录>          生成演示库并验证读写");
-    println!("  littledb verify <目录>        输出数据目录概览");
+    println!("  littledb verify <目录> [--deep]  概览 / 深度一致性校验（--deep 扫描+索引比对）");
     println!("  littledb dump <目录> [-o 文件] 导出为 SQL 脚本（默认输出到 stdout）");
     println!("  littledb load <目录> <脚本>   导入 SQL 脚本（--batch n 控制每批事务大小）");
     println!("  littledb start <目录>         后台启动（关终端不退出，日志写数据目录）");
@@ -116,9 +116,9 @@ fn real_main() {
             }
         },
         "verify" => match args.get(2) {
-            Some(dir) => run_verify(dir),
+            Some(dir) => run_verify(dir, args.iter().any(|a| a == "--deep")),
             None => {
-                eprintln!("用法: littledb verify <目录>");
+                eprintln!("用法: littledb verify <目录> [--deep]");
                 exit(1);
             }
         },
@@ -714,7 +714,7 @@ fn run_demo(dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_verify(dir: &str) -> Result<()> {
+fn run_verify(dir: &str, deep: bool) -> Result<()> {
     let mut engine = Engine::open(Path::new(dir))?;
     let stats = engine.stats();
 
@@ -729,6 +729,22 @@ fn run_verify(dir: &str) -> Result<()> {
         engine.store.orphans_removed
     );
     println!();
+
+    if deep {
+        println!("深度校验中（全表扫描 + 索引重建比对）…");
+        let problems = engine.deep_verify();
+        if problems.is_empty() {
+            println!("深度校验通过：row_count、索引内容、row_id 边界、空闲页全部一致");
+        } else {
+            println!("深度校验发现 {} 个问题：", problems.len());
+            for problem in &problems {
+                println!("  - {}", problem);
+            }
+            engine.close()?;
+            exit(1);
+        }
+        println!();
+    }
 
     let names = engine.table_names();
     for name in &names {

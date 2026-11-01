@@ -444,8 +444,9 @@ fn run_serve(dir: &str, extra: &[String]) -> Result<()> {
     let stats = engine.stats();
     let recovered = engine.store.recovered_txns;
     littledb::log::info(&format!(
-        "启动：数据目录 {}（{} 张表 · {} 页 · {} 字节 · 恢复 {} 个事务）",
-        dir, stats.tables, stats.pages, stats.bytes, recovered
+        "启动：数据目录 {}（{} 张表 · {} 页 · {} 字节 · 重放 WAL {} 条记录 / {} 个显式事务）",
+        dir, stats.tables, stats.pages, stats.bytes,
+        engine.store.recovered_records, recovered
     ));
     if options.token.is_some() {
         littledb::log::info("已启用 token 认证");

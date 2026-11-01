@@ -139,9 +139,45 @@
     width: 100%; border: 0; outline: 0; resize: none;
     background: transparent; color: #dbeafe;
     font-family: var(--mono); font-size: 13px; line-height: 1.65;
-    padding: 14px 16px; height: 148px; tab-size: 2;
+    padding: 14px 16px; height: 100%; tab-size: 2;
   }
   textarea::placeholder { color: #4a5a72; }
+
+  /* 编辑器：行号槽 + 可拖拽高度 */
+  .editor-body {
+    display: flex; align-items: stretch; min-height: 0;
+    height: var(--editor-h, 148px); overflow: hidden;
+  }
+  .gutter {
+    flex: none; width: 46px; overflow: hidden; user-select: none;
+    padding: 14px 8px 14px 4px; text-align: right;
+    font-family: var(--mono); font-size: 13px; line-height: 1.65;
+    color: #4a5a72; background: rgba(148,163,184,.05);
+    border-right: 1px solid rgba(148,163,184,.12);
+  }
+  .editor-resize {
+    height: 7px; cursor: row-resize; flex: none;
+    background: transparent; transition: background .15s;
+  }
+  .editor-resize:hover, .editor-resize.dragging { background: rgba(79,140,255,.35); }
+
+  /* 结果表头排序 */
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable::after { content: '↕'; opacity: .3; margin-left: 5px; font-size: 10px; }
+  th.sorted-asc::after { content: '↑'; opacity: .9; }
+  th.sorted-desc::after { content: '↓'; opacity: .9; }
+
+  /* 多语句结果标签页 */
+  .res-tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .res-tabs button {
+    font: inherit; font-size: 12px; padding: 3px 10px; cursor: pointer;
+    border: 1px solid rgba(148,163,184,.25); border-radius: 6px;
+    background: transparent; color: var(--muted);
+  }
+  .res-tabs button.active { background: var(--accent-soft); color: #fff; border-color: rgba(79,140,255,.45); }
+  .res-tabs button.has-error { border-color: rgba(248,113,113,.6); color: #fca5a5; }
+
+  .editor.collapsed .editor-body { display: none; }
 
   .editor.collapsed textarea { display: none; }
   #editor-toggle { padding: 3px 8px; }
@@ -436,6 +472,8 @@
   #filter-input:focus { border-color: var(--accent); width: 170px; }
   #menu-btn { display: none; }
 
+  body.light .gutter { color: #94a3b8; background: #f1f5f9; border-right-color: rgba(15,23,42,.08); }
+
   /* ---------------------------------------------------------- 浅色主题 */
   body.light {
     --bg: #eef1f6;
@@ -573,6 +611,7 @@
         <span class="pill">表 <b id="p-tables">-</b></span>
         <span class="pill">行 <b id="p-rows">-</b></span>
         <span class="pill">存储 <b id="p-bytes">-</b></span>
+        <span class="pill" title="最近 512 次查询的服务端 p95 延迟">p95 <b id="p-p95">-</b></span>
       </div>
       <button id="open-backup" title="备份与恢复">⇅ 备份</button>
       <button id="open-settings" title="设置">⚙ 设置</button>
@@ -594,7 +633,11 @@
           <button id="clear">清空</button>
           <button id="run" class="primary">运行<kbd>Ctrl ↵</kbd></button>
         </div>
-        <textarea id="sql" spellcheck="false" autocomplete="off" placeholder="输入 SQL，Ctrl+Enter 运行；Ctrl+空格 唤出补全"></textarea>
+        <div class="editor-body" id="editor-body">
+          <div class="gutter" id="gutter">1</div>
+          <textarea id="sql" spellcheck="false" autocomplete="off" placeholder="输入 SQL，Ctrl+Enter 运行；Ctrl+空格 唤出补全"></textarea>
+        </div>
+        <div class="editor-resize" id="editor-resize" title="拖拽调整编辑器高度"></div>
       </div>
     </section>
 
@@ -991,7 +1034,16 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     return data.result;
   }
 
-  const runSql = (sql) => api('/api/sql', { method: 'POST', body: JSON.stringify({ sql }) });
+  // 最近一次 /api/sql 请求的往返耗时（含网络 + 服务端），供结果卡片展示
+  let lastRoundtripMs = null;
+  const runSql = async (sql) => {
+    const t0 = performance.now();
+    try {
+      return await api('/api/sql', { method: 'POST', body: JSON.stringify({ sql }) });
+    } finally {
+      lastRoundtripMs = performance.now() - t0;
+    }
+  };
 
   async function refreshTables() {
     try {
@@ -1004,6 +1056,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
       $('#p-tables').textContent = stats.tables ?? '-';
       $('#p-rows').textContent = stats.rows ?? '-';
       $('#p-bytes').textContent = formatBytes(stats.bytes || 0);
+      $('#p-p95').textContent = info.latency && info.latency.p95Ms != null ? info.latency.p95Ms + ' ms' : '-';
       $('#foot-dir').textContent = '数据目录 ' + (stats.dir || '—');
       setStatus(true, '已连接 · 协议 v1');
     } catch (err) {
@@ -1115,9 +1168,43 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
     return `INSERT INTO "${table}" (${cols}) VALUES (${vals});`;
   }
 
+  /** 由 schema 生成 CREATE TABLE + 索引 DDL（与 dump 同风格，DECIMAL 用 38 位精度） */
+  function schemaToDdl(s) {
+    const colLines = s.columns.map((c) => {
+      const type = c.type === 'DECIMAL' ? `DECIMAL(38,${c.scale ?? 0})` : c.type;
+      const parts = ['"' + c.name + '"', type];
+      if (c.primaryKey) parts.push('PRIMARY KEY');
+      else if (c.notNull) parts.push('NOT NULL');
+      if (c.unique && !c.primaryKey) parts.push('UNIQUE');
+      if (c.default !== null && c.default !== undefined && c.default !== '') {
+        parts.push('DEFAULT ' + sqlLiteral(c.default));
+      }
+      return '  ' + parts.join(' ');
+    });
+    const out = ['CREATE TABLE "' + s.name + '" (', colLines.join(',\n'), ');'];
+    for (const ix of s.indexes || []) {
+      if (ix.primary || ix.implicit) continue; // 主键/自增的隐式索引不重复生成
+      out.push(
+        'CREATE ' + (ix.unique ? 'UNIQUE ' : '') + 'INDEX "' + ix.name + '" ON "' + s.name + '" (' +
+        ix.columns.map((c) => '"' + c + '"').join(', ') + ');'
+      );
+    }
+    return out.join('\n');
+  }
+
+  /** 单元格排序比较：NULL 恒排最后；数字按值、布尔按真假、其余按自然字符串序 */
+  function cmpCell(a, b) {
+    if (a === null || a === undefined) return b === null || b === undefined ? 0 : 1;
+    if (b === null || b === undefined) return -1;
+    if (typeof a === 'number' && typeof b === 'number') return a - b;
+    if (typeof a === 'boolean' && typeof b === 'boolean') return a === b ? 0 : a ? 1 : -1;
+    return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+  }
+
   /**
    * 渲染结果表格。
    * meta = { table, pk } 时启用行操作：双击单元格改值、右键菜单删行/复制。
+   * 点击表头可对当前结果排序（重建表格；行数组引用不变，编辑/删除逻辑不受影响）。
    */
   function makeTable(columns, rows, meta) {
     const opts = meta || {};
@@ -1138,6 +1225,18 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
       const hasNum = rows.some((r) => typeof r[ci] === 'number');
       const allNum = rows.every((r) => r[ci] === null || r[ci] === undefined || typeof r[ci] === 'number');
       if (hasNum && allNum) th.classList.add('num');
+      // 点击表头排序（再次点击切换方向；col-grip 的 mousedown 已 stopPropagation，互不干扰）
+      th.classList.add('sortable');
+      if (opts._sort && opts._sort.col === ci) {
+        th.classList.add(opts._sort.asc ? 'sorted-asc' : 'sorted-desc');
+      }
+      th.addEventListener('click', () => {
+        const asc = opts._sort && opts._sort.col === ci ? !opts._sort.asc : true;
+        const sorted = rows.slice().sort((ra, rb) => cmpCell(ra[ci], rb[ci]));
+        if (!asc) sorted.reverse();
+        const fresh = makeTable(columns, sorted, Object.assign({}, opts, { _sort: { col: ci, asc } }));
+        scroll.replaceChildren(...fresh.childNodes);
+      });
       htr.appendChild(th);
     });
     thead.appendChild(htr);
@@ -1320,25 +1419,48 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
       for (const r of result.results) renderResult(r, container);
       return;
     }
-    const timing = typeof result.elapsedMs === 'number' ? result.elapsedMs.toFixed(2) + ' ms' : '';
+    const serverMs = typeof result.elapsedMs === 'number' ? result.elapsedMs.toFixed(2) + ' ms' : '';
+    const roundMs = lastRoundtripMs != null ? lastRoundtripMs.toFixed(1) + ' ms' : '';
+    const timing = [serverMs ? '服务端 ' + serverMs : '', roundMs ? '往返 ' + roundMs : '']
+      .filter(Boolean)
+      .join(' · ');
 
     if (result.type === 'select' || result.type === 'explain') {
       const count = result.rowCount === undefined ? result.rows.length : result.rowCount;
       const body = result.rows.length
         ? makeTable(result.columns, result.rows)
         : Object.assign(document.createElement('div'), { className: 'msg ok', textContent: '（结果集为空）' });
-      const actions = result.type === 'select' ? [exportButton(result.columns, result.rows)] : [];
-      container.appendChild(
-        card(
-          [
-            { text: result.type.toUpperCase(), className: 'tag' },
-            { text: count + ' 行' },
-          ],
-          body,
-          Object.assign(document.createElement('div'), { className: 'pager', textContent: timing }),
-          actions
-        )
+      // 结果内筛选：对当前结果集做本地即时过滤（不改 SQL、不重跑）
+      const filterInput = document.createElement('input');
+      filterInput.id = 'filter-input';
+      filterInput.type = 'text';
+      filterInput.placeholder = '结果内筛选…';
+      const baseCount = count + ' 行';
+      const actions = [];
+      if (result.type === 'select') actions.push(filterInput, exportButton(result.columns, result.rows));
+      const cardEl = card(
+        [
+          { text: result.type.toUpperCase(), className: 'tag' },
+          { text: baseCount },
+        ],
+        body,
+        Object.assign(document.createElement('div'), { className: 'pager', textContent: timing }),
+        actions
       );
+      const headCount = cardEl.querySelectorAll('.card-head span')[1];
+      filterInput.addEventListener('input', () => {
+        const q = filterInput.value.trim().toLowerCase();
+        const tbody = body.querySelector('tbody');
+        if (!tbody) return;
+        let shown = 0;
+        for (const tr of tbody.children) {
+          const hit = !q || tr.textContent.toLowerCase().includes(q);
+          tr.style.display = hit ? '' : 'none';
+          if (hit) shown++;
+        }
+        headCount.textContent = q ? `筛选 ${shown}/${count} 行` : baseCount;
+      });
+      container.appendChild(cardEl);
       return;
     }
 
@@ -2077,24 +2199,87 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
 
   let pendingDangerous = null;
 
+  /** 错误码 → 给用户的下一步建议 */
+  function errorHint(code) {
+    switch (code) {
+      case 'WRITE_CONFLICT': return '有其它会话提交了冲突写入，请重试整个事务';
+      case 'RATE_LIMITED': return '认证失败次数过多，稍等片刻再试（见 Retry-After）';
+      case 'SESSION_BUSY': return '同一会话还有请求在执行，稍等片刻再试';
+      case 'CONSTRAINT_VIOLATION': return '键已被占用或违反非空约束，重试无用，请改数据';
+      case 'ROW_TOO_LARGE': return '单行上限约 4060 字节，请把大值拆分或存外部引用';
+      case 'NOT_FOUND': return '检查表名/列名拼写，或刷新左侧列表';
+      default: return '';
+    }
+  }
+
   async function runStatements(statements) {
     running = true;
     $('#run').disabled = true;
     resultBox.innerHTML = '';
+    // 多语句：每条语句一个结果面板 + 标签页，逐条执行、出错即停
+    const multi = statements.length > 1;
+    let panels = null;
+    let tabButtons = null;
+    let currentPanel = 0;
+    if (multi) {
+      panels = statements.map(() => {
+        const p = document.createElement('div');
+        p.hidden = true;
+        resultBox.appendChild(p);
+        return p;
+      });
+      const tabbar = document.createElement('div');
+      tabbar.className = 'res-tabs';
+      tabButtons = panels.map((_, i) => {
+        const b = document.createElement('button');
+        b.textContent = '语句 ' + (i + 1);
+        b.title = statements[i].slice(0, 120);
+        b.addEventListener('click', () => {
+          currentPanel = i;
+          panels.forEach((p, pi) => (p.hidden = pi !== i));
+          tabButtons.forEach((tb, ti) => tb.classList.toggle('active', ti === i));
+        });
+        tabbar.appendChild(b);
+        return b;
+      });
+      resultBox.insertBefore(tabbar, resultBox.firstChild);
+      panels[0].hidden = false;
+      tabButtons[0].classList.add('active');
+    }
     try {
       // 逐条执行（后端每次只接受一条语句），出错即停，已执行的结果保留显示
-      for (const stmt of statements) {
-        const result = await runSql(stmt);
-        renderResult(result, resultBox);
+      for (let i = 0; i < statements.length; i++) {
+        const stmt = statements[i];
+        const target = panels ? panels[i] : resultBox;
+        try {
+          const result = await runSql(stmt);
+          renderResult(result, target);
+        } catch (err) {
+          const hint = errorHint(err.code);
+          target.appendChild(messageCard('err', err.message, [err.code ? '错误码 ' + err.code : '', hint].filter(Boolean).join(' · ')));
+          if (panels) {
+            currentPanel = i;
+            panels.forEach((p, pi) => (p.hidden = pi !== i));
+            tabButtons.forEach((tb, ti) => tb.classList.toggle('active', ti === i));
+            tabButtons[i].classList.add('has-error');
+          }
+          throw err;
+        }
       }
       state.page = null;
       renderTables();
       refreshStats();
       pushHistory(statements.join('\n'));
-      // 回读表结构变化（DDL 后刷新侧栏）
-      if (statements.some((s) => /CREATE|DROP/i.test(s))) refreshTableList();
+      // 每次执行后都回读：表列表的行数徽标与结构保持新鲜
+      //（正在浏览的表如果被改，点它时会按最后页码重新加载，不在这里抢结果区）
+      refreshTableList();
     } catch (err) {
-      resultBox.appendChild(messageCard('err', err.message, err.code ? '错误码 ' + err.code : ''));
+      if (!panels) {
+        // 单语句的报错已在对应位置渲染；这里只兜底（如批量外的意外错误）
+        if (!resultBox.querySelector('.msg.err')) {
+          resultBox.appendChild(messageCard('err', err.message, [err.code ? '错误码 ' + err.code : '', errorHint(err.code)].filter(Boolean).join(' · ')));
+        }
+      }
       setStatus(true, '已连接 · 协议 v1');
     } finally {
       running = false;
@@ -2110,6 +2295,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
       $('#p-tables').textContent = stats.tables ?? '-';
       $('#p-rows').textContent = stats.rows ?? '-';
       $('#p-bytes').textContent = formatBytes(stats.bytes || 0);
+      $('#p-p95').textContent = info.latency && info.latency.p95Ms != null ? info.latency.p95Ms + ' ms' : '-';
     } catch (_) { /* 忽略 */ }
   }
 
@@ -2129,6 +2315,7 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
 
   async function openTable(name, offset) {
     const limit = settings.pageSize;
+    lastRoundtripMs = null; // 浏览表的往返耗时与 SQL 结果无关，不显示
     try {
       const data = await api('/api/tables/' + encodeURIComponent(name) + '?limit=' + limit + '&offset=' + offset);
       state.page = { table: name, offset, limit };
@@ -2208,6 +2395,20 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
         details.className = 'schema-panel';
         const summary = document.createElement('summary');
         summary.textContent = `表结构 · ${data.schema.columns.length} 列 · ${data.schema.indexes.length} 个索引`;
+        // 一键生成并复制建表 DDL（含索引；格式与 dump 一致）
+        const ddlBtn = document.createElement('button');
+        ddlBtn.textContent = '复制 DDL';
+        ddlBtn.style.marginLeft = '10px';
+        ddlBtn.addEventListener('click', async (e) => {
+          e.stopPropagation(); // 别把 <details> 折叠了
+          try {
+            await copyText(schemaToDdl(data.schema));
+            toast('建表 DDL 已复制到剪贴板');
+          } catch (err) {
+            toast('复制失败：' + err.message);
+          }
+        });
+        summary.appendChild(ddlBtn);
         details.appendChild(summary);
         details.appendChild(
           makeTable(
@@ -2982,6 +3183,46 @@ SELECT name, age, active FROM demo_users ORDER BY age DESC;`;
       }
     }
   }
+
+  // ------------------------------------------------------------ 编辑器行号与高度拖拽
+  const gutter = $('#gutter');
+  const editorBody = $('#editor-body');
+  const resizeBar = $('#editor-resize');
+
+  function refreshGutter() {
+    const lines = sqlInput.value.split('\n').length;
+    gutter.textContent = Array.from({ length: lines }, (_, i) => i + 1).join('\n');
+  }
+
+  // 拖拽调高编辑器（60..600px，记住选择）
+  resizeBar.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = editorBody.getBoundingClientRect().height;
+    resizeBar.classList.add('dragging');
+    const move = (ev) => {
+      const h = Math.min(600, Math.max(60, Math.round(startH + ev.clientY - startY)));
+      editorBody.style.height = h + 'px';
+      try { localStorage.setItem('ldb_editor_h', String(h)); } catch (_) { /* 忽略 */ }
+    };
+    const up = () => {
+      resizeBar.classList.remove('dragging');
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+
+  try {
+    const savedH = parseInt(localStorage.getItem('ldb_editor_h') || '', 10);
+    if (savedH) editorBody.style.height = Math.min(600, Math.max(60, savedH)) + 'px';
+  } catch (_) { /* 忽略 */ }
+  refreshGutter();
+  sqlInput.addEventListener('input', refreshGutter);
+  sqlInput.addEventListener('scroll', () => {
+    gutter.scrollTop = sqlInput.scrollTop;
+  });
 
   // 启动
   try {
